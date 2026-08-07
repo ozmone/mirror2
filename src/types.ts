@@ -1,5 +1,24 @@
 export type ThemeName = "onyx" | "ivory" | "blue" | "green";
-export type AccentName = "sage" | "violet" | "blue" | "rose" | "amber" | "teal" | "clay" | "silver";
+export type AccentName =
+  | "sage"
+  | "violet"
+  | "blue"
+  | "rose"
+  | "amber"
+  | "teal"
+  | "clay"
+  | "silver"
+  | "bone"
+  | "muted blue"
+  | "dusty rose"
+  | "dark burgundy"
+  | "dark violet"
+  | "plum"
+  | "deep navy"
+  | "deep teal"
+  | "forest green"
+  | "dark rust"
+  | "charcoal/slate";
 export type FontName = "system" | "inter" | "lora" | "nunito";
 export type FontSizeName = "small" | "standard" | "large" | "xl";
 export type BubbleMode = "bubbles" | "minimal";

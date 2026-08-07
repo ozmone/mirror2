@@ -21,6 +21,7 @@
   --accent: #8fbea8;
   --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
   --accent-line: color-mix(in srgb, var(--accent) 42%, transparent);
+  --accent-fill: var(--accent);
   --accent-contrast: #111715;
   --user: rgba(23, 27, 35, 0.92);
   --assistant: rgba(15, 18, 24, 0.84);
@@ -59,12 +60,12 @@
   --field: rgba(8, 8, 8, 0.9);
   --glass: rgba(14, 14, 14, 0.66);
   --glass-strong: rgba(18, 18, 18, 0.9);
-  --line: rgba(235, 231, 222, 0.15);
-  --line-soft: rgba(235, 231, 222, 0.075);
-  --line-bright: rgba(255, 250, 238, 0.16);
-  --text: #e7e1d7;
-  --text-2: #b7b0a5;
-  --muted: #7c766d;
+  --line: rgba(220, 224, 230, 0.15);
+  --line-soft: rgba(220, 224, 230, 0.075);
+  --line-bright: rgba(244, 246, 248, 0.15);
+  --text: #e2e4e7;
+  --text-2: #acb0b6;
+  --muted: #747981;
   --user: rgba(25, 25, 25, 0.92);
   --assistant: rgba(13, 13, 13, 0.86);
   --overlay: rgba(0, 0, 0, 0.72);
@@ -708,7 +709,7 @@ small {
 }
 
 .send-button {
-  background: var(--accent);
+  background: var(--accent-fill);
   color: var(--accent-contrast);
   border-color: transparent;
   font-weight: 750;

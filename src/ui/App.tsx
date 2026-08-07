@@ -56,8 +56,62 @@ const accents = [
   { name: "amber", value: "#d3aa66" },
   { name: "teal", value: "#72bfc2" },
   { name: "clay", value: "#c58f78" },
-  { name: "silver", value: "#b9bdc7" }
+  { name: "silver", value: "#b9bdc7" },
+  { name: "bone", value: "#d8d1c2" },
+  { name: "muted blue", value: "#6f8fb8" },
+  { name: "dusty rose", value: "#a86373" },
+  { name: "dark burgundy", value: "#5a1f2c" },
+  { name: "dark violet", value: "#43245f" },
+  { name: "plum", value: "#62314f" },
+  { name: "deep navy", value: "#1f355c" },
+  { name: "deep teal", value: "#1f5a5c" },
+  { name: "forest green", value: "#284d34" },
+  { name: "dark rust", value: "#74412a" },
+  { name: "charcoal/slate", value: "#4b5563" }
 ] as const;
+
+function hexToRgb(hex: string) {
+  const clean = hex.replace("#", "");
+  const value = Number.parseInt(clean, 16);
+  return {
+    r: (value >> 16) & 255,
+    g: (value >> 8) & 255,
+    b: value & 255
+  };
+}
+
+function rgbToHex({ r, g, b }: { r: number; g: number; b: number }) {
+  return `#${[r, g, b].map((part) => Math.round(Math.max(0, Math.min(255, part))).toString(16).padStart(2, "0")).join("")}`;
+}
+
+function relativeLuminance(hex: string) {
+  const { r, g, b } = hexToRgb(hex);
+  const channel = (value: number) => {
+    const normalized = value / 255;
+    return normalized <= 0.03928 ? normalized / 12.92 : ((normalized + 0.055) / 1.055) ** 2.4;
+  };
+  return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b);
+}
+
+function mixHex(a: string, b: string, amount: number) {
+  const first = hexToRgb(a);
+  const second = hexToRgb(b);
+  return rgbToHex({
+    r: first.r + (second.r - first.r) * amount,
+    g: first.g + (second.g - first.g) * amount,
+    b: first.b + (second.b - first.b) * amount
+  });
+}
+
+function accentTokens(value: string) {
+  const luminance = relativeLuminance(value);
+  const isDark = luminance < 0.24;
+  return {
+    accent: value,
+    fill: isDark ? mixHex(value, "#ffffff", 0.24) : value,
+    contrast: isDark ? "#f4f6f8" : "#111315"
+  };
+}
 
 const routeLabels: Record<RouteName, string> = {
   chat: "Chat",
@@ -190,7 +244,10 @@ export function App() {
     document.documentElement.style.setProperty("--app-font-size", `${settings.fontScale ?? 16}px`);
     document.documentElement.style.setProperty("--entry-width", `${settings.entryWidth}%`);
     document.documentElement.style.setProperty("--message-gap", `${settings.messageSpacing}px`);
-    document.documentElement.style.setProperty("--accent", accents.find((accent) => accent.name === settings.accent)?.value ?? accents[0].value);
+    const tokens = accentTokens(accents.find((accent) => accent.name === settings.accent)?.value ?? accents[0].value);
+    document.documentElement.style.setProperty("--accent", tokens.accent);
+    document.documentElement.style.setProperty("--accent-fill", tokens.fill);
+    document.documentElement.style.setProperty("--accent-contrast", tokens.contrast);
   }, [settings]);
 
   const projectChats = useMemo(() => chats.filter((chat) => chat.projectId === selectedProjectId), [chats, selectedProjectId]);

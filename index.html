@@ -24,16 +24,64 @@
           amber: "#d3aa66",
           teal: "#72bfc2",
           clay: "#c58f78",
-          silver: "#c8c8c4"
+          silver: "#b9bdc7",
+          bone: "#d8d1c2",
+          "muted blue": "#6f8fb8",
+          "dusty rose": "#a86373",
+          "dark burgundy": "#5a1f2c",
+          "dark violet": "#43245f",
+          plum: "#62314f",
+          "deep navy": "#1f355c",
+          "deep teal": "#1f5a5c",
+          "forest green": "#284d34",
+          "dark rust": "#74412a",
+          "charcoal/slate": "#4b5563"
         };
+        function hexToRgb(hex) {
+          var value = parseInt(hex.replace("#", ""), 16);
+          return { r: (value >> 16) & 255, g: (value >> 8) & 255, b: value & 255 };
+        }
+        function rgbToHex(rgb) {
+          return "#" + [rgb.r, rgb.g, rgb.b].map(function (part) {
+            return Math.round(Math.max(0, Math.min(255, part))).toString(16).padStart(2, "0");
+          }).join("");
+        }
+        function relativeLuminance(hex) {
+          var rgb = hexToRgb(hex);
+          function channel(value) {
+            var normalized = value / 255;
+            return normalized <= 0.03928 ? normalized / 12.92 : Math.pow((normalized + 0.055) / 1.055, 2.4);
+          }
+          return 0.2126 * channel(rgb.r) + 0.7152 * channel(rgb.g) + 0.0722 * channel(rgb.b);
+        }
+        function mixHex(a, b, amount) {
+          var first = hexToRgb(a);
+          var second = hexToRgb(b);
+          return rgbToHex({
+            r: first.r + (second.r - first.r) * amount,
+            g: first.g + (second.g - first.g) * amount,
+            b: first.b + (second.b - first.b) * amount
+          });
+        }
+        function accentTokens(value) {
+          var isDark = relativeLuminance(value) < 0.24;
+          return {
+            accent: value,
+            fill: isDark ? mixHex(value, "#ffffff", 0.24) : value,
+            contrast: isDark ? "#f4f6f8" : "#111315"
+          };
+        }
         function apply(settings) {
           var root = document.documentElement;
+          var tokens = accentTokens(accents[(settings && settings.accent) || "sage"] || accents.sage);
           root.dataset.theme = settings && settings.theme ? settings.theme : "onyx";
           root.dataset.font = settings && settings.font ? settings.font : "system";
           root.style.setProperty("--app-font-size", ((settings && settings.fontScale) || 16) + "px");
           root.style.setProperty("--entry-width", ((settings && settings.entryWidth) || 80) + "%");
           root.style.setProperty("--message-gap", ((settings && settings.messageSpacing) || 4) + "px");
-          root.style.setProperty("--accent", accents[(settings && settings.accent) || "sage"] || accents.sage);
+          root.style.setProperty("--accent", tokens.accent);
+          root.style.setProperty("--accent-fill", tokens.fill);
+          root.style.setProperty("--accent-contrast", tokens.contrast);
         }
         window.__mirrorThemeReady = new Promise(function (resolve) {
           try {
