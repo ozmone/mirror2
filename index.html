@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en" data-theme="onyx" class="theme-pending">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#17181c" />
+    <style>
+      html.theme-pending,
+      html.theme-pending body {
+        background: #030303;
+      }
+
+      html.theme-pending body {
+        visibility: hidden;
+      }
+    </style>
+    <script>
+      (function () {
+        var accents = {
+          sage: "#8fbea8",
+          violet: "#b7a1e8",
+          blue: "#82aee6",
+          rose: "#d993a8",
+          amber: "#d3aa66",
+          teal: "#72bfc2",
+          clay: "#c58f78",
+          silver: "#c8c8c4"
+        };
+        function apply(settings) {
+          var root = document.documentElement;
+          root.dataset.theme = settings && settings.theme ? settings.theme : "onyx";
+          root.dataset.font = settings && settings.font ? settings.font : "system";
+          root.style.setProperty("--app-font-size", ((settings && settings.fontScale) || 16) + "px");
+          root.style.setProperty("--entry-width", ((settings && settings.entryWidth) || 80) + "%");
+          root.style.setProperty("--message-gap", ((settings && settings.messageSpacing) || 4) + "px");
+          root.style.setProperty("--accent", accents[(settings && settings.accent) || "sage"] || accents.sage);
+        }
+        window.__mirrorThemeReady = new Promise(function (resolve) {
+          try {
+            var request = indexedDB.open("mirror-2");
+            request.onerror = function () {
+              apply();
+              resolve();
+            };
+            request.onsuccess = function () {
+              var database = request.result;
+              try {
+                var transaction = database.transaction("settings", "readonly");
+                var settingsRequest = transaction.objectStore("settings").get("settings");
+                settingsRequest.onsuccess = function () {
+                  apply(settingsRequest.result);
+                  database.close();
+                  resolve();
+                };
+                settingsRequest.onerror = function () {
+                  apply();
+                  database.close();
+                  resolve();
+                };
+              } catch (error) {
+                apply();
+                database.close();
+                resolve();
+              }
+            };
+          } catch (error) {
+            apply();
+            resolve();
+          }
+        }).finally(function () {
+          document.documentElement.classList.remove("theme-pending");
+        });
+      })();
+    </script>
+    <script>
+      (function () {
+        var recoveryFlag = "mirror-2-stale-recovery-attempted";
+        function showRecovery(message) {
+          var root = document.getElementById("root");
+          if (!root) return;
+          root.innerHTML =
+            '<main style="min-height:100dvh;display:grid;place-items:center;padding:24px;background:#030303;color:#e7e1d7;font-family:Inter,system-ui,sans-serif;">' +
+            '<section style="width:min(440px,100%);border:1px solid rgba(235,231,222,.18);background:rgba(18,18,18,.9);padding:18px;">' +
+            '<h1 style="margin:0 0 8px;font-size:20px;">Update Needed</h1>' +
+            '<p style="margin:0 0 14px;line-height:1.45;color:#b7b0a5;">' +
+            message +
+            " Your local projects, chats, characters, archives, images, and settings are still stored in IndexedDB.</p>" +
+            '<button id="mirror-recovery-reload" style="min-height:42px;padding:0 14px;border:1px solid rgba(235,231,222,.18);background:transparent;color:#e7e1d7;">Reload current version</button>' +
+            "</section></main>";
+          document.documentElement.classList.remove("theme-pending");
+          document.getElementById("mirror-recovery-reload").addEventListener("click", function () {
+            location.reload();
+          });
+        }
+        function recover() {
+          if (window.__mirrorRecovering) return;
+          window.__mirrorRecovering = true;
+          if (sessionStorage.getItem(recoveryFlag)) {
+            showRecovery("Automatic recovery already tried once.");
+            return;
+          }
+          sessionStorage.setItem(recoveryFlag, "1");
+          if (!navigator.serviceWorker) {
+            location.reload();
+            return;
+          }
+          navigator.serviceWorker
+            .getRegistrations()
+            .then(function (registrations) {
+              return Promise.all(registrations.map(function (registration) { return registration.update(); }));
+            })
+            .finally(function () {
+              location.reload();
+            });
+        }
+        window.__mirrorRecoverFromStaleAsset = recover;
+        window.addEventListener(
+          "error",
+          function (event) {
+            var target = event.target;
+            if (target && (target.tagName === "SCRIPT" || target.tagName === "LINK")) recover();
+          },
+          true
+        );
+      })();
+    </script>
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="icon" href="./icons/icon-192.svg" />
+    <title>Mirror 2.0</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
