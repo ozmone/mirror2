@@ -813,6 +813,15 @@ function ChatScreen({
     await onRefresh();
   }
 
+  async function answeredUserMessage(message: Message) {
+    if (message.role === "user") return message;
+    return db.messages
+      .where("[chatId+branchId+sequence]")
+      .between([message.chatId, message.branchId, Dexie.minKey], [message.chatId, message.branchId, message.sequence - 1])
+      .and((row) => row.role === "user")
+      .last();
+  }
+
   async function resendFromMessage(message: Message) {
     if (!project || !settings.apiKey) {
       alert("Add your OpenRouter API key before regenerating.");
@@ -822,7 +831,12 @@ function ChatScreen({
       alert("Choose a model before regenerating.");
       return;
     }
-    if (!confirm("Regenerate from this message? Later messages in this branch will be replaced.")) return;
+    const promptMessage = await answeredUserMessage(message);
+    if (!promptMessage) {
+      alert("No user message was found to regenerate from.");
+      return;
+    }
+    if (!confirm("Regenerate from this user message? Later messages in this branch will be replaced.")) return;
     const chatId = message.chatId;
     const branchId = message.branchId;
     const timestamp = now();
@@ -837,13 +851,14 @@ function ChatScreen({
       compactionEnabled && activeChat?.compactionMemory ? `Compaction memory:\n${activeChat.compactionMemory}` : "",
       sourceFiles.length ? `Source files:\n${sourceFiles.map((file) => `# ${file.name}\n${file.textContent}`).join("\n\n")}` : ""
     ].filter(Boolean);
-    const cutoffSequence = message.role === "assistant" ? message.sequence - 1 : message.sequence;
     const allHistory = await db.messages
       .where("[chatId+branchId+sequence]")
-      .between([chatId, branchId, Dexie.minKey], [chatId, branchId, cutoffSequence])
+      .between([chatId, branchId, Dexie.minKey], [chatId, branchId, promptMessage.sequence])
       .toArray();
+    const orderedHistory = allHistory.sort((a, b) => a.sequence - b.sequence);
     const historyLimit = historyNoLimit ? undefined : optionalNumber(maxHistory);
-    const selectedHistory = historyLimit ? allHistory.slice(-historyLimit) : allHistory;
+    const limitedHistory = historyLimit ? orderedHistory.slice(-historyLimit) : orderedHistory;
+    const selectedHistory = limitedHistory.some((row) => row.id === promptMessage.id) ? limitedHistory : [...limitedHistory, promptMessage].sort((a, b) => a.sequence - b.sequence);
     const requestMessages = [
       ...(systemParts.length ? [{ role: "system", content: systemParts.join("\n\n") }] : []),
       ...selectedHistory.map((historyMessage) => ({
@@ -874,20 +889,15 @@ function ChatScreen({
     await db.transaction("rw", db.messages, db.stars, db.chats, async () => {
       const laterIds = await db.messages
         .where("[chatId+branchId+sequence]")
-        .between([chatId, branchId, message.role === "assistant" ? message.sequence + 1 : message.sequence + 1], [chatId, branchId, Dexie.maxKey])
+        .between([chatId, branchId, promptMessage.sequence + 1], [chatId, branchId, Dexie.maxKey])
         .primaryKeys();
       if (laterIds.length) {
         const messageIds = laterIds as string[];
         await db.stars.where("messageId").anyOf(messageIds).delete();
         await db.messages.bulkDelete(messageIds);
       }
-      if (message.role === "assistant") {
-        await db.messages.update(message.id, { body: streamingEnabled ? "" : "...", modelId: selectedModelId, status: streamingEnabled ? "streaming" : "pending", error: undefined, requestInfo, updatedAt: timestamp });
-        reply = { ...message, body: streamingEnabled ? "" : "...", modelId: selectedModelId, status: streamingEnabled ? "streaming" : "pending", requestInfo, updatedAt: timestamp };
-      } else {
-        reply = await addMessage(chatId, branchId, "assistant", streamingEnabled ? "" : "...");
-        await db.messages.update(reply.id, { modelId: selectedModelId, status: streamingEnabled ? "streaming" : "pending", requestInfo });
-      }
+      reply = await addMessage(chatId, branchId, "assistant", streamingEnabled ? "" : "...");
+      await db.messages.update(reply.id, { modelId: selectedModelId, status: streamingEnabled ? "streaming" : "pending", requestInfo });
       await db.chats.update(chatId, { updatedAt: timestamp });
     });
     if (!reply) return;
@@ -1057,6 +1067,11 @@ function MessageRow({
     await onEdit(message, draftBody);
     setEditOpen(false);
   }
+  async function saveEditAndResend() {
+    await onEdit(message, draftBody);
+    setEditOpen(false);
+    await onResend(message);
+  }
   return (
     <>
       <article className={`message ${message.role}`} onClick={onExpand}>
@@ -1083,6 +1098,7 @@ function MessageRow({
             <textarea className="large-entry" value={draftBody} onChange={(event) => setDraftBody(event.target.value)} />
             <div className="split-actions">
               <button onClick={saveEdit}><Save size={18} /> Save</button>
+              {message.role === "user" && <button onClick={saveEditAndResend}><RefreshCw size={18} /> Save & resend</button>}
               <button onClick={() => setEditOpen(false)}>Cancel</button>
             </div>
           </section>
