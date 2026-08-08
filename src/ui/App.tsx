@@ -795,6 +795,180 @@ function ChatScreen({
     await onRefresh();
   }
 
+  async function editMessage(message: Message, nextBody: string) {
+    const clean = nextBody.trim();
+    if (!clean) return;
+    const timestamp = now();
+    await db.transaction("rw", db.messages, db.stars, async () => {
+      await db.messages.update(message.id, {
+        body: clean,
+        inputTokens: message.role === "user" ? estimateTokens(clean) : message.inputTokens,
+        outputTokens: message.role === "assistant" ? estimateTokens(clean) : message.outputTokens,
+        estimatedTokens: true,
+        updatedAt: timestamp
+      });
+      const star = await db.stars.where("messageId").equals(message.id).first();
+      if (star) await db.stars.update(star.id, { bodyCopy: clean, updatedAt: timestamp });
+    });
+    await onRefresh();
+  }
+
+  async function resendFromMessage(message: Message) {
+    if (!project || !settings.apiKey) {
+      alert("Add your OpenRouter API key before regenerating.");
+      return;
+    }
+    if (!selectedModelId) {
+      alert("Choose a model before regenerating.");
+      return;
+    }
+    if (!confirm("Regenerate from this message? Later messages in this branch will be replaced.")) return;
+    const chatId = message.chatId;
+    const branchId = message.branchId;
+    const timestamp = now();
+    const sourceFiles = includeSourceFiles
+      ? await db.sourceFiles.where("projectId").equals(project.id).and((file) => Boolean(file.textContent)).toArray()
+      : [];
+    const activeChat = await db.chats.get(chatId);
+    const systemParts = [
+      `Project: ${project.name}`,
+      includeInstructions && project.instructions ? `Project instructions:\n${project.instructions}` : "",
+      includeWorld && project.worldSetting ? `World setting:\n${project.worldSetting}` : "",
+      compactionEnabled && activeChat?.compactionMemory ? `Compaction memory:\n${activeChat.compactionMemory}` : "",
+      sourceFiles.length ? `Source files:\n${sourceFiles.map((file) => `# ${file.name}\n${file.textContent}`).join("\n\n")}` : ""
+    ].filter(Boolean);
+    const cutoffSequence = message.role === "assistant" ? message.sequence - 1 : message.sequence;
+    const allHistory = await db.messages
+      .where("[chatId+branchId+sequence]")
+      .between([chatId, branchId, Dexie.minKey], [chatId, branchId, cutoffSequence])
+      .toArray();
+    const historyLimit = historyNoLimit ? undefined : optionalNumber(maxHistory);
+    const selectedHistory = historyLimit ? allHistory.slice(-historyLimit) : allHistory;
+    const requestMessages = [
+      ...(systemParts.length ? [{ role: "system", content: systemParts.join("\n\n") }] : []),
+      ...selectedHistory.map((historyMessage) => ({
+        role: historyMessage.role === "system" ? "system" : historyMessage.role === "assistant" ? "assistant" : "user",
+        content: historyMessage.body
+      }))
+    ];
+    const requestInfo = {
+      settings: [
+        `Model: ${selectedModelId}`,
+        `Temperature: ${temperature || "0"}`,
+        `Top P: ${topP || "0"}`,
+        `Max output: ${maxTokens || "no limit"}`,
+        historyNoLimit ? "History: no limit" : `History: ${maxHistory || "not set"} messages`,
+        `Streaming: ${streamingEnabled ? "on" : "off"}`
+      ],
+      toggles: [
+        `World setting: ${includeWorld ? "on" : "off"}`,
+        `Instructions: ${includeInstructions ? "on" : "off"}`,
+        `Characters: ${includeCharacters ? "on" : "off"}`,
+        `Source files: ${includeSourceFiles ? "on" : "off"}`,
+        `Compaction memory: ${compactionEnabled ? "on" : "off"}`,
+        "Images: 0"
+      ],
+      toolCalls: ["None"]
+    };
+    let reply: Message | undefined;
+    await db.transaction("rw", db.messages, db.stars, db.chats, async () => {
+      const laterIds = await db.messages
+        .where("[chatId+branchId+sequence]")
+        .between([chatId, branchId, message.role === "assistant" ? message.sequence + 1 : message.sequence + 1], [chatId, branchId, Dexie.maxKey])
+        .primaryKeys();
+      if (laterIds.length) {
+        const messageIds = laterIds as string[];
+        await db.stars.where("messageId").anyOf(messageIds).delete();
+        await db.messages.bulkDelete(messageIds);
+      }
+      if (message.role === "assistant") {
+        await db.messages.update(message.id, { body: streamingEnabled ? "" : "...", modelId: selectedModelId, status: streamingEnabled ? "streaming" : "pending", error: undefined, requestInfo, updatedAt: timestamp });
+        reply = { ...message, body: streamingEnabled ? "" : "...", modelId: selectedModelId, status: streamingEnabled ? "streaming" : "pending", requestInfo, updatedAt: timestamp };
+      } else {
+        reply = await addMessage(chatId, branchId, "assistant", streamingEnabled ? "" : "...");
+        await db.messages.update(reply.id, { modelId: selectedModelId, status: streamingEnabled ? "streaming" : "pending", requestInfo });
+      }
+      await db.chats.update(chatId, { updatedAt: timestamp });
+    });
+    if (!reply) return;
+    await onRefresh();
+    const payload: Record<string, unknown> = {
+      model: selectedModelId,
+      messages: requestMessages,
+      stream: streamingEnabled
+    };
+    const temperatureValue = optionalNumber(temperature || "0");
+    const topPValue = optionalNumber(topP || "0");
+    const maxTokensValue = optionalNumber(maxTokens);
+    if (temperatureValue !== undefined) payload.temperature = temperatureValue;
+    if (topPValue !== undefined) payload.top_p = topPValue;
+    if (maxTokensValue !== undefined) payload.max_tokens = maxTokensValue;
+    if (streamingEnabled) payload.stream_options = { include_usage: true };
+    try {
+      const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${settings.apiKey}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": location.origin,
+          "X-Title": "Mirror 2.0"
+        },
+        body: JSON.stringify(payload)
+      });
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(errorText || `OpenRouter request failed (${response.status})`);
+      }
+      if (streamingEnabled && response.body) {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let replyText = "";
+        let inputTokens: number | undefined;
+        let outputTokens: number | undefined;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+          for (const line of lines) {
+            const clean = line.trim();
+            if (!clean.startsWith("data:")) continue;
+            const data = clean.slice(5).trim();
+            if (data === "[DONE]") continue;
+            const chunk = JSON.parse(data) as { choices?: { delta?: { content?: string } }[]; usage?: { prompt_tokens?: number; completion_tokens?: number } };
+            replyText += chunk.choices?.[0]?.delta?.content ?? "";
+            inputTokens = chunk.usage?.prompt_tokens ?? inputTokens;
+            outputTokens = chunk.usage?.completion_tokens ?? outputTokens;
+            await db.messages.update(reply.id, { body: replyText, outputTokens: estimateTokens(replyText), updatedAt: now() });
+            await onRefresh();
+          }
+        }
+        await db.messages.update(reply.id, { body: replyText || "(No response text returned.)", inputTokens, outputTokens: outputTokens ?? estimateTokens(replyText), estimatedTokens: !outputTokens, status: "complete", updatedAt: now() });
+      } else {
+        const json = await response.json() as { choices?: { message?: { content?: string } }[]; usage?: { prompt_tokens?: number; completion_tokens?: number } };
+        const replyText = json.choices?.[0]?.message?.content ?? "";
+        await db.messages.update(reply.id, {
+          body: replyText || "(No response text returned.)",
+          inputTokens: json.usage?.prompt_tokens,
+          outputTokens: json.usage?.completion_tokens ?? estimateTokens(replyText),
+          estimatedTokens: !json.usage?.completion_tokens,
+          status: "complete",
+          updatedAt: now()
+        });
+      }
+    } catch (error) {
+      await db.messages.update(reply.id, {
+        body: "OpenRouter request failed.",
+        error: error instanceof Error ? error.message : "Unknown error",
+        status: "failed",
+        updatedAt: now()
+      });
+    }
+    await onRefresh();
+  }
+
   if (!project) {
     return <EmptyState title="Choose a project" body="Open the sidebar and select a project before starting a chat." />;
   }
@@ -810,6 +984,8 @@ function ChatScreen({
             message={message}
             expanded={expandedMessageId === message.id}
             onExpand={() => setExpandedMessageId(expandedMessageId === message.id ? undefined : message.id)}
+            onEdit={editMessage}
+            onResend={resendFromMessage}
             onRefresh={onRefresh}
           />
         ))}
@@ -845,8 +1021,27 @@ function ChatScreen({
   );
 }
 
-function MessageRow({ projectId, message, expanded, onExpand, onRefresh }: { projectId: string; message: Message; expanded: boolean; onExpand: () => void; onRefresh: () => Promise<void> }) {
+function MessageRow({
+  projectId,
+  message,
+  expanded,
+  onExpand,
+  onEdit,
+  onResend,
+  onRefresh
+}: {
+  projectId: string;
+  message: Message;
+  expanded: boolean;
+  onExpand: () => void;
+  onEdit: (message: Message, nextBody: string) => Promise<void>;
+  onResend: (message: Message) => Promise<void>;
+  onRefresh: () => Promise<void>;
+}) {
   const [infoOpen, setInfoOpen] = useState(false);
+  const [editOpen, setEditOpen] = useState(false);
+  const [draftBody, setDraftBody] = useState(message.body);
+  useEffect(() => setDraftBody(message.body), [message.id, message.body]);
   async function star() {
     const { toggleStar } = await import("../data/repositories");
     await toggleStar(projectId, message);
@@ -856,8 +1051,11 @@ function MessageRow({ projectId, message, expanded, onExpand, onRefresh }: { pro
     await navigator.clipboard.writeText(message.body);
   }
   async function resend() {
-    if (!confirm("Create a new branch from this point and regenerate from here? The original branch will remain stored.")) return;
-    alert("Branch-safe resend is represented in the data model. API regeneration will be wired to OpenRouter next.");
+    await onResend(message);
+  }
+  async function saveEdit() {
+    await onEdit(message, draftBody);
+    setEditOpen(false);
   }
   return (
     <>
@@ -865,7 +1063,7 @@ function MessageRow({ projectId, message, expanded, onExpand, onRefresh }: { pro
         {expanded && message.role === "assistant" && message.modelId && <div className="message-model">{message.modelId}</div>}
         <div className="message-body">{message.body}</div>
         <div className={`message-meta ${expanded ? "show" : ""}`}>
-          <button aria-label="Edit message" title="Edit"><Edit3 size={16} /></button>
+          <button aria-label="Edit message" title="Edit" onClick={(event) => { event.stopPropagation(); setEditOpen(true); }}><Edit3 size={16} /></button>
           <button aria-label={message.starred ? "Unstar message" : "Star message"} title={message.starred ? "Unstar" : "Star"} onClick={(event) => { event.stopPropagation(); star(); }}><Star size={16} fill={message.starred ? "currentColor" : "none"} /></button>
           <button aria-label="Copy message" title="Copy" onClick={(event) => { event.stopPropagation(); copyMessage(); }}><Clipboard size={16} /></button>
           <button aria-label="Message info" title="Info" onClick={(event) => { event.stopPropagation(); setInfoOpen(true); }}><FileText size={16} /></button>
@@ -875,6 +1073,21 @@ function MessageRow({ projectId, message, expanded, onExpand, onRefresh }: { pro
         </div>
       </article>
       {infoOpen && <MessageInfoModal message={message} onClose={() => setInfoOpen(false)} />}
+      {editOpen && (
+        <div className="modal-backdrop" onClick={() => setEditOpen(false)}>
+          <section className="star-modal message-info-modal" onClick={(event) => event.stopPropagation()}>
+            <div className="section-title">
+              <h2>Edit Message</h2>
+              <button className="icon-button" onClick={() => setEditOpen(false)} aria-label="Close edit message"><X size={18} /></button>
+            </div>
+            <textarea className="large-entry" value={draftBody} onChange={(event) => setDraftBody(event.target.value)} />
+            <div className="split-actions">
+              <button onClick={saveEdit}><Save size={18} /> Save</button>
+              <button onClick={() => setEditOpen(false)}>Cancel</button>
+            </div>
+          </section>
+        </div>
+      )}
     </>
   );
 }
