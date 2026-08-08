@@ -36,6 +36,7 @@ import {
   createChat,
   createMemory,
   createProject,
+  findCharacters,
   getCharacterBio,
   getCharacterIdentity,
   getCharacterStats,
@@ -172,6 +173,96 @@ function fileToDataUrl(file: File) {
     reader.readAsDataURL(file);
   });
 }
+
+type OpenRouterMessage = {
+  role: "system" | "user" | "assistant" | "tool";
+  content?: unknown;
+  tool_call_id?: string;
+  tool_calls?: OpenRouterToolCall[];
+};
+
+type OpenRouterToolCall = {
+  id: string;
+  type: "function";
+  function: {
+    name: string;
+    arguments: string;
+  };
+};
+
+type OpenRouterUsage = {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+};
+
+type OpenRouterResponse = {
+  choices?: {
+    message?: {
+      content?: string;
+      tool_calls?: OpenRouterToolCall[];
+    };
+  }[];
+  usage?: OpenRouterUsage;
+};
+
+const characterTools = [
+  {
+    type: "function",
+    function: {
+      name: "find_characters",
+      description: "Find character IDs by canonical character name within the active project before requesting a character division.",
+      parameters: {
+        type: "object",
+        properties: {
+          nameQuery: { type: "string", description: "Canonical name or partial name of the character to find." }
+        },
+        required: ["nameQuery"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_character_identity",
+      description: "Return only the requested character identity division for a stable character ID.",
+      parameters: {
+        type: "object",
+        properties: {
+          characterId: { type: "string", description: "Stable character ID returned by find_characters." }
+        },
+        required: ["characterId"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_character_bio",
+      description: "Return only the requested character bio division for a stable character ID.",
+      parameters: {
+        type: "object",
+        properties: {
+          characterId: { type: "string", description: "Stable character ID returned by find_characters." }
+        },
+        required: ["characterId"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_character_stats",
+      description: "Return only the requested character stats division for a stable character ID.",
+      parameters: {
+        type: "object",
+        properties: {
+          characterId: { type: "string", description: "Stable character ID returned by find_characters." }
+        },
+        required: ["characterId"]
+      }
+    }
+  }
+] as const;
 
 export function App() {
   const [ready, setReady] = useState(false);
@@ -635,6 +726,106 @@ function ChatScreen({
     await db.projects.update(project.id, { ...patch, updatedAt: now() });
     await onRefresh();
   }
+
+  function openRouterPayload(messagesToSend: OpenRouterMessage[], stream: boolean) {
+    const payload: Record<string, unknown> = {
+      model: selectedModelId,
+      messages: messagesToSend,
+      stream
+    };
+    const temperatureValue = optionalNumber(temperature || "0");
+    const topPValue = optionalNumber(topP || "0");
+    const maxTokensValue = optionalNumber(maxTokens);
+    if (temperatureValue !== undefined) payload.temperature = temperatureValue;
+    if (topPValue !== undefined) payload.top_p = topPValue;
+    if (maxTokensValue !== undefined) payload.max_tokens = maxTokensValue;
+    if (includeCharacters) payload.tools = characterTools;
+    if (stream) payload.stream_options = { include_usage: true };
+    return payload;
+  }
+
+  async function openRouterRequest(payload: Record<string, unknown>) {
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${settings.apiKey}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": location.origin,
+        "X-Title": "Mirror 2.0"
+      },
+      body: JSON.stringify(payload)
+    });
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(errorText || `OpenRouter request failed (${response.status})`);
+    }
+    return response;
+  }
+
+  async function runCharacterTool(toolCall: OpenRouterToolCall) {
+    if (!project) return null;
+    let args: Record<string, unknown> = {};
+    try {
+      args = JSON.parse(toolCall.function.arguments || "{}") as Record<string, unknown>;
+    } catch {
+      return { error: "Invalid tool arguments." };
+    }
+    const characterId = typeof args.characterId === "string" ? args.characterId : "";
+    switch (toolCall.function.name) {
+      case "find_characters":
+        return findCharacters(project.id, typeof args.nameQuery === "string" ? args.nameQuery : "");
+      case "get_character_identity":
+        return characterId ? getCharacterIdentity(project.id, characterId) : { error: "characterId is required." };
+      case "get_character_bio":
+        return characterId ? getCharacterBio(project.id, characterId) : { error: "characterId is required." };
+      case "get_character_stats":
+        return characterId ? getCharacterStats(project.id, characterId) : { error: "characterId is required." };
+      default:
+        return { error: `Unknown tool ${toolCall.function.name}.` };
+    }
+  }
+
+  async function resolveCharacterToolCalls(messagesToSend: OpenRouterMessage[], toolLog: string[]) {
+    if (!includeCharacters) return { messages: messagesToSend, usage: undefined as OpenRouterUsage | undefined };
+    let nextMessages = [...messagesToSend];
+    let usage: OpenRouterUsage | undefined;
+    for (let index = 0; index < 4; index += 1) {
+      const response = await openRouterRequest(openRouterPayload(nextMessages, false));
+      const json = await response.json() as OpenRouterResponse;
+      usage = json.usage ?? usage;
+      const assistantMessage = json.choices?.[0]?.message;
+      const toolCalls = assistantMessage?.tool_calls ?? [];
+      if (!toolCalls.length) return { messages: nextMessages, assistantMessage, usage };
+      nextMessages = [
+        ...nextMessages,
+        {
+          role: "assistant",
+          content: assistantMessage?.content ?? "",
+          tool_calls: toolCalls
+        }
+      ];
+      for (const toolCall of toolCalls) {
+        const result = await runCharacterTool(toolCall);
+        toolLog.push(toolCall.function.name);
+        nextMessages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          content: JSON.stringify(result)
+        });
+      }
+    }
+    return { messages: nextMessages, usage };
+  }
+
+  async function completeWithCharacterTools(messagesToSend: OpenRouterMessage[], toolLog: string[]) {
+    const resolved = await resolveCharacterToolCalls(messagesToSend, toolLog);
+    const replyText = typeof resolved.assistantMessage?.content === "string" ? resolved.assistantMessage.content : "";
+    return {
+      replyText,
+      inputTokens: resolved.usage?.prompt_tokens,
+      outputTokens: resolved.usage?.completion_tokens
+    };
+  }
   async function send() {
     if (!project || !body.trim()) return;
     if (!settings.apiKey) {
@@ -687,13 +878,14 @@ function ChatScreen({
       const historyLimit = historyNoLimit ? undefined : optionalNumber(maxHistory);
       const selectedHistory = historyLimit ? allHistory.slice(-historyLimit) : allHistory;
       const images = await Promise.all(attachedImages.map(fileToDataUrl));
-      const requestMessages = [
-        ...(systemParts.length ? [{ role: "system", content: systemParts.join("\n\n") }] : []),
+      const requestMessages: OpenRouterMessage[] = [
+        ...(systemParts.length ? [{ role: "system" as const, content: systemParts.join("\n\n") }] : []),
         ...selectedHistory.map((message) => ({
-          role: message.role === "system" ? "system" : message.role === "assistant" ? "assistant" : "user",
+          role: (message.role === "system" ? "system" : message.role === "assistant" ? "assistant" : "user") as OpenRouterMessage["role"],
           content: message.id === allHistory[allHistory.length - 1]?.id ? openRouterContent(message.body, images) : message.body
         }))
       ];
+      const toolLog: string[] = [];
       const requestInfo = {
         settings: [
           `Model: ${selectedModelId}`,
@@ -711,38 +903,30 @@ function ChatScreen({
           `Compaction memory: ${compactionEnabled ? "on" : "off"}`,
           `Images: ${attachedImages.length}`
         ],
-        toolCalls: ["None"]
+        toolCalls: toolLog
       };
-      const reply = await addMessage(chatId, branchId, "assistant", streamingEnabled ? "" : "...");
-      await db.messages.update(reply.id, { modelId: selectedModelId, status: streamingEnabled ? "streaming" : "pending", requestInfo });
+      const canStreamDirectly = streamingEnabled && !includeCharacters;
+      const reply = await addMessage(chatId, branchId, "assistant", canStreamDirectly ? "" : "...");
+      await db.messages.update(reply.id, { modelId: selectedModelId, status: canStreamDirectly ? "streaming" : "pending", requestInfo });
       await onRefresh();
-      const payload: Record<string, unknown> = {
-        model: selectedModelId,
-        messages: requestMessages,
-        stream: streamingEnabled
-      };
-      const temperatureValue = optionalNumber(temperature || "0");
-      const topPValue = optionalNumber(topP || "0");
-      const maxTokensValue = optionalNumber(maxTokens);
-      if (temperatureValue !== undefined) payload.temperature = temperatureValue;
-      if (topPValue !== undefined) payload.top_p = topPValue;
-      if (maxTokensValue !== undefined) payload.max_tokens = maxTokensValue;
-      if (streamingEnabled) payload.stream_options = { include_usage: true };
       try {
-        const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${settings.apiKey}`,
-            "Content-Type": "application/json",
-            "HTTP-Referer": location.origin,
-            "X-Title": "Mirror 2.0"
-          },
-          body: JSON.stringify(payload)
-        });
-        if (!response.ok) {
-          const errorText = await response.text();
-          throw new Error(errorText || `OpenRouter request failed (${response.status})`);
+        if (includeCharacters) {
+          const completed = await completeWithCharacterTools(requestMessages, toolLog);
+          await db.messages.update(reply.id, {
+            body: completed.replyText || "(No response text returned.)",
+            inputTokens: completed.inputTokens,
+            outputTokens: completed.outputTokens ?? estimateTokens(completed.replyText),
+            estimatedTokens: !completed.outputTokens,
+            status: "complete",
+            requestInfo: { ...requestInfo, toolCalls: toolLog.length ? toolLog : ["None"] },
+            updatedAt: now()
+          });
+          setAttachedImages([]);
+          await onRefresh();
+          return;
         }
+        const response = await openRouterRequest(openRouterPayload(requestMessages, streamingEnabled));
+        await db.messages.update(reply.id, { requestInfo: { ...requestInfo, toolCalls: toolLog.length ? toolLog : ["None"] } });
         if (streamingEnabled && response.body) {
           const reader = response.body.getReader();
           const decoder = new TextDecoder();
@@ -859,13 +1043,14 @@ function ChatScreen({
     const historyLimit = historyNoLimit ? undefined : optionalNumber(maxHistory);
     const limitedHistory = historyLimit ? orderedHistory.slice(-historyLimit) : orderedHistory;
     const selectedHistory = limitedHistory.some((row) => row.id === promptMessage.id) ? limitedHistory : [...limitedHistory, promptMessage].sort((a, b) => a.sequence - b.sequence);
-    const requestMessages = [
-      ...(systemParts.length ? [{ role: "system", content: systemParts.join("\n\n") }] : []),
+    const requestMessages: OpenRouterMessage[] = [
+      ...(systemParts.length ? [{ role: "system" as const, content: systemParts.join("\n\n") }] : []),
       ...selectedHistory.map((historyMessage) => ({
-        role: historyMessage.role === "system" ? "system" : historyMessage.role === "assistant" ? "assistant" : "user",
+        role: (historyMessage.role === "system" ? "system" : historyMessage.role === "assistant" ? "assistant" : "user") as OpenRouterMessage["role"],
         content: historyMessage.body
       }))
     ];
+    const toolLog: string[] = [];
     const requestInfo = {
       settings: [
         `Model: ${selectedModelId}`,
@@ -883,7 +1068,7 @@ function ChatScreen({
         `Compaction memory: ${compactionEnabled ? "on" : "off"}`,
         "Images: 0"
       ],
-      toolCalls: ["None"]
+      toolCalls: toolLog
     };
     let reply: Message | undefined;
     await db.transaction("rw", db.messages, db.stars, db.chats, async () => {
@@ -896,39 +1081,30 @@ function ChatScreen({
         await db.stars.where("messageId").anyOf(messageIds).delete();
         await db.messages.bulkDelete(messageIds);
       }
-      reply = await addMessage(chatId, branchId, "assistant", streamingEnabled ? "" : "...");
-      await db.messages.update(reply.id, { modelId: selectedModelId, status: streamingEnabled ? "streaming" : "pending", requestInfo });
+      const canStreamDirectly = streamingEnabled && !includeCharacters;
+      reply = await addMessage(chatId, branchId, "assistant", canStreamDirectly ? "" : "...");
+      await db.messages.update(reply.id, { modelId: selectedModelId, status: canStreamDirectly ? "streaming" : "pending", requestInfo });
       await db.chats.update(chatId, { updatedAt: timestamp });
     });
     if (!reply) return;
     await onRefresh();
-    const payload: Record<string, unknown> = {
-      model: selectedModelId,
-      messages: requestMessages,
-      stream: streamingEnabled
-    };
-    const temperatureValue = optionalNumber(temperature || "0");
-    const topPValue = optionalNumber(topP || "0");
-    const maxTokensValue = optionalNumber(maxTokens);
-    if (temperatureValue !== undefined) payload.temperature = temperatureValue;
-    if (topPValue !== undefined) payload.top_p = topPValue;
-    if (maxTokensValue !== undefined) payload.max_tokens = maxTokensValue;
-    if (streamingEnabled) payload.stream_options = { include_usage: true };
     try {
-      const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${settings.apiKey}`,
-          "Content-Type": "application/json",
-          "HTTP-Referer": location.origin,
-          "X-Title": "Mirror 2.0"
-        },
-        body: JSON.stringify(payload)
-      });
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(errorText || `OpenRouter request failed (${response.status})`);
+      if (includeCharacters) {
+        const completed = await completeWithCharacterTools(requestMessages, toolLog);
+        await db.messages.update(reply.id, {
+          body: completed.replyText || "(No response text returned.)",
+          inputTokens: completed.inputTokens,
+          outputTokens: completed.outputTokens ?? estimateTokens(completed.replyText),
+          estimatedTokens: !completed.outputTokens,
+          status: "complete",
+          requestInfo: { ...requestInfo, toolCalls: toolLog.length ? toolLog : ["None"] },
+          updatedAt: now()
+        });
+        await onRefresh();
+        return;
       }
+      const response = await openRouterRequest(openRouterPayload(requestMessages, streamingEnabled));
+      await db.messages.update(reply.id, { requestInfo: { ...requestInfo, toolCalls: toolLog.length ? toolLog : ["None"] } });
       if (streamingEnabled && response.body) {
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
