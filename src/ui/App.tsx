@@ -174,6 +174,49 @@ function fileToDataUrl(file: File) {
   });
 }
 
+function renderInlineMarkdown(text: string) {
+  const nodes: React.ReactNode[] = [];
+  const pattern = /(\(\(.+?\)\)|\*\*\*.+?\*\*\*|\*\*.+?\*\*|\*[^*\n]+?\*)/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(text))) {
+    if (match.index > lastIndex) nodes.push(text.slice(lastIndex, match.index));
+    const token = match[0];
+    const key = `${match.index}-${token}`;
+    if (token.startsWith("((") && token.endsWith("))")) {
+      nodes.push(<span className="md-ooc" key={key}>{token.slice(2, -2)}</span>);
+    } else if (token.startsWith("***") && token.endsWith("***")) {
+      nodes.push(<strong key={key}><em>{token.slice(3, -3)}</em></strong>);
+    } else if (token.startsWith("**") && token.endsWith("**")) {
+      nodes.push(<strong key={key}>{token.slice(2, -2)}</strong>);
+    } else if (token.startsWith("*") && token.endsWith("*")) {
+      nodes.push(<em key={key}>{token.slice(1, -1)}</em>);
+    }
+    lastIndex = pattern.lastIndex;
+  }
+  if (lastIndex < text.length) nodes.push(text.slice(lastIndex));
+  return nodes;
+}
+
+function MarkdownText({ text, emptyText }: { text: string; emptyText?: string }) {
+  const source = text || emptyText || "";
+  if (!source) return null;
+  return (
+    <div className="markdown-text">
+      {source.split(/\r?\n/).map((line, index) => {
+        if (/^\s*---\s*$/.test(line)) return <hr key={index} />;
+        const header = /^(#{1,3})\s+(.+)$/.exec(line);
+        if (header) {
+          const level = header[1].length;
+          const Tag = (`h${level}` as "h1" | "h2" | "h3");
+          return <Tag key={index}>{renderInlineMarkdown(header[2])}</Tag>;
+        }
+        return <p key={index}>{line ? renderInlineMarkdown(line) : "\u00a0"}</p>;
+      })}
+    </div>
+  );
+}
+
 type OpenRouterMessage = {
   role: "system" | "user" | "assistant" | "tool";
   content?: unknown;
@@ -285,11 +328,12 @@ export function App() {
   const selectedChat = chats.find((chat) => chat.id === selectedChatId);
 
   async function refresh() {
-    const [nextSettings, nextProjects, nextChats] = await Promise.all([
+    const [nextSettings, nextProjects, unsortedChats] = await Promise.all([
       db.settings.get("settings"),
       db.projects.orderBy("orderIndex").toArray(),
-      selectedProjectId ? db.chats.where("projectId").equals(selectedProjectId).reverse().sortBy("updatedAt") : Promise.resolve([])
+      selectedProjectId ? db.chats.where("projectId").equals(selectedProjectId).toArray() : Promise.resolve([])
     ]);
+    const nextChats = unsortedChats.sort((a, b) => b.updatedAt - a.updatedAt);
     setSettings(nextSettings ?? defaultSettings());
     setProjects(nextProjects);
     setChats(nextChats);
@@ -302,7 +346,7 @@ export function App() {
         .where("[chatId+branchId+sequence]")
         .between([activeChat.id, activeChat.activeBranchId, Dexie.minKey], [activeChat.id, activeChat.activeBranchId, Dexie.maxKey])
         .toArray();
-      setMessages(rows);
+      setMessages(rows.sort((a, b) => a.sequence - b.sequence));
     } else {
       setMessages([]);
     }
@@ -349,6 +393,50 @@ export function App() {
       : routeLabels[route];
 
   if (!ready) return <div className="loading">Mirror 2.0</div>;
+
+  async function selectChat(id: string) {
+    const activeChat = await db.chats.get(id);
+    setSelectedChatId(id);
+    if (!activeChat) {
+      setMessages([]);
+      return;
+    }
+    const [rows, nextChats] = await Promise.all([
+      db.messages
+        .where("[chatId+branchId+sequence]")
+        .between([activeChat.id, activeChat.activeBranchId, Dexie.minKey], [activeChat.id, activeChat.activeBranchId, Dexie.maxKey])
+        .toArray(),
+      db.chats.where("projectId").equals(activeChat.projectId).toArray()
+    ]);
+    setChats(nextChats.sort((a, b) => b.updatedAt - a.updatedAt));
+    setMessages(rows.sort((a, b) => a.sequence - b.sequence));
+  }
+
+  async function renameChat(id: string) {
+    const chat = await db.chats.get(id);
+    if (!chat) return;
+    const nextTitle = prompt("Rename chat thread", chat.title)?.trim();
+    if (!nextTitle || nextTitle === chat.title) return;
+    await db.chats.update(id, { title: nextTitle, titleState: "manual", updatedAt: now() });
+    await refresh();
+  }
+
+  async function deleteChat(id: string) {
+    const chat = await db.chats.get(id);
+    if (!chat) return;
+    if (!confirm(`Delete chat thread "${chat.title}"? This removes its messages and stars.`)) return;
+    await db.transaction("rw", db.chats, db.branches, db.messages, db.stars, async () => {
+      await db.stars.where("chatId").equals(id).delete();
+      await db.messages.where("chatId").equals(id).delete();
+      await db.branches.where("chatId").equals(id).delete();
+      await db.chats.delete(id);
+    });
+    if (selectedChatId === id) {
+      setSelectedChatId(undefined);
+      setMessages([]);
+    }
+    await refresh();
+  }
 
   async function applyUpdate() {
     const registration = await navigator.serviceWorker?.getRegistration?.("./");
@@ -402,10 +490,12 @@ export function App() {
           setDrawerOpen(false);
         }}
         onChat={(id) => {
-          setSelectedChatId(id);
+          void selectChat(id);
           setRoute("chat");
           setDrawerOpen(false);
         }}
+        onRenameChat={renameChat}
+        onDeleteChat={deleteChat}
       />
       <main className="screen">
         {route === "chat" && (
@@ -415,7 +505,7 @@ export function App() {
             messages={messages}
             settings={settings}
             onRefresh={refresh}
-            onChatCreated={setSelectedChatId}
+            onChatCreated={selectChat}
             onRoute={setRoute}
             selectedModelId={selectedModelId}
           />
@@ -593,8 +683,16 @@ function Drawer(props: {
   onRoute: (route: RouteName) => void;
   onProject: (id: string) => void;
   onChat: (id: string) => void;
+  onRenameChat: (id: string) => Promise<void>;
+  onDeleteChat: (id: string) => Promise<void>;
 }) {
   const visibleProjects = props.projects.slice(0, 4);
+  const [pressTimer, setPressTimer] = useState<number>();
+  const [activeChatId, setActiveChatId] = useState<string>();
+  function clearPressTimer() {
+    if (pressTimer) window.clearTimeout(pressTimer);
+    setPressTimer(undefined);
+  }
   return (
     <>
       {props.open && <button className="drawer-backdrop" onClick={props.onClose} aria-label="Close navigation" />}
@@ -626,9 +724,28 @@ function Drawer(props: {
         <DrawerSection title="Chats">
           {props.chats.length === 0 && <p className="muted-pad">No chats yet.</p>}
           {props.chats.map((chat) => (
-            <button key={chat.id} className={`nav-row ${chat.id === props.selectedChatId ? "active" : ""}`} onClick={() => props.onChat(chat.id)}>
-              <MessageSquare size={18} /> {chat.title}
-            </button>
+            <div className="nav-chat" key={chat.id}>
+              <button
+                className={`nav-row ${chat.id === props.selectedChatId ? "active" : ""}`}
+                onClick={() => props.onChat(chat.id)}
+                onPointerDown={() => setPressTimer(window.setTimeout(() => setActiveChatId(chat.id), 520))}
+                onPointerUp={clearPressTimer}
+                onPointerLeave={clearPressTimer}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  setActiveChatId(chat.id);
+                }}
+              >
+                <MessageSquare size={18} /> {chat.title}
+              </button>
+              {activeChatId === chat.id && (
+                <div className="row-context-menu">
+                  <button onClick={async () => { await props.onRenameChat(chat.id); setActiveChatId(undefined); }}><Edit3 size={15} /> Rename</button>
+                  <button className="danger" onClick={async () => { await props.onDeleteChat(chat.id); setActiveChatId(undefined); }}><Trash2 size={15} /> Delete</button>
+                  <button onClick={() => setActiveChatId(undefined)}><X size={15} /> Close</button>
+                </div>
+              )}
+            </div>
           ))}
         </DrawerSection>
         <div className="drawer-foot">
@@ -695,7 +812,7 @@ function ChatScreen({
   messages: Message[];
   settings: AppSettings;
   onRefresh: () => Promise<void>;
-  onChatCreated: (id: string) => void;
+  onChatCreated: (id: string) => void | Promise<void>;
   onRoute: (route: RouteName) => void;
   selectedModelId: string;
 }) {
@@ -840,11 +957,13 @@ function ChatScreen({
     setBody("");
     let chatId = chat?.id;
     let branchId = chat?.activeBranchId;
+    let createdChatId: string | undefined;
     if (!chatId || !branchId) {
       chatId = await createChat(project.id, text);
+      createdChatId = chatId;
       const created = await db.chats.get(chatId);
       branchId = created?.activeBranchId;
-      onChatCreated(chatId);
+      await onChatCreated(chatId);
     } else {
       await addMessage(chatId, branchId, "user", text);
     }
@@ -922,7 +1041,8 @@ function ChatScreen({
             updatedAt: now()
           });
           setAttachedImages([]);
-          await onRefresh();
+          if (createdChatId) await onChatCreated(createdChatId);
+          else await onRefresh();
           return;
         }
         const response = await openRouterRequest(openRouterPayload(requestMessages, streamingEnabled));
@@ -976,12 +1096,13 @@ function ChatScreen({
       }
     }
     setAttachedImages([]);
-    await onRefresh();
+    if (createdChatId) await onChatCreated(createdChatId);
+    else await onRefresh();
   }
 
   async function editMessage(message: Message, nextBody: string) {
     const clean = nextBody.trim();
-    if (!clean) return;
+    if (!clean) return message;
     const timestamp = now();
     await db.transaction("rw", db.messages, db.stars, async () => {
       await db.messages.update(message.id, {
@@ -995,10 +1116,11 @@ function ChatScreen({
       if (star) await db.stars.update(star.id, { bodyCopy: clean, updatedAt: timestamp });
     });
     await onRefresh();
+    return { ...message, body: clean, updatedAt: timestamp, estimatedTokens: true };
   }
 
   async function answeredUserMessage(message: Message) {
-    if (message.role === "user") return message;
+    if (message.role === "user") return (await db.messages.get(message.id)) ?? message;
     return db.messages
       .where("[chatId+branchId+sequence]")
       .between([message.chatId, message.branchId, Dexie.minKey], [message.chatId, message.branchId, message.sequence - 1])
@@ -1220,7 +1342,7 @@ function MessageRow({
   message: Message;
   expanded: boolean;
   onExpand: () => void;
-  onEdit: (message: Message, nextBody: string) => Promise<void>;
+  onEdit: (message: Message, nextBody: string) => Promise<Message>;
   onResend: (message: Message) => Promise<void>;
   onRefresh: () => Promise<void>;
 }) {
@@ -1244,15 +1366,15 @@ function MessageRow({
     setEditOpen(false);
   }
   async function saveEditAndResend() {
-    await onEdit(message, draftBody);
+    const updatedMessage = await onEdit(message, draftBody);
     setEditOpen(false);
-    await onResend(message);
+    await onResend(updatedMessage);
   }
   return (
     <>
       <article className={`message ${message.role}`} onClick={onExpand}>
         {expanded && message.role === "assistant" && message.modelId && <div className="message-model">{message.modelId}</div>}
-        <div className="message-body">{message.body}</div>
+        <div className="message-body"><MarkdownText text={message.body} /></div>
         <div className={`message-meta ${expanded ? "show" : ""}`}>
           <button aria-label="Edit message" title="Edit" onClick={(event) => { event.stopPropagation(); setEditOpen(true); }}><Edit3 size={16} /></button>
           <button aria-label={message.starred ? "Unstar message" : "Star message"} title={message.starred ? "Unstar" : "Star"} onClick={(event) => { event.stopPropagation(); star(); }}><Star size={16} fill={message.starred ? "currentColor" : "none"} /></button>
@@ -2020,7 +2142,7 @@ function ArchiveEntryForm({ entry, onSave }: { entry: { id: string; header: stri
                 {attachments.length > 1 && <ImageStrip attachments={attachments.slice(1)} onOpen={(nextIndex) => setViewerIndex(nextIndex + 1)} />}
               </div>
             )}
-            <p className="entry-body">{entry.body || "No entry text yet."}</p>
+            <div className="entry-body"><MarkdownText text={entry.body} emptyText="No entry text yet." /></div>
           </div>
         </>
       )}
