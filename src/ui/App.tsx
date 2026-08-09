@@ -248,7 +248,7 @@ function jobCategories(jobs: DeltaJobTemplate[]) {
 
 function isDeltaModeRequest(text: string) {
   const clean = text.toLowerCase();
-  return /\bdelta(?:\s+mode)?\b/.test(clean) && /\b(open|start|switch|enter|launch|run|test|try|use|begin)\b/.test(clean);
+  return /\bdelta(?:\s+mode)?\b/.test(clean) && /\b(open|start|switch|enter|launch|run(?:ning)?|test(?:ing)?|try|use|begin|engage|engagement)\b/.test(clean);
 }
 
 function extractJsonObject(text: string) {
@@ -985,7 +985,7 @@ export function App() {
             onRoute={setRoute}
             selectedModelId={selectedModelId}
             models={models}
-            onOpenDelta={(startContext) => openDeltaMode(selectedChat, startContext)}
+            onOpenDelta={(chatOverride, startContext) => openDeltaMode(chatOverride, startContext)}
             onSettingsSaved={async (modelId) => {
               setSelectedModelId(modelId);
               await refresh();
@@ -2376,7 +2376,7 @@ function ChatScreen({
   onRoute: (route: RouteName) => void;
   selectedModelId: string;
   models: { modelId: string; cosmeticName: string }[];
-  onOpenDelta: (startContext: string) => Promise<void>;
+  onOpenDelta: (chat: Chat, startContext: string) => Promise<void>;
   onSettingsSaved: (modelId: string) => Promise<void>;
 }) {
   const [body, setBody] = useState("");
@@ -2731,9 +2731,16 @@ function ChatScreen({
   async function send() {
     if (!project || !body.trim()) return;
     const text = body.trim();
-    if (isDeltaModeRequest(text) && chat) {
+    if (isDeltaModeRequest(text)) {
       setBody("");
-      await onOpenDelta(text);
+      let deltaChat = chat;
+      if (!deltaChat) {
+        const deltaChatId = await createChat(project.id, text);
+        deltaChat = await db.chats.get(deltaChatId);
+        if (!deltaChat) return;
+        await onChatCreated(deltaChatId);
+      }
+      await onOpenDelta(deltaChat, text);
       return;
     }
     if (!settings.apiKey) {
