@@ -23,7 +23,9 @@ import {
   Search,
   Settings,
   Shield,
+  ShoppingBag,
   Star,
+  Swords,
   Trash2,
   Upload,
   UserRound,
@@ -33,10 +35,13 @@ import { db, ensureSeedData } from "../data/db";
 import {
   abilities,
   addMessage,
+  addDeltaMessage,
+  archiveDeltaSession,
   createChat,
   createMemory,
   createProject,
   findCharacters,
+  getOrCreateDeltaSession,
   getCharacterBio,
   getCharacterIdentity,
   getCharacterStats,
@@ -45,7 +50,7 @@ import {
   validatePointBuy
 } from "../data/repositories";
 import { defaultMemoryInstruction, defaultSettings } from "../data/defaults";
-import { Ability, AppSettings, Character, CharacterBonus, Chat, InventoryKind, InventoryItem, InventoryLog, Memory, Message, Project, RouteName } from "../types";
+import { Ability, AppSettings, Character, CharacterBonus, Chat, DeltaEntity, DeltaMessage, DeltaSession, InventoryKind, InventoryItem, InventoryLog, Memory, Message, Project, RouteName } from "../types";
 import { estimateTokens, formatDate, normaliseTag, now, splitTags, uid } from "../utils";
 import { ProjectIcon, projectIcons } from "./icons";
 
@@ -205,6 +210,11 @@ function MarkdownText({ text, emptyText }: { text: string; emptyText?: string })
     <div className="markdown-text">
       {source.split(/\r?\n/).map((line, index) => {
         if (/^\s*---\s*$/.test(line)) return <hr key={index} />;
+        const quote = /^(>{1,3})\s*(.*)$/.exec(line);
+        if (quote) {
+          const depth = quote[1].length;
+          return <blockquote className={`md-quote depth-${depth}`} key={index}>{quote[2] ? renderInlineMarkdown(quote[2]) : "\u00a0"}</blockquote>;
+        }
         const header = /^(#{1,3})\s+(.+)$/.exec(line);
         if (header) {
           const level = header[1].length;
@@ -322,10 +332,23 @@ export function App() {
   const [models, setModels] = useState<{ modelId: string; cosmeticName: string }[]>([]);
   const [selectedModelId, setSelectedModelId] = useState("");
   const [inventoryOpen, setInventoryOpen] = useState(false);
+  const [deltaOpen, setDeltaOpen] = useState(false);
+  const [deltaSession, setDeltaSession] = useState<DeltaSession>();
+  const [deltaMessages, setDeltaMessages] = useState<DeltaMessage[]>([]);
+  const [deltaEntities, setDeltaEntities] = useState<DeltaEntity[]>([]);
+  const [archivedDeltaSessions, setArchivedDeltaSessions] = useState<DeltaSession[]>([]);
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const selectedProject = projects.find((project) => project.id === selectedProjectId);
   const editingProject = projects.find((project) => project.id === (editingProjectId ?? selectedProjectId));
   const selectedChat = chats.find((chat) => chat.id === selectedChatId);
+
+  useEffect(() => {
+    setDeltaOpen(false);
+    setDeltaSession(undefined);
+    setDeltaMessages([]);
+    setDeltaEntities([]);
+    setArchivedDeltaSessions([]);
+  }, [selectedChatId]);
 
   async function refresh() {
     const [nextSettings, nextProjects, unsortedChats] = await Promise.all([
@@ -339,7 +362,7 @@ export function App() {
     setChats(nextChats);
     const nextModels = await db.modelLibrary.orderBy("orderIndex").toArray();
     setModels(nextModels);
-    setSelectedModelId((current) => current || nextSettings?.defaultModelId || nextModels[0]?.modelId || "");
+    setSelectedModelId((current) => nextSettings?.defaultModelId || current || nextModels[0]?.modelId || "");
     const activeChat = selectedChatId ? await db.chats.get(selectedChatId) : undefined;
     if (activeChat) {
       const rows = await db.messages
@@ -379,6 +402,7 @@ export function App() {
     document.documentElement.style.setProperty("--app-font-size", `${settings.fontScale ?? 16}px`);
     document.documentElement.style.setProperty("--entry-width", `${settings.entryWidth}%`);
     document.documentElement.style.setProperty("--message-gap", `${settings.messageSpacing}px`);
+    document.documentElement.style.setProperty("--paragraph-gap", `${settings.paragraphSpacing ?? 4}px`);
     const tokens = accentTokens(accents.find((accent) => accent.name === settings.accent)?.value ?? accents[0].value);
     document.documentElement.style.setProperty("--accent", tokens.accent);
     document.documentElement.style.setProperty("--accent-fill", tokens.fill);
@@ -425,10 +449,16 @@ export function App() {
     const chat = await db.chats.get(id);
     if (!chat) return;
     if (!confirm(`Delete chat thread "${chat.title}"? This removes its messages and stars.`)) return;
-    await db.transaction("rw", db.chats, db.branches, db.messages, db.stars, async () => {
+    await db.transaction("rw", [db.chats, db.branches, db.messages, db.stars, db.deltaSessions, db.deltaMessages, db.deltaEntities], async () => {
+      const deltaSessionIds = (await db.deltaSessions.where("chatId").equals(id).primaryKeys()) as string[];
       await db.stars.where("chatId").equals(id).delete();
       await db.messages.where("chatId").equals(id).delete();
       await db.branches.where("chatId").equals(id).delete();
+      if (deltaSessionIds.length) {
+        await db.deltaMessages.where("sessionId").anyOf(deltaSessionIds).delete();
+        await db.deltaEntities.where("sessionId").anyOf(deltaSessionIds).delete();
+      }
+      await db.deltaSessions.where("chatId").equals(id).delete();
       await db.chats.delete(id);
     });
     if (selectedChatId === id) {
@@ -436,6 +466,35 @@ export function App() {
       setMessages([]);
     }
     await refresh();
+  }
+
+  async function openDeltaMode() {
+    if (!selectedProject || !selectedChat) return;
+    const session = await getOrCreateDeltaSession(selectedChat);
+    const [nextMessages, nextEntities, archivedSessions] = await Promise.all([
+      db.deltaMessages.where("sessionId").equals(session.id).toArray(),
+      db.deltaEntities.where("sessionId").equals(session.id).toArray(),
+      db.deltaSessions.where("chatId").equals(selectedChat.id).and((item) => !item.active).toArray()
+    ]);
+    setDeltaSession(session);
+    setDeltaMessages(nextMessages.sort((a, b) => a.sequence - b.sequence));
+    setDeltaEntities(nextEntities.sort((a, b) => a.orderIndex - b.orderIndex));
+    setArchivedDeltaSessions(archivedSessions.sort((a, b) => b.updatedAt - a.updatedAt));
+    setDeltaOpen(true);
+  }
+
+  async function refreshDeltaMode() {
+    if (!deltaSession) return;
+    const [session, nextMessages, nextEntities, archivedSessions] = await Promise.all([
+      db.deltaSessions.get(deltaSession.id),
+      db.deltaMessages.where("sessionId").equals(deltaSession.id).toArray(),
+      db.deltaEntities.where("sessionId").equals(deltaSession.id).toArray(),
+      db.deltaSessions.where("chatId").equals(deltaSession.chatId).and((item) => !item.active).toArray()
+    ]);
+    if (session) setDeltaSession(session);
+    setDeltaMessages(nextMessages.sort((a, b) => a.sequence - b.sequence));
+    setDeltaEntities(nextEntities.sort((a, b) => a.orderIndex - b.orderIndex));
+    setArchivedDeltaSessions(archivedSessions.sort((a, b) => b.updatedAt - a.updatedAt));
   }
 
   async function applyUpdate() {
@@ -463,15 +522,32 @@ export function App() {
         onMenu={() => setDrawerOpen(true)}
         right={route === "chat" && selectedProject ? (
           <div className="header-actions">
-            {(selectedProject.inventoryEnabled || selectedProject.gearEnabled) && <button className="inventory-trigger" onClick={() => setInventoryOpen(true)}>INV</button>}
-            <select className="header-model-picker" value={selectedModelId} onChange={async (event) => { setSelectedModelId(event.target.value); await db.settings.update("settings", { defaultModelId: event.target.value, updatedAt: now() }); }}>
-              <option value="">Model</option>
-              {models.map((model) => <option value={model.modelId} key={model.modelId}>{model.cosmeticName}</option>)}
-            </select>
+            {(selectedProject.inventoryEnabled || selectedProject.gearEnabled) && (
+              <button className="inventory-trigger" onClick={() => setInventoryOpen(true)} aria-label="Open inventory" title="Inventory">
+                <ShoppingBag size={19} />
+              </button>
+            )}
+            {selectedChat && (
+              <button className="inventory-trigger" type="button" onClick={openDeltaMode} aria-label="Open Delta Mode" title="Delta Mode">
+                <Swords size={19} />
+              </button>
+            )}
           </div>
         ) : undefined}
       />
       {selectedProject && <InventoryDrawer open={inventoryOpen} project={selectedProject} onClose={() => setInventoryOpen(false)} onRefresh={refresh} />}
+      {selectedProject && selectedChat && deltaOpen && deltaSession && (
+        <DeltaModeWorkspace
+          project={selectedProject}
+          chat={selectedChat}
+          session={deltaSession}
+          messages={deltaMessages}
+          entities={deltaEntities}
+          archivedSessions={archivedDeltaSessions}
+          onClose={() => setDeltaOpen(false)}
+          onRefresh={refreshDeltaMode}
+        />
+      )}
       <Drawer
         open={drawerOpen}
         projects={projects}
@@ -508,6 +584,11 @@ export function App() {
             onChatCreated={selectChat}
             onRoute={setRoute}
             selectedModelId={selectedModelId}
+            models={models}
+            onSettingsSaved={async (modelId) => {
+              setSelectedModelId(modelId);
+              await refresh();
+            }}
           />
         )}
         {route === "projects" && <ProjectsPage projects={projects} selectedProjectId={selectedProjectId} onSelect={setSelectedProjectId} onEdit={(id) => { setEditingProjectId(id); setRoute("projectEdit"); }} onRefresh={refresh} />}
@@ -622,6 +703,162 @@ function InventoryItemRow({ item, onRefresh }: { item: InventoryItem; onRefresh:
       <button onClick={() => { const next = Math.max(0, quantity - 1); setQuantity(next); save(next); }}>-</button>
       <input type="number" value={quantity} onChange={(event) => setQuantity(Number(event.target.value))} onBlur={() => save()} />
       <button onClick={() => { const next = quantity + 1; setQuantity(next); save(next); }}>+</button>
+    </div>
+  );
+}
+
+function DeltaModeWorkspace({
+  project,
+  chat,
+  session,
+  messages,
+  entities,
+  archivedSessions,
+  onClose,
+  onRefresh
+}: {
+  project: Project;
+  chat: Chat;
+  session: DeltaSession;
+  messages: DeltaMessage[];
+  entities: DeltaEntity[];
+  archivedSessions: DeltaSession[];
+  onClose: () => void;
+  onRefresh: () => Promise<void>;
+}) {
+  const [body, setBody] = useState("");
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsDraft, setSettingsDraft] = useState(session.settings);
+  const [previewSession, setPreviewSession] = useState<DeltaSession>();
+  const [previewMessages, setPreviewMessages] = useState<DeltaMessage[]>([]);
+  const [saved, showSaved] = useSavedNotice();
+  useEffect(() => setSettingsDraft(session.settings), [session.id, session.settings]);
+  async function send() {
+    const clean = body.trim();
+    if (!clean || !session.active) return;
+    setBody("");
+    await addDeltaMessage(session.id, "user", clean);
+    await onRefresh();
+  }
+  async function archiveCurrent() {
+    if (!confirm("Archive this Delta engagement? It will remain visible as a read-only record for this chat.")) return;
+    await archiveDeltaSession(session.id);
+    await onRefresh();
+    onClose();
+  }
+  async function openArchived(sessionRecord: DeltaSession) {
+    const archivedMessages = await db.deltaMessages.where("sessionId").equals(sessionRecord.id).toArray();
+    setPreviewSession(sessionRecord);
+    setPreviewMessages(archivedMessages.sort((a, b) => a.sequence - b.sequence));
+  }
+  async function saveSettings() {
+    await db.deltaSessions.update(session.id, { settings: settingsDraft, updatedAt: now() });
+    showSaved();
+    await onRefresh();
+  }
+  const playerEntityId = settingsDraft.playerEntityId ?? entities[0]?.id;
+  return (
+    <div className="delta-layer">
+      <button className="delta-dim" onClick={onClose} aria-label="Close Delta Mode" />
+      <aside className="delta-workspace">
+        <div className="delta-top">
+          <div>
+            <small>{project.name} / {chat.title}</small>
+            <h2>Delta Mode</h2>
+          </div>
+          <div className="split-actions">
+            <button className="icon-button" onClick={() => setSettingsOpen(!settingsOpen)} aria-label="Delta settings"><Settings size={18} /></button>
+            <button className="icon-button" onClick={onClose} aria-label="Close Delta Mode"><X size={18} /></button>
+          </div>
+        </div>
+        <section className="delta-hud">
+          <div className="section-title"><h2>Entity List</h2><span className="save-status">Placeholder</span></div>
+          <div className="delta-entity-list">
+            {entities.map((entity) => {
+              const hp = entity.currentHp ?? 0;
+              const maxHp = entity.maxHp || 1;
+              return (
+                <div className={`delta-entity ${entity.id === playerEntityId ? "player" : ""}`} key={entity.id}>
+                  <span>{entity.name}</span>
+                  <div className="delta-hp"><i style={{ width: `${Math.max(0, Math.min(100, (hp / maxHp) * 100))}%` }} /></div>
+                  <small>{hp}/{maxHp} HP</small>
+                  <small>{entity.statusText || "No status"}</small>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+        {settingsOpen && (
+          <section className="delta-settings stack">
+            <div className="settings-tabs">
+              <button className="picked">Chat</button>
+              <button>Entity list</button>
+            </div>
+            <label>Delta compaction memory<textarea value={settingsDraft.compactionMemory} onChange={(event) => setSettingsDraft({ ...settingsDraft, compactionMemory: event.target.value })} /></label>
+            <label>History limit<input type="number" min={1} value={settingsDraft.maxHistoryMessages ?? ""} placeholder="no limit" onChange={(event) => setSettingsDraft({ ...settingsDraft, maxHistoryMessages: event.target.value === "" ? undefined : Number(event.target.value) })} /></label>
+            <label>Player character<select value={playerEntityId ?? ""} onChange={(event) => setSettingsDraft({ ...settingsDraft, playerEntityId: event.target.value })}>{entities.map((entity) => <option value={entity.id} key={entity.id}>{entity.name}</option>)}</select></label>
+            <p className="notice">Future entity-list options will live here, including image uploads and compact display preferences.</p>
+            <div className="split-actions"><button onClick={saveSettings}><Save size={18} /> Save Delta settings</button>{saved && <span className="save-status">Saved</span>}</div>
+          </section>
+        )}
+        <div className="delta-body">
+          <section className="delta-summary">
+            <h2>Engagement Summary</h2>
+            <p>This Delta workspace is attached to this chat. Its active notes stay separate from the main transcript and archived engagements stay reference-only.</p>
+          </section>
+          {archivedSessions.length > 0 && (
+            <section className="delta-summary">
+              <div className="section-title"><h2>Delta History</h2><span>{archivedSessions.length}</span></div>
+              <div className="delta-history-list">
+                {archivedSessions.map((item) => (
+                  <button key={item.id} onClick={() => openArchived(item)}>
+                    <span>{item.title}</span>
+                    <small>{formatDate(item.archivedAt ?? item.updatedAt)}</small>
+                  </button>
+                ))}
+              </div>
+            </section>
+          )}
+          <div className="delta-messages">
+            {messages.map((message) => (
+              <article className={`message ${message.role === "user" ? "user" : "assistant"}`} key={message.id}>
+                <div className="message-body"><MarkdownText text={message.body} /></div>
+              </article>
+            ))}
+          </div>
+          <section className="delta-conclusion">
+            <h2>Conclusion</h2>
+            <div className="mini-row"><strong>Engagement Summary</strong><span>Pending outcome</span></div>
+            <div className="mini-row"><strong>Loot</strong><span>Mock item, Mock clue, Mock currency</span></div>
+            <div className="split-actions">
+              <button onClick={archiveCurrent}>Archive engagement</button>
+              <button onClick={onClose}>Continue</button>
+            </div>
+          </section>
+        </div>
+        <section className="composer delta-composer">
+          <textarea value={body} onChange={(event) => setBody(event.target.value)} placeholder="Write Delta notes" rows={2} />
+          <button className="send-button" onClick={send}>Send</button>
+        </section>
+      </aside>
+      {previewSession && (
+        <div className="modal-backdrop" onClick={() => setPreviewSession(undefined)}>
+          <section className="modal delta-archive-preview" onClick={(event) => event.stopPropagation()}>
+            <div className="section-title">
+              <h2>{previewSession.title}</h2>
+              <button className="icon-button" onClick={() => setPreviewSession(undefined)} aria-label="Close archived engagement"><X size={18} /></button>
+            </div>
+            <p className="notice">Archived Delta engagements are read-only reference records and are not used for future Delta prompts, summaries, or compaction.</p>
+            <div className="delta-messages">
+              {previewMessages.map((message) => (
+                <article className={`message ${message.role === "user" ? "user" : "assistant"}`} key={message.id}>
+                  <div className="message-body"><MarkdownText text={message.body} /></div>
+                </article>
+              ))}
+            </div>
+          </section>
+        </div>
+      )}
     </div>
   );
 }
@@ -805,7 +1042,9 @@ function ChatScreen({
   onRefresh,
   onChatCreated,
   onRoute,
-  selectedModelId
+  selectedModelId,
+  models,
+  onSettingsSaved
 }: {
   project?: Project;
   chat?: Chat;
@@ -815,12 +1054,17 @@ function ChatScreen({
   onChatCreated: (id: string) => void | Promise<void>;
   onRoute: (route: RouteName) => void;
   selectedModelId: string;
+  models: { modelId: string; cosmeticName: string }[];
+  onSettingsSaved: (modelId: string) => Promise<void>;
 }) {
   const [body, setBody] = useState("");
   const [contextOpen, setContextOpen] = useState(false);
-  const [includeWorld, setIncludeWorld] = useState(true);
-  const [includeInstructions, setIncludeInstructions] = useState(true);
-  const [includeCharacters, setIncludeCharacters] = useState(false);
+  const [chatSettingsOpen, setChatSettingsOpen] = useState(false);
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const [draftModelId, setDraftModelId] = useState(selectedModelId);
+  const [includeWorld, setIncludeWorld] = useState(settings.includeWorld ?? true);
+  const [includeInstructions, setIncludeInstructions] = useState(settings.includeInstructions ?? true);
+  const [includeCharacters, setIncludeCharacters] = useState(settings.includeCharacters ?? false);
   const [includeSourceFiles, setIncludeSourceFiles] = useState(settings.includeSourceFiles ?? false);
   const [temperature, setTemperature] = useState(settings.temperature?.toString() ?? "0");
   const [topP, setTopP] = useState(settings.topP?.toString() ?? "0");
@@ -829,24 +1073,60 @@ function ChatScreen({
   const [historyNoLimit, setHistoryNoLimit] = useState(!settings.maxHistoryMessages);
   const [compactionEnabled, setCompactionEnabled] = useState(settings.compactionEnabled ?? false);
   const [streamingEnabled, setStreamingEnabled] = useState(settings.streamingEnabled ?? false);
+  const [inventoryEnabled, setInventoryEnabled] = useState(project?.inventoryEnabled ?? false);
+  const [gearEnabled, setGearEnabled] = useState(project?.gearEnabled ?? false);
   const [attachedImages, setAttachedImages] = useState<File[]>([]);
   const [expandedMessageId, setExpandedMessageId] = useState<string>();
+  const [saved, showSaved] = useSavedNotice();
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => {
+    setDraftModelId(selectedModelId);
+    setIncludeWorld(settings.includeWorld ?? true);
+    setIncludeInstructions(settings.includeInstructions ?? true);
+    setIncludeCharacters(settings.includeCharacters ?? false);
+    setIncludeSourceFiles(settings.includeSourceFiles ?? false);
+    setTemperature(settings.temperature?.toString() ?? "0");
+    setTopP(settings.topP?.toString() ?? "0");
+    setMaxTokens(settings.maxTokens?.toString() ?? "");
+    setMaxHistory(settings.maxHistoryMessages?.toString() ?? "");
+    setHistoryNoLimit(!settings.maxHistoryMessages);
+    setCompactionEnabled(settings.compactionEnabled ?? false);
+    setStreamingEnabled(settings.streamingEnabled ?? false);
+  }, [settings, selectedModelId]);
+  useEffect(() => {
+    setInventoryEnabled(project?.inventoryEnabled ?? false);
+    setGearEnabled(project?.gearEnabled ?? false);
+  }, [project?.id, project?.inventoryEnabled, project?.gearEnabled]);
   useEffect(() => {
     const composer = composerRef.current;
     if (!composer) return;
     composer.style.height = "auto";
     composer.style.height = `${Math.min(composer.scrollHeight, 240)}px`;
   }, [body]);
-  async function updateProjectInventorySetting(patch: Partial<Pick<Project, "inventoryEnabled" | "gearEnabled">>) {
-    if (!project) return;
-    await db.projects.update(project.id, { ...patch, updatedAt: now() });
-    await onRefresh();
+  async function saveChatSettings() {
+    const timestamp = now();
+    await db.settings.update("settings", {
+      defaultModelId: draftModelId || undefined,
+      temperature: optionalNumber(temperature),
+      topP: optionalNumber(topP),
+      maxTokens: optionalNumber(maxTokens),
+      maxHistoryMessages: historyNoLimit ? undefined : optionalNumber(maxHistory),
+      compactionEnabled,
+      includeWorld,
+      includeInstructions,
+      includeCharacters,
+      includeSourceFiles,
+      streamingEnabled,
+      updatedAt: timestamp
+    });
+    if (project) await db.projects.update(project.id, { inventoryEnabled, gearEnabled, updatedAt: timestamp });
+    showSaved();
+    await onSettingsSaved(draftModelId);
   }
 
   function openRouterPayload(messagesToSend: OpenRouterMessage[], stream: boolean) {
     const payload: Record<string, unknown> = {
-      model: selectedModelId,
+      model: draftModelId,
       messages: messagesToSend,
       stream
     };
@@ -949,7 +1229,7 @@ function ChatScreen({
       alert("Add your OpenRouter API key before sending AI requests. Your draft is still here.");
       return;
     }
-    if (!selectedModelId) {
+    if (!draftModelId) {
       alert("Choose a model before sending.");
       return;
     }
@@ -968,17 +1248,6 @@ function ChatScreen({
       await addMessage(chatId, branchId, "user", text);
     }
     if (chatId && branchId) {
-      const timestamp = now();
-      await db.settings.update("settings", {
-        temperature: optionalNumber(temperature),
-        topP: optionalNumber(topP),
-        maxTokens: optionalNumber(maxTokens),
-        maxHistoryMessages: historyNoLimit ? undefined : optionalNumber(maxHistory),
-        compactionEnabled,
-        includeSourceFiles,
-        streamingEnabled,
-        updatedAt: timestamp
-      });
       const sourceFiles = includeSourceFiles
         ? await db.sourceFiles.where("projectId").equals(project.id).and((file) => Boolean(file.textContent)).toArray()
         : [];
@@ -1007,7 +1276,7 @@ function ChatScreen({
       const toolLog: string[] = [];
       const requestInfo = {
         settings: [
-          `Model: ${selectedModelId}`,
+          `Model: ${draftModelId}`,
           `Temperature: ${temperature || "0"}`,
           `Top P: ${topP || "0"}`,
           `Max output: ${maxTokens || "no limit"}`,
@@ -1026,7 +1295,7 @@ function ChatScreen({
       };
       const canStreamDirectly = streamingEnabled && !includeCharacters;
       const reply = await addMessage(chatId, branchId, "assistant", canStreamDirectly ? "" : "...");
-      await db.messages.update(reply.id, { modelId: selectedModelId, status: canStreamDirectly ? "streaming" : "pending", requestInfo });
+      await db.messages.update(reply.id, { modelId: draftModelId, status: canStreamDirectly ? "streaming" : "pending", requestInfo });
       await onRefresh();
       try {
         if (includeCharacters) {
@@ -1133,7 +1402,7 @@ function ChatScreen({
       alert("Add your OpenRouter API key before regenerating.");
       return;
     }
-    if (!selectedModelId) {
+    if (!draftModelId) {
       alert("Choose a model before regenerating.");
       return;
     }
@@ -1175,7 +1444,7 @@ function ChatScreen({
     const toolLog: string[] = [];
     const requestInfo = {
       settings: [
-        `Model: ${selectedModelId}`,
+        `Model: ${draftModelId}`,
         `Temperature: ${temperature || "0"}`,
         `Top P: ${topP || "0"}`,
         `Max output: ${maxTokens || "no limit"}`,
@@ -1205,7 +1474,7 @@ function ChatScreen({
       }
       const canStreamDirectly = streamingEnabled && !includeCharacters;
       reply = await addMessage(chatId, branchId, "assistant", canStreamDirectly ? "" : "...");
-      await db.messages.update(reply.id, { modelId: selectedModelId, status: canStreamDirectly ? "streaming" : "pending", requestInfo });
+      await db.messages.update(reply.id, { modelId: draftModelId, status: canStreamDirectly ? "streaming" : "pending", requestInfo });
       await db.chats.update(chatId, { updatedAt: timestamp });
     });
     if (!reply) return;
@@ -1302,20 +1571,54 @@ function ChatScreen({
         {contextOpen && (
           <div className="context-popover">
             <label className="file-pick"><ImageIcon size={18} /> Attach image<input type="file" accept="image/*" multiple onChange={(event) => setAttachedImages(Array.from(event.target.files ?? []))} /></label>
-            <label className="compact-check"><input type="checkbox" checked={includeWorld} onChange={(event) => setIncludeWorld(event.target.checked)} /> World Setting</label>
-            <label className="compact-check"><input type="checkbox" checked={includeInstructions} onChange={(event) => setIncludeInstructions(event.target.checked)} /> Instructions</label>
-            <label className="compact-check"><input type="checkbox" checked={includeCharacters} onChange={(event) => setIncludeCharacters(event.target.checked)} /> Characters</label>
-            <label className="compact-check"><input type="checkbox" checked={includeSourceFiles} onChange={(event) => setIncludeSourceFiles(event.target.checked)} /> Source files</label>
-            <label className="compact-check"><input type="checkbox" checked={project.inventoryEnabled} onChange={(event) => updateProjectInventorySetting({ inventoryEnabled: event.target.checked })} /> Enable inventory</label>
-            <label className="compact-check"><input type="checkbox" checked={project.gearEnabled} onChange={(event) => updateProjectInventorySetting({ gearEnabled: event.target.checked })} /> Enable gear</label>
-            <label className="compact-check"><input type="checkbox" checked={compactionEnabled} onChange={(event) => setCompactionEnabled(event.target.checked)} /> Compaction memory</label>
-            <button onClick={() => onRoute("compaction")}><BookOpen size={18} /> Open compaction memory</button>
-            <label className="compact-check"><input type="checkbox" checked={streamingEnabled} onChange={(event) => setStreamingEnabled(event.target.checked)} /> Streaming</label>
-            <label>Temperature<input type="number" min={0} max={2} step={0.05} value={temperature} placeholder="0" onChange={(event) => setTemperature(event.target.value)} /></label>
-            <label>Top P<input type="number" min={0} max={1} step={0.05} value={topP} placeholder="0" onChange={(event) => setTopP(event.target.value)} /></label>
-            <label>Max output tokens<input type="number" min={1} max={16000} value={maxTokens} placeholder="no limit" onChange={(event) => setMaxTokens(event.target.value)} /></label>
-            <label className="compact-check"><input type="checkbox" checked={historyNoLimit} onChange={(event) => setHistoryNoLimit(event.target.checked)} /> No message history limit</label>
-            {!historyNoLimit && <label>Message history limit<input type="number" min={10} max={500} value={maxHistory} onChange={(event) => setMaxHistory(event.target.value)} /></label>}
+            <button className="drawer-action-row" type="button" onClick={() => setChatSettingsOpen(!chatSettingsOpen)}>
+              <Settings size={18} /> Chat settings
+            </button>
+            {chatSettingsOpen && (
+              <div className="chat-settings-panel">
+                <button className="model-row" type="button" onClick={() => setModelMenuOpen(!modelMenuOpen)}>
+                  <span>Current model</span>
+                  <strong>{models.find((model) => model.modelId === draftModelId)?.cosmeticName || draftModelId || "Choose model"}</strong>
+                </button>
+                {modelMenuOpen && (
+                  <div className="model-menu">
+                    {models.length === 0 && <p className="muted-pad">Add models in API settings first.</p>}
+                    {models.map((model) => (
+                      <button
+                        key={model.modelId}
+                        className={model.modelId === draftModelId ? "picked" : ""}
+                        type="button"
+                        onClick={() => {
+                          setDraftModelId(model.modelId);
+                          setModelMenuOpen(false);
+                        }}
+                      >
+                        <span>{model.cosmeticName}</span>
+                        <small>{model.modelId}</small>
+                      </button>
+                    ))}
+                  </div>
+                )}
+                <label className="compact-check"><input type="checkbox" checked={includeWorld} onChange={(event) => setIncludeWorld(event.target.checked)} /> World Setting</label>
+                <label className="compact-check"><input type="checkbox" checked={includeInstructions} onChange={(event) => setIncludeInstructions(event.target.checked)} /> Instructions</label>
+                <label className="compact-check"><input type="checkbox" checked={includeCharacters} onChange={(event) => setIncludeCharacters(event.target.checked)} /> Characters</label>
+                <label className="compact-check"><input type="checkbox" checked={includeSourceFiles} onChange={(event) => setIncludeSourceFiles(event.target.checked)} /> Source files</label>
+                <label className="compact-check"><input type="checkbox" checked={inventoryEnabled} onChange={(event) => setInventoryEnabled(event.target.checked)} /> Enable inventory</label>
+                <label className="compact-check"><input type="checkbox" checked={gearEnabled} onChange={(event) => setGearEnabled(event.target.checked)} /> Enable gear</label>
+                <label className="compact-check"><input type="checkbox" checked={compactionEnabled} onChange={(event) => setCompactionEnabled(event.target.checked)} /> Compaction memory</label>
+                <button onClick={() => onRoute("compaction")}><BookOpen size={18} /> Open compaction memory</button>
+                <label className="compact-check"><input type="checkbox" checked={streamingEnabled} onChange={(event) => setStreamingEnabled(event.target.checked)} /> Streaming</label>
+                <label className="range-row"><span>Temperature <b>{temperature || "0"}</b></span><input type="range" min={0} max={2} step={0.05} value={temperature || "0"} onChange={(event) => setTemperature(event.target.value)} /></label>
+                <label className="range-row"><span>Top P <b>{topP || "0"}</b></span><input type="range" min={0} max={1} step={0.05} value={topP || "0"} onChange={(event) => setTopP(event.target.value)} /></label>
+                <label>Max output tokens<input type="number" min={1} max={16000} value={maxTokens} placeholder="no limit" onChange={(event) => setMaxTokens(event.target.value)} /></label>
+                <label className="compact-check"><input type="checkbox" checked={historyNoLimit} onChange={(event) => setHistoryNoLimit(event.target.checked)} /> No message history limit</label>
+                {!historyNoLimit && <label>Message history limit<input type="number" min={10} max={500} value={maxHistory} onChange={(event) => setMaxHistory(event.target.value)} /></label>}
+                <div className="split-actions">
+                  <button onClick={saveChatSettings}><Save size={18} /> Save chat settings</button>
+                  {saved && <span className="save-status">Saved</span>}
+                </div>
+              </div>
+            )}
             {attachedImages.length > 0 && <small>{attachedImages.length} image(s) ready</small>}
           </div>
         )}
@@ -1473,10 +1776,11 @@ function ProjectCard({ project, active, index, total, onSelect, onEdit, projects
     const count = await db.messages.where("chatId").anyOf((await db.chats.where("projectId").equals(project.id).primaryKeys()) as string[]).count();
     const ok = count > 0 ? prompt(`Deleting this project removes chats, messages, stars, archives, characters, and memories. Type DELETE ${project.name} to continue.`) === `DELETE ${project.name}` : confirm("Delete this project and its associated records?");
     if (!ok) return;
-    await db.transaction("rw", [db.projects, db.chats, db.branches, db.messages, db.stars, db.archives, db.archiveEntries, db.characters, db.characterBonuses, db.memories], async () => {
+    await db.transaction("rw", [db.projects, db.chats, db.branches, db.messages, db.stars, db.archives, db.archiveEntries, db.characters, db.characterBonuses, db.memories, db.deltaSessions, db.deltaMessages, db.deltaEntities], async () => {
       const chatIds = (await db.chats.where("projectId").equals(project.id).primaryKeys()) as string[];
       const archiveIds = (await db.archives.where("projectId").equals(project.id).primaryKeys()) as string[];
       const characterIds = (await db.characters.where("projectId").equals(project.id).primaryKeys()) as string[];
+      const deltaSessionIds = chatIds.length ? (await db.deltaSessions.where("chatId").anyOf(chatIds).primaryKeys()) as string[] : [];
       await db.messages.where("chatId").anyOf(chatIds).delete();
       await db.branches.where("chatId").anyOf(chatIds).delete();
       await db.chats.where("projectId").equals(project.id).delete();
@@ -1486,6 +1790,11 @@ function ProjectCard({ project, active, index, total, onSelect, onEdit, projects
       await db.characterBonuses.where("characterId").anyOf(characterIds).delete();
       await db.characters.where("projectId").equals(project.id).delete();
       await db.memories.where("projectId").equals(project.id).delete();
+      if (deltaSessionIds.length) {
+        await db.deltaMessages.where("sessionId").anyOf(deltaSessionIds).delete();
+        await db.deltaEntities.where("sessionId").anyOf(deltaSessionIds).delete();
+      }
+      if (deltaSessionIds.length) await db.deltaSessions.where("id").anyOf(deltaSessionIds).delete();
       await db.projects.delete(project.id);
     });
     await onRefresh();
@@ -1595,6 +1904,7 @@ function SettingsPage({ settings, onRefresh }: { settings: AppSettings; onRefres
           <Segment label="Scope" value={draft.bubbleScope} options={["global", "project"]} onChange={(bubbleScope) => setDraft({ ...draft, bubbleScope })} />
           <label>Entry width {draft.entryWidth}%<input type="range" min={60} max={100} value={draft.entryWidth} onChange={(event) => setDraft({ ...draft, entryWidth: Number(event.target.value) })} /></label>
           <label>Message spacing {draft.messageSpacing}px<input type="range" min={4} max={28} value={draft.messageSpacing} onChange={(event) => setDraft({ ...draft, messageSpacing: Number(event.target.value) })} /></label>
+          <label>Paragraph spacing {draft.paragraphSpacing ?? 4}px<input type="range" min={0} max={18} value={draft.paragraphSpacing ?? 4} onChange={(event) => setDraft({ ...draft, paragraphSpacing: Number(event.target.value) })} /></label>
           <div className="split-actions"><button onClick={save}><Save size={18} /> Save settings</button>{saved && <span className="save-status">Saved</span>}</div>
         </>
       )}
@@ -2208,7 +2518,10 @@ function DataSettingsContent() {
       modelLibrary: await db.modelLibrary.toArray(),
       sourceFiles: await db.sourceFiles.toArray(),
       inventoryItems: await db.inventoryItems.toArray(),
-      inventoryLogs: await db.inventoryLogs.toArray()
+      inventoryLogs: await db.inventoryLogs.toArray(),
+      deltaSessions: await db.deltaSessions.toArray(),
+      deltaMessages: await db.deltaMessages.toArray(),
+      deltaEntities: await db.deltaEntities.toArray()
     };
     downloadJson("mirror-backup.json", data);
   }
@@ -2220,11 +2533,11 @@ function DataSettingsContent() {
         setImportStatus("Invalid import file.");
         return;
       }
-      const counts = ["projects", "chats", "branches", "messages", "stars", "archives", "archiveEntries", "memories", "characters", "modelLibrary", "sourceFiles", "inventoryItems", "inventoryLogs"]
+      const counts = ["projects", "chats", "branches", "messages", "stars", "archives", "archiveEntries", "memories", "characters", "modelLibrary", "sourceFiles", "inventoryItems", "inventoryLogs", "deltaSessions", "deltaMessages", "deltaEntities"]
         .map((key) => `${key}: ${Array.isArray(parsed[key]) ? parsed[key].length : 0}`)
         .join(", ");
       if (!confirm(`Import this backup?\n${counts}`)) return;
-      await db.transaction("rw", [db.settings, db.projects, db.chats, db.branches, db.messages, db.stars, db.archives, db.archiveEntries, db.memories, db.characters, db.modelLibrary, db.sourceFiles, db.inventoryItems, db.inventoryLogs], async () => {
+      await db.transaction("rw", [db.settings, db.projects, db.chats, db.branches, db.messages, db.stars, db.archives, db.archiveEntries, db.memories, db.characters, db.modelLibrary, db.sourceFiles, db.inventoryItems, db.inventoryLogs, db.deltaSessions, db.deltaMessages, db.deltaEntities], async () => {
         if (parsed.settings && typeof parsed.settings === "object") await db.settings.put(parsed.settings as AppSettings);
         if (Array.isArray(parsed.projects)) await db.projects.bulkPut(parsed.projects as Project[]);
         if (Array.isArray(parsed.chats)) await db.chats.bulkPut(parsed.chats as Chat[]);
@@ -2239,6 +2552,9 @@ function DataSettingsContent() {
         if (Array.isArray(parsed.sourceFiles)) await db.sourceFiles.bulkPut(parsed.sourceFiles as never[]);
         if (Array.isArray(parsed.inventoryItems)) await db.inventoryItems.bulkPut(parsed.inventoryItems as never[]);
         if (Array.isArray(parsed.inventoryLogs)) await db.inventoryLogs.bulkPut(parsed.inventoryLogs as never[]);
+        if (Array.isArray(parsed.deltaSessions)) await db.deltaSessions.bulkPut(parsed.deltaSessions as DeltaSession[]);
+        if (Array.isArray(parsed.deltaMessages)) await db.deltaMessages.bulkPut(parsed.deltaMessages as DeltaMessage[]);
+        if (Array.isArray(parsed.deltaEntities)) await db.deltaEntities.bulkPut(parsed.deltaEntities as DeltaEntity[]);
       });
       setImportStatus("Import complete.");
     } catch {

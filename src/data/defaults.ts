@@ -19,8 +19,12 @@ export const defaultSettings = (): AppSettings => {
     bubbleScope: "global",
     entryWidth: 80,
     messageSpacing: 4,
+    paragraphSpacing: 4,
     privacyPreset: "balanced",
     compactionEnabled: false,
+    includeWorld: true,
+    includeInstructions: true,
+    includeCharacters: false,
     includeSourceFiles: false,
     streamingEnabled: false
   };

@@ -56,6 +56,7 @@ export interface AppSettings extends Timestamped {
   bubbleScope: BubbleScope;
   entryWidth: number;
   messageSpacing: number;
+  paragraphSpacing?: number;
   apiKey?: string;
   privacyPreset: "maximum" | "balanced" | "availability";
   defaultModelId?: string;
@@ -64,6 +65,9 @@ export interface AppSettings extends Timestamped {
   maxTokens?: number;
   maxHistoryMessages?: number;
   compactionEnabled?: boolean;
+  includeWorld?: boolean;
+  includeInstructions?: boolean;
+  includeCharacters?: boolean;
   includeSourceFiles?: boolean;
   streamingEnabled?: boolean;
 }
@@ -123,6 +127,45 @@ export interface Message extends Timestamped {
     toggles: string[];
     toolCalls: string[];
   };
+}
+
+export interface DeltaModeSettings {
+  modelId?: string;
+  temperature?: number;
+  topP?: number;
+  maxTokens?: number;
+  maxHistoryMessages?: number;
+  compactionMemory: string;
+  playerEntityId?: string;
+}
+
+export interface DeltaSession extends Timestamped {
+  chatId: string;
+  projectId: string;
+  title: string;
+  active: boolean;
+  archivedAt?: number;
+  settings: DeltaModeSettings;
+}
+
+export interface DeltaMessage extends Timestamped {
+  sessionId: string;
+  sequence: number;
+  role: "user" | "assistant" | "system";
+  body: string;
+  status: "complete" | "pending" | "failed";
+  modelId?: string;
+}
+
+export interface DeltaEntity extends Timestamped {
+  sessionId: string;
+  name: string;
+  side: "party" | "opposition" | "neutral";
+  currentHp?: number;
+  maxHp?: number;
+  statusText?: string;
+  imageAttachmentId?: string;
+  orderIndex: number;
 }
 
 export interface Star extends Timestamped {

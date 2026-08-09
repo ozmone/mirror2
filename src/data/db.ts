@@ -8,6 +8,9 @@ import {
   Character,
   CharacterBonus,
   Chat,
+  DeltaEntity,
+  DeltaMessage,
+  DeltaSession,
   InventoryItem,
   InventoryLog,
   Memory,
@@ -40,6 +43,9 @@ export class MirrorDatabase extends Dexie {
   sourceFiles!: Table<SourceFile, string>;
   inventoryItems!: Table<InventoryItem, string>;
   inventoryLogs!: Table<InventoryLog, string>;
+  deltaSessions!: Table<DeltaSession, string>;
+  deltaMessages!: Table<DeltaMessage, string>;
+  deltaEntities!: Table<DeltaEntity, string>;
 
   constructor(name = "mirror-2") {
     super(name);
@@ -122,6 +128,52 @@ export class MirrorDatabase extends Dexie {
       sourceFiles: "id, [projectId+updatedAt], projectId",
       inventoryItems: "id, [projectId+kind+normalisedName], projectId, kind, updatedAt",
       inventoryLogs: "id, [projectId+updatedAt], projectId"
+    });
+    this.version(5).stores({
+      settings: "id",
+      projects: "id, orderIndex, pinned, locked, updatedAt",
+      chats: "id, [projectId+updatedAt], projectId, activeBranchId, archived",
+      branches: "id, chatId, rootMessageId",
+      messages: "id, [chatId+branchId+sequence], chatId, branchId, parentMessageId, sequence, starred",
+      stars: "id, [projectId+updatedAt], messageId, chatId",
+      archives: "id, [projectId+updatedAt], projectId",
+      archiveEntries: "id, [archiveId+orderIndex], archiveId",
+      attachments: "id, [ownerType+ownerId]",
+      characters: "id, [projectId+normalisedName], [projectId+orderIndex], projectId",
+      characterBonuses: "id, characterId, stat",
+      memories: "id, [projectId+updatedAt], projectId, *normalisedTags, archived",
+      pendingMemories: "id, projectId, updatedAt",
+      modelLibrary: "id, modelId, orderIndex",
+      migrationMetadata: "id, schemaVersion",
+      sourceFiles: "id, [projectId+updatedAt], projectId",
+      inventoryItems: "id, [projectId+kind+normalisedName], projectId, kind, updatedAt",
+      inventoryLogs: "id, [projectId+updatedAt], projectId",
+      deltaSessions: "id, [projectId+updatedAt], projectId, active",
+      deltaMessages: "id, [sessionId+sequence], sessionId, sequence",
+      deltaEntities: "id, [sessionId+orderIndex], sessionId, orderIndex"
+    });
+    this.version(6).stores({
+      settings: "id",
+      projects: "id, orderIndex, pinned, locked, updatedAt",
+      chats: "id, [projectId+updatedAt], projectId, activeBranchId, archived",
+      branches: "id, chatId, rootMessageId",
+      messages: "id, [chatId+branchId+sequence], chatId, branchId, parentMessageId, sequence, starred",
+      stars: "id, [projectId+updatedAt], messageId, chatId",
+      archives: "id, [projectId+updatedAt], projectId",
+      archiveEntries: "id, [archiveId+orderIndex], archiveId",
+      attachments: "id, [ownerType+ownerId]",
+      characters: "id, [projectId+normalisedName], [projectId+orderIndex], projectId",
+      characterBonuses: "id, characterId, stat",
+      memories: "id, [projectId+updatedAt], projectId, *normalisedTags, archived",
+      pendingMemories: "id, projectId, updatedAt",
+      modelLibrary: "id, modelId, orderIndex",
+      migrationMetadata: "id, schemaVersion",
+      sourceFiles: "id, [projectId+updatedAt], projectId",
+      inventoryItems: "id, [projectId+kind+normalisedName], projectId, kind, updatedAt",
+      inventoryLogs: "id, [projectId+updatedAt], projectId",
+      deltaSessions: "id, [chatId+updatedAt], chatId, projectId, active",
+      deltaMessages: "id, [sessionId+sequence], sessionId, sequence",
+      deltaEntities: "id, [sessionId+orderIndex], sessionId, orderIndex"
     });
   }
 }

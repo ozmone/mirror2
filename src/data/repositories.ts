@@ -1,7 +1,7 @@
 import Dexie from "dexie";
 import { db } from "./db";
 import { defaultMemoryInstruction } from "./defaults";
-import { Ability, Character, CharacterBonus, InventoryKind, Memory, Message, Project } from "../types";
+import { Ability, Character, CharacterBonus, Chat, DeltaSession, InventoryKind, Memory, Message, Project } from "../types";
 import { estimateTokens, fallbackChatTitle, normaliseTag, now, uid } from "../utils";
 
 export const abilities: Ability[] = ["STR", "DEX", "CON", "INT", "WIS", "CHA"];
@@ -96,6 +96,56 @@ export async function addMessage(chatId: string, branchId: string, role: Message
   await db.messages.add(message);
   await db.chats.update(chatId, { updatedAt: timestamp });
   return message;
+}
+
+export async function getOrCreateDeltaSession(chat: Chat) {
+  const existing = await db.deltaSessions.where("chatId").equals(chat.id).and((session) => session.active).first();
+  if (existing) return existing;
+  const timestamp = now();
+  const session: DeltaSession = {
+    id: uid(),
+    chatId: chat.id,
+    projectId: chat.projectId,
+    title: "Delta Mode",
+    active: true,
+    settings: {
+      compactionMemory: "",
+      temperature: 0,
+      topP: 0
+    },
+    createdAt: timestamp,
+    updatedAt: timestamp
+  };
+  await db.transaction("rw", db.deltaSessions, db.deltaEntities, db.deltaMessages, async () => {
+    await db.deltaSessions.add(session);
+    await db.deltaEntities.bulkAdd([
+      { id: uid(), sessionId: session.id, name: "Player character", side: "party", currentHp: 10, maxHp: 10, statusText: "Ready", orderIndex: 0, createdAt: timestamp, updatedAt: timestamp },
+      { id: uid(), sessionId: session.id, name: "Opposition", side: "opposition", currentHp: 10, maxHp: 10, statusText: "Placeholder", orderIndex: 1, createdAt: timestamp, updatedAt: timestamp }
+    ]);
+    await db.deltaMessages.add({
+      id: uid(),
+      sessionId: session.id,
+      sequence: 0,
+      role: "system",
+      body: "Engagement Summary\n\nDelta Mode workspace initialized. Use this space for temporary structured engagement notes without changing the main chat.",
+      status: "complete",
+      createdAt: timestamp,
+      updatedAt: timestamp
+    });
+  });
+  return session;
+}
+
+export async function archiveDeltaSession(sessionId: string) {
+  const timestamp = now();
+  await db.deltaSessions.update(sessionId, { active: false, archivedAt: timestamp, updatedAt: timestamp });
+}
+
+export async function addDeltaMessage(sessionId: string, role: "user" | "assistant" | "system", body: string) {
+  const timestamp = now();
+  const sequence = ((await db.deltaMessages.where("[sessionId+sequence]").between([sessionId, Dexie.minKey], [sessionId, Dexie.maxKey]).last())?.sequence ?? -1) + 1;
+  await db.deltaMessages.add({ id: uid(), sessionId, sequence, role, body, status: "complete", createdAt: timestamp, updatedAt: timestamp });
+  await db.deltaSessions.update(sessionId, { updatedAt: timestamp });
 }
 
 export async function toggleStar(projectId: string, message: Message) {
