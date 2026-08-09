@@ -1083,7 +1083,7 @@ small {
 .delta-tool-panel {
   position: absolute;
   z-index: 2;
-  top: calc(92px + env(safe-area-inset-top));
+  top: calc(132px + env(safe-area-inset-top));
   right: 12px;
   width: min(420px, calc(100% - 24px));
   max-height: min(58dvh, 520px);

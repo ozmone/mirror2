@@ -1213,7 +1213,8 @@ function DeltaModeWorkspace({
     onStartContextConsumed();
     void submitDeltaTurn(handoff, {
       hideUser: true,
-      instruction: "Start this Delta engagement from the main-chat handoff. Do not place the handoff text in the user's composer. Begin with a concise summary of how the engagement was reached, then wait for the next turn."
+      stageEngagement: true,
+      instruction: "Start this Delta engagement from the main-chat handoff. Do not place the handoff text in the user's composer. First stage the engagement, then write a concise roleplay-facing opening that establishes who is involved, what is happening, where it is happening, and why it matters. Wait for the next turn."
     });
   }, [startContext, messages.length]);
   useEffect(() => {
@@ -1323,13 +1324,14 @@ function DeltaModeWorkspace({
         return { error: `Unknown Delta tool ${toolCall.function.name}.` };
     }
   }
-  async function completeDeltaTurn(history: OpenRouterMessage[], toolLog: string[]) {
+  async function completeDeltaTurn(history: OpenRouterMessage[], toolLog: string[], requireInitialTool = false) {
     let messagesToSend = history;
     for (let index = 0; index < 4; index += 1) {
       const response = await deltaOpenRouterRequest({
         model: session.settings.modelId || chat.modelId || selectedModelId || settings.defaultModelId,
         messages: messagesToSend,
         tools: [...characterTools, ...deltaEntityTools],
+        ...(requireInitialTool && index === 0 ? { tool_choice: "required" } : {}),
         temperature: session.settings.temperature ?? 0,
         top_p: session.settings.topP ?? 0,
         ...(session.settings.maxTokens ? { max_tokens: session.settings.maxTokens } : {})
@@ -1350,7 +1352,7 @@ function DeltaModeWorkspace({
     }
     return "Delta tools reached their turn limit. Continue from the current engagement state.";
   }
-  async function submitDeltaTurn(clean: string, options: { hideUser?: boolean; instruction?: string } = {}) {
+  async function submitDeltaTurn(clean: string, options: { hideUser?: boolean; instruction?: string; stageEngagement?: boolean } = {}) {
     if (!clean || !session.active) return false;
     if (!settings.apiKey) {
       alert("Add your OpenRouter API key before sending Delta AI requests. Your draft is still here.");
@@ -1380,7 +1382,10 @@ function DeltaModeWorkspace({
       `Available PREFIX labels: ${(project.deltaPrefixes ?? []).map((item) => item.label).join(", ") || "(none)"}`,
       `Available BASE labels: ${(project.deltaBases ?? []).map((item) => item.label).join(", ") || "(none)"}`,
       `Available JOB categories: ${jobCategories(project.deltaJobs ?? []).map(([category, count]) => `${category} (${count})`).join(", ") || "(none)"}`,
-      "When an engagement introduces participants, keep the entity list current. Use saved character IDs for known saved characters. For generated/unlinked entities, use readable PREFIX-BASE JOB labels only when suitable. Do not add A/B/C/D suffixes to actual names."
+      "When an engagement introduces participants, keep the entity list current. Use saved character IDs for known saved characters so their saved stats are authoritative. For generated/unlinked entities, use readable PREFIX-BASE JOB labels only when suitable. Do not add A/B/C/D suffixes to actual names.",
+      options.stageEngagement
+        ? "This is the opening of an engagement. Before writing any response, use create_delta_entity to make the entity list match the scene: retain the player entity, add every named saved character who is currently involved with the correct relationship, and add only immediate NPCs, neutrals, or hostiles that the handoff actually establishes. Do not use placeholders. Then write an opening that clearly states who, what, where, and why in concise roleplay text."
+        : ""
     ].filter(Boolean).join("\n\n");
     const requestMessages: OpenRouterMessage[] = [
       { role: "system", content: context },
@@ -1389,7 +1394,7 @@ function DeltaModeWorkspace({
     ];
     const toolLog: string[] = [];
     try {
-      const reply = await completeDeltaTurn(requestMessages, toolLog);
+      const reply = await completeDeltaTurn(requestMessages, toolLog, options.stageEngagement);
       await db.deltaMessages.update(replyId, { body: reply || "", status: "complete", updatedAt: now() });
     } catch (error) {
       await db.deltaMessages.update(replyId, { body: error instanceof Error ? error.message : "OpenRouter request failed.", status: "failed", updatedAt: now() });
@@ -1924,6 +1929,7 @@ function DeltaModeWorkspace({
             )}
             {activeTool === "settings" && (
               <div className="stack">
+                <div className="section-title"><h2>Delta Settings</h2></div>
                 <label className="range-row">
                   <span>Archived engagements <b>{settingsDraft.maxHistoryMessages === undefined ? "infinite" : settingsDraft.maxHistoryMessages}</b></span>
                   <input
