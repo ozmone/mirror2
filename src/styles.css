@@ -1014,7 +1014,8 @@ small {
 
 .delta-top,
 .delta-tool-panel,
-.delta-actions-panel {
+.delta-actions-panel,
+.delta-dice-panel {
   border: 1px solid var(--line-soft);
   background: color-mix(in srgb, var(--surface) 74%, transparent);
   border-radius: var(--radius-sm);
@@ -1028,9 +1029,16 @@ small {
   gap: 10px;
 }
 
+.delta-title-block {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
 .delta-top h2,
 .delta-tool-panel h2,
-.delta-actions-panel h2 {
+.delta-actions-panel h2,
+.delta-dice-panel h2 {
   margin: 0;
 }
 
@@ -1041,6 +1049,12 @@ small {
 }
 
 .delta-top small {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--muted);
 }
 
@@ -1349,7 +1363,7 @@ small {
 }
 
 .delta-composer {
-  grid-template-columns: auto 1fr auto;
+  grid-template-columns: auto auto 1fr auto;
   border: 1px solid var(--line-soft);
   border-radius: var(--radius-sm);
 }
@@ -1367,6 +1381,56 @@ small {
   max-height: min(48dvh, 430px);
   overflow-y: auto;
   backdrop-filter: var(--blur-panel);
+}
+
+.delta-dice-panel {
+  position: absolute;
+  z-index: 4;
+  left: 12px;
+  bottom: calc(72px + env(safe-area-inset-bottom));
+  width: min(340px, calc(100% - 24px));
+  display: grid;
+  gap: 10px;
+  backdrop-filter: var(--blur-panel);
+}
+
+.dice-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.dice-grid button {
+  min-height: 38px;
+  font-weight: 800;
+}
+
+.delta-finish-modal {
+  max-height: min(82dvh, 720px);
+  overflow-y: auto;
+}
+
+.loot-review-list {
+  display: grid;
+  gap: 8px;
+}
+
+.loot-review-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 72px auto auto;
+  gap: 8px;
+  align-items: center;
+  padding: 8px;
+  border-left: 2px solid var(--accent-line);
+  background: color-mix(in srgb, var(--canvas) 50%, transparent);
+}
+
+.loot-review-row strong {
+  overflow-wrap: anywhere;
+}
+
+.loot-review-row input {
+  min-width: 0;
 }
 
 .delta-action-tree {

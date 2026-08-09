@@ -15,6 +15,7 @@ import {
   Folder,
   History,
   Image as ImageIcon,
+  Dices,
   KeyRound,
   Menu,
   MessageSquare,
@@ -58,7 +59,7 @@ import {
   validatePointBuy
 } from "../data/repositories";
 import { defaultDeltaBases, defaultDeltaJobs, defaultDeltaNpcStats, defaultDeltaPrefixes, defaultMemoryInstruction, defaultSettings } from "../data/defaults";
-import { Ability, AbilityModifiers, AbilityScores, AppSettings, Character, CharacterBonus, Chat, DeltaActionMacro, DeltaAllyCacheEntry, DeltaBaseTemplate, DeltaEntity, DeltaJobTemplate, DeltaMessage, DeltaPrefixTemplate, DeltaSession, InventoryKind, InventoryItem, InventoryLog, InventoryUpdateRequest, Memory, Message, PendingMemory, Project, RouteName } from "../types";
+import { Ability, AbilityModifiers, AbilityScores, AppSettings, Character, CharacterBonus, Chat, DeltaActionMacro, DeltaAllyCacheEntry, DeltaBaseTemplate, DeltaEntity, DeltaFinishPacket, DeltaJobTemplate, DeltaLootItem, DeltaMessage, DeltaPrefixTemplate, DeltaSession, InventoryKind, InventoryItem, InventoryLog, InventoryUpdateRequest, Memory, Message, PendingMemory, Project, RouteName } from "../types";
 import { estimateTokens, formatDate, normaliseTag, now, splitTags, uid } from "../utils";
 import { ProjectIcon, projectIcons } from "./icons";
 
@@ -243,6 +244,40 @@ function jobCategories(jobs: DeltaJobTemplate[]) {
     counts.set(category, (counts.get(category) ?? 0) + 1);
   }
   return Array.from(counts.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+}
+
+function isDeltaModeRequest(text: string) {
+  const clean = text.toLowerCase();
+  return /\bdelta(?:\s+mode)?\b/.test(clean) && /\b(open|start|switch|enter|launch|run|test|try|use|begin)\b/.test(clean);
+}
+
+function extractJsonObject(text: string) {
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) throw new Error("No JSON object found.");
+  return text.slice(start, end + 1);
+}
+
+function parseDeltaFinishPacket(text: string): DeltaFinishPacket {
+  const parsed = JSON.parse(extractJsonObject(text)) as Partial<DeltaFinishPacket>;
+  const lootItems = Array.isArray(parsed.lootItems)
+    ? parsed.lootItems.map((item, index) => {
+        const row = item as Partial<DeltaLootItem>;
+        const quantity = Math.max(0, Math.floor(Number(row.quantity) || 0));
+        return {
+          id: typeof row.id === "string" && row.id.trim() ? row.id : uid(),
+          name: typeof row.name === "string" ? row.name.trim() : "",
+          quantity,
+          pickedQuantity: Math.max(0, Math.min(quantity, Math.floor(Number(row.pickedQuantity) || 0)))
+        };
+      }).filter((item) => item.name && item.quantity > 0)
+    : [];
+  return {
+    finalEngagementBeat: String(parsed.finalEngagementBeat ?? "").trim(),
+    outcomeSummary: String(parsed.outcomeSummary ?? "").trim(),
+    lootItems,
+    parentChatHandoff: String(parsed.parentChatHandoff ?? "").trim()
+  };
 }
 
 async function parseJobFiles(files: FileList | null) {
@@ -658,6 +693,7 @@ export function App() {
   const [archivedDeltaSessions, setArchivedDeltaSessions] = useState<DeltaSession[]>([]);
   const [deltaActionMacros, setDeltaActionMacros] = useState<DeltaActionMacro[]>([]);
   const [deltaAllyCache, setDeltaAllyCache] = useState<DeltaAllyCacheEntry[]>([]);
+  const [deltaStartContext, setDeltaStartContext] = useState("");
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const selectedProject = projects.find((project) => project.id === selectedProjectId);
   const editingProject = projects.find((project) => project.id === (editingProjectId ?? selectedProjectId));
@@ -813,15 +849,17 @@ export function App() {
     await refresh();
   }
 
-  async function openDeltaMode() {
-    if (!selectedProject || !selectedChat) return;
-    const session = await getOrCreateDeltaSession(selectedChat);
+  async function openDeltaMode(chatOverride?: Chat, startContext = "") {
+    const activeChat = chatOverride ?? selectedChat;
+    const activeProject = activeChat ? projects.find((project) => project.id === activeChat.projectId) : selectedProject;
+    if (!activeProject || !activeChat) return;
+    const session = await getOrCreateDeltaSession(activeChat);
     const [nextMessages, nextEntities, archivedSessions, actionMacros, allyCache] = await Promise.all([
       db.deltaMessages.where("sessionId").equals(session.id).toArray(),
       db.deltaEntities.where("sessionId").equals(session.id).toArray(),
-      db.deltaSessions.where("chatId").equals(selectedChat.id).and((item) => !item.active).toArray(),
-      db.deltaActionMacros.where("chatId").equals(selectedChat.id).toArray(),
-      db.deltaAllyCache.where("chatId").equals(selectedChat.id).toArray()
+      db.deltaSessions.where("chatId").equals(activeChat.id).and((item) => !item.active).toArray(),
+      db.deltaActionMacros.where("chatId").equals(activeChat.id).toArray(),
+      db.deltaAllyCache.where("chatId").equals(activeChat.id).toArray()
     ]);
     setDeltaSession(session);
     setDeltaMessages(nextMessages.sort((a, b) => a.sequence - b.sequence));
@@ -829,6 +867,7 @@ export function App() {
     setArchivedDeltaSessions(archivedSessions.sort((a, b) => b.updatedAt - a.updatedAt));
     setDeltaActionMacros(actionMacros.sort((a, b) => a.orderIndex - b.orderIndex));
     setDeltaAllyCache(allyCache.sort((a, b) => b.updatedAt - a.updatedAt));
+    setDeltaStartContext(startContext);
     setDeltaOpen(true);
     window.history.pushState({ mirrorDeltaMode: true }, "", window.location.href);
   }
@@ -882,7 +921,7 @@ export function App() {
               </button>
             )}
             {selectedChat && (
-              <button className="inventory-trigger" type="button" onClick={openDeltaMode} aria-label="Open Delta Mode" title="Delta Mode">
+              <button className="inventory-trigger" type="button" onClick={() => openDeltaMode()} aria-label="Open Delta Mode" title="Delta Mode">
                 <Swords size={19} />
               </button>
             )}
@@ -902,6 +941,8 @@ export function App() {
           archivedSessions={archivedDeltaSessions}
           actionMacros={deltaActionMacros}
           allyCache={deltaAllyCache}
+          startContext={deltaStartContext}
+          onStartContextConsumed={() => setDeltaStartContext("")}
           onOpenInventory={() => setInventoryOpen(true)}
           onClose={() => setDeltaOpen(false)}
           onRefresh={refreshDeltaMode}
@@ -944,6 +985,7 @@ export function App() {
             onRoute={setRoute}
             selectedModelId={selectedModelId}
             models={models}
+            onOpenDelta={(startContext) => openDeltaMode(selectedChat, startContext)}
             onSettingsSaved={async (modelId) => {
               setSelectedModelId(modelId);
               await refresh();
@@ -1108,6 +1150,8 @@ function DeltaModeWorkspace({
   archivedSessions,
   actionMacros,
   allyCache,
+  startContext,
+  onStartContextConsumed,
   onOpenInventory,
   onClose,
   onRefresh
@@ -1122,12 +1166,15 @@ function DeltaModeWorkspace({
   archivedSessions: DeltaSession[];
   actionMacros: DeltaActionMacro[];
   allyCache: DeltaAllyCacheEntry[];
+  startContext?: string;
+  onStartContextConsumed: () => void;
   onOpenInventory: () => void;
   onClose: () => void;
   onRefresh: () => Promise<void>;
 }) {
   const [body, setBody] = useState("");
   const [activeTool, setActiveTool] = useState<"entities" | "inventory" | "settings" | "history" | "actions">();
+  const [diceOpen, setDiceOpen] = useState(false);
   const [actionsEditMode, setActionsEditMode] = useState(false);
   const [entitySettingsOpen, setEntitySettingsOpen] = useState(false);
   const [entitySettingsTab, setEntitySettingsTab] = useState<"entities" | "ally-cache">("entities");
@@ -1135,6 +1182,10 @@ function DeltaModeWorkspace({
   const [cacheDraftTag, setCacheDraftTag] = useState("");
   const [cacheImportStatus, setCacheImportStatus] = useState("");
   const [clearCacheOpen, setClearCacheOpen] = useState(false);
+  const [finishPacket, setFinishPacket] = useState<DeltaFinishPacket>();
+  const [finishLoading, setFinishLoading] = useState(false);
+  const [finishError, setFinishError] = useState("");
+  const [forfeitConfirmOpen, setForfeitConfirmOpen] = useState(false);
   const [expandedEntityId, setExpandedEntityId] = useState<string>();
   const [projectCharacters, setProjectCharacters] = useState<Character[]>([]);
   const [settingsDraft, setSettingsDraft] = useState(session.settings);
@@ -1156,6 +1207,15 @@ function DeltaModeWorkspace({
   const archiveLimitOptions = [0, 1, 3, 5, 8, 12, 16, 20, 30, 40, 50, Infinity];
   useEffect(() => setSettingsDraft(session.settings), [session.id, session.settings]);
   useEffect(() => setPlayerCharacterId(chat.deltaPlayerCharacterId ?? ""), [chat.id, chat.deltaPlayerCharacterId]);
+  useEffect(() => {
+    if (!startContext || messages.length > 0) return;
+    const handoff = startContext;
+    onStartContextConsumed();
+    void submitDeltaTurn(handoff, {
+      hideUser: true,
+      instruction: "Start this Delta engagement from the main-chat handoff. Do not place the handoff text in the user's composer. Begin with a concise summary of how the engagement was reached, then wait for the next turn."
+    });
+  }, [startContext, messages.length]);
   useEffect(() => {
     const closeFromHistory = () => onClose();
     window.addEventListener("popstate", closeFromHistory);
@@ -1290,29 +1350,27 @@ function DeltaModeWorkspace({
     }
     return "Delta tools reached their turn limit. Continue from the current engagement state.";
   }
-  async function send() {
-    const clean = body.trim();
-    if (!clean || !session.active) return;
+  async function submitDeltaTurn(clean: string, options: { hideUser?: boolean; instruction?: string } = {}) {
+    if (!clean || !session.active) return false;
     if (!settings.apiKey) {
-      setBody(clean);
       alert("Add your OpenRouter API key before sending Delta AI requests. Your draft is still here.");
-      return;
+      return false;
     }
     const model = session.settings.modelId || chat.modelId || selectedModelId || settings.defaultModelId;
     if (!model) {
-      setBody(clean);
       alert("Choose a model before sending Delta AI requests. Your draft is still here.");
-      return;
+      return false;
     }
-    setBody("");
-    await addDeltaMessage(session.id, "user", clean);
+    if (!options.hideUser) await addDeltaMessage(session.id, "user", clean);
     const timestamp = now();
     const replyId = uid();
-    await db.deltaMessages.add({ id: replyId, sessionId: session.id, sequence: messages.length + 1, role: "assistant", body: "...", status: "pending", modelId: model, createdAt: timestamp, updatedAt: timestamp });
+    await db.deltaMessages.add({ id: replyId, sessionId: session.id, sequence: messages.length + (options.hideUser ? 0 : 1), role: "assistant", body: "...", status: "pending", modelId: model, createdAt: timestamp, updatedAt: timestamp });
     await onRefresh();
     const allCharacters = await db.characters.where("projectId").equals(project.id).toArray();
     const context = [
       `You are in Delta Mode, a separate active messaging workspace attached to this chat. Do not include archived engagements in reasoning.`,
+      "Delta Mode replies should be compact, turn-like, and operational. Use minimal text rows, not long story prose.",
+      "When starting an engagement from a handoff, begin with a brief summary of how the current engagement was reached, then continue as Delta Mode.",
       `Project: ${project.name}`,
       project.instructions ? `Project instructions:\n${project.instructions}` : "",
       project.worldSetting ? `World setting:\n${project.worldSetting}` : "",
@@ -1327,7 +1385,7 @@ function DeltaModeWorkspace({
     const requestMessages: OpenRouterMessage[] = [
       { role: "system", content: context },
       ...messages.map((message) => ({ role: message.role as OpenRouterMessage["role"], content: message.body })),
-      { role: "user", content: clean }
+      { role: "user", content: [options.instruction, clean].filter(Boolean).join("\n\n") }
     ];
     const toolLog: string[] = [];
     try {
@@ -1337,11 +1395,121 @@ function DeltaModeWorkspace({
       await db.deltaMessages.update(replyId, { body: error instanceof Error ? error.message : "OpenRouter request failed.", status: "failed", updatedAt: now() });
     }
     await onRefresh();
+    return true;
   }
-  async function archiveCurrent() {
-    if (!confirm("Archive this Delta engagement? It will remain visible as a read-only record for this chat.")) return;
+  async function send() {
+    const clean = body.trim();
+    if (!clean || !session.active) return;
+    const sent = await submitDeltaTurn(clean);
+    if (sent) setBody("");
+  }
+  function rollDie(sides: number) {
+    const values = new Uint32Array(1);
+    const range = 0x100000000;
+    const limit = range - (range % sides);
+    do {
+      crypto.getRandomValues(values);
+    } while (values[0] >= limit);
+    return (values[0] % sides) + 1;
+  }
+  async function rollDeltaDie(sides: number) {
+    const result = rollDie(sides);
+    await submitDeltaTurn(`Dice roll: d${sides} = ${result}`, {
+      instruction: "This is an actual client-generated dice roll. The result is authoritative. Do not reroll, reinterpret the number, or replace it with an AI-chosen value. Respond with the concise Delta outcome."
+    });
+    setDiceOpen(false);
+  }
+  async function cacheCurrentGeneratedAllies() {
+    await Promise.all(entities.map((entity) => upsertDeltaAllyCache(chat.id, entity)));
+  }
+  function finishContext() {
+    return [
+      "Finish the current Delta engagement and return only valid JSON with this exact object shape:",
+      "{\"finalEngagementBeat\":\"\",\"outcomeSummary\":\"\",\"lootItems\":[{\"id\":\"\",\"name\":\"\",\"quantity\":1,\"pickedQuantity\":0}],\"parentChatHandoff\":\"\"}",
+      "finalEngagementBeat: short in-world closing beat for the Delta transcript.",
+      "outcomeSummary: compact roleplay-facing summary of who was involved, what changed, injuries/deaths/escapes/captures/alliances/hostilities/unresolved threads, scene/location changes, discoveries, and consequences.",
+      "lootItems: only concrete loot or gained items with quantities. Use pickedQuantity 0 initially. Use an empty array if none.",
+      "parentChatHandoff: short roleplay-facing continuation packet for the parent chat. No full transcript, no tool calls, no debug text, no UI wording, no technical explanation.",
+      `Project: ${project.name}`,
+      project.instructions ? `Project instructions:\n${project.instructions}` : "",
+      project.worldSetting ? `World setting:\n${project.worldSetting}` : "",
+      `Current entity list:\n${entities.map((entity) => `- ${entity.name}, ${entity.side}${entity.templateTag ? `, ${entity.templateTag}` : ""}${entity.statusText ? `, ${entity.statusText}` : ""}${entityPositionLabel(entity) ? `, ${entityPositionLabel(entity)}` : ""}`).join("\n") || "(none)"}`,
+      `Delta transcript:\n${messages.map((message) => `${message.role}: ${message.body}`).join("\n\n") || "(none)"}`
+    ].filter(Boolean).join("\n\n");
+  }
+  async function startFinishFlow() {
+    if (!session.active) return;
+    if (!settings.apiKey) {
+      setFinishError("Add your OpenRouter API key before finishing Delta.");
+      return;
+    }
+    const model = session.settings.modelId || chat.modelId || selectedModelId || settings.defaultModelId;
+    if (!model) {
+      setFinishError("Choose a model before finishing Delta.");
+      return;
+    }
+    setFinishError("");
+    setFinishLoading(true);
+    try {
+      await cacheCurrentGeneratedAllies();
+      const response = await deltaOpenRouterRequest({
+        model,
+        messages: [
+          { role: "system", content: "You write concise roleplay-facing Delta finish packets as valid JSON only." },
+          { role: "user", content: finishContext() }
+        ],
+        temperature: session.settings.temperature ?? 0,
+        top_p: session.settings.topP ?? 0,
+        ...(session.settings.maxTokens ? { max_tokens: session.settings.maxTokens } : {})
+      });
+      const json = await response.json() as OpenRouterResponse;
+      const packet = parseDeltaFinishPacket(json.choices?.[0]?.message?.content ?? "");
+      if (!packet.finalEngagementBeat || !packet.parentChatHandoff) throw new Error("Finish packet was missing required text.");
+      await addDeltaMessage(session.id, "assistant", packet.finalEngagementBeat);
+      setFinishPacket(packet);
+      await onRefresh();
+    } catch (error) {
+      setFinishError(error instanceof Error ? error.message : "Finish packet failed.");
+    } finally {
+      setFinishLoading(false);
+    }
+  }
+  function updateLootItem(id: string, patch: Partial<DeltaLootItem>) {
+    if (!finishPacket) return;
+    setFinishPacket({
+      ...finishPacket,
+      lootItems: finishPacket.lootItems.map((item) => {
+        if (item.id !== id) return item;
+        const quantity = Math.max(0, Math.floor(patch.quantity ?? item.quantity));
+        const pickedQuantity = Math.max(0, Math.min(quantity, Math.floor(patch.pickedQuantity ?? item.pickedQuantity)));
+        return { ...item, ...patch, quantity, pickedQuantity };
+      })
+    });
+  }
+  function pickUpAllLoot() {
+    if (!finishPacket) return;
+    setFinishPacket({ ...finishPacket, lootItems: finishPacket.lootItems.map((item) => ({ ...item, pickedQuantity: item.quantity })) });
+  }
+  function hasUnclaimedLoot(packet = finishPacket) {
+    return Boolean(packet?.lootItems.some((item) => item.pickedQuantity < item.quantity));
+  }
+  async function continueFromFinish(force = false) {
+    if (!finishPacket) return;
+    if (!force && hasUnclaimedLoot()) {
+      setForfeitConfirmOpen(true);
+      return;
+    }
+    const timestamp = now();
+    const picked = finishPacket.lootItems.filter((item) => item.pickedQuantity > 0);
+    if (picked.length && !project.inventoryEnabled) await db.projects.update(project.id, { inventoryEnabled: true, updatedAt: timestamp });
+    for (const item of picked) {
+      await applyInventoryChange(project.id, chat.id, "inventory", item.name, item.pickedQuantity, `Recovered ${item.name} x ${item.pickedQuantity}.`);
+    }
+    await addMessage(chat.id, chat.activeBranchId, "system", finishPacket.parentChatHandoff);
     await archiveDeltaSession(session.id, session.title);
     await pruneArchivedDeltaSessions();
+    setFinishPacket(undefined);
+    setForfeitConfirmOpen(false);
     await onRefresh();
     window.history.back();
   }
@@ -1620,11 +1788,11 @@ function DeltaModeWorkspace({
       <div className="delta-dim" aria-hidden="true" />
       <aside className="delta-workspace">
         <div className="delta-top">
-          <div>
-            <h2><Swords size={18} /> {session.title}</h2>
-            <small>{project.name} / {chat.title}</small>
+          <div className="delta-title-block">
+            <h2><Swords size={18} /> Delta Mode</h2>
+            <small title={`${project.name} / ${chat.title}`}>{project.name} / {chat.title}</small>
           </div>
-          <button className="icon-button" onClick={renameActiveEngagement} aria-label="Rename Delta engagement" title="Rename engagement"><Edit3 size={16} /></button>
+          <button className="icon-button" onClick={renameActiveEngagement} aria-label="Rename Delta engagement" title={session.title || "Name engagement"}><Edit3 size={16} /></button>
         </div>
         <nav className="delta-toolbar" aria-label="Delta tools">
           <button className={activeTool === "entities" ? "picked" : ""} onClick={() => setActiveTool(activeTool === "entities" ? undefined : "entities")} aria-label="Entity list"><UserRound size={18} /></button>
@@ -1775,7 +1943,8 @@ function DeltaModeWorkspace({
             {activeTool === "history" && (
               <div className="stack">
                 <div className="section-title"><h2>Delta History</h2><span>{archivedSessions.length}</span></div>
-                <button onClick={archiveCurrent}>Archive current engagement</button>
+                <button onClick={startFinishFlow} disabled={finishLoading}>{finishLoading ? "Finishing..." : "Finish Engagement"}</button>
+                {finishError && <p className="import-errors">{finishError}</p>}
                 <div className="delta-history-list">
                   {archivedSessions.length === 0 && <p className="notice">No archived Delta engagements for this chat yet.</p>}
                   {archivedSessions.map((item) => (
@@ -1799,10 +1968,24 @@ function DeltaModeWorkspace({
           </div>
         </div>
         <section className="composer delta-composer">
-          <button type="button" onClick={() => setActiveTool(activeTool === "actions" ? undefined : "actions")}><Zap size={18} /> Actions</button>
+          <button type="button" onClick={() => { setDiceOpen(false); setActiveTool(activeTool === "actions" ? undefined : "actions"); }}><Zap size={18} /> Actions</button>
+          <button type="button" onClick={() => { setActiveTool(undefined); setDiceOpen(!diceOpen); }} aria-label="Open dice roller" title="Dice"><Dices size={18} /></button>
           <textarea ref={composerRef} value={body} onChange={(event) => setBody(event.target.value)} placeholder="Write Delta message" rows={2} />
           <button className="send-button" onClick={send}>Send</button>
         </section>
+        {diceOpen && (
+          <section className="delta-dice-panel">
+            <div className="section-title">
+              <h2>Dice</h2>
+              <button className="icon-button" onClick={() => setDiceOpen(false)} aria-label="Close dice roller"><X size={16} /></button>
+            </div>
+            <div className="dice-grid">
+              {[4, 6, 8, 10, 12, 20, 100].map((sides) => (
+                <button key={sides} type="button" onClick={() => rollDeltaDie(sides)}>d{sides}</button>
+              ))}
+            </div>
+          </section>
+        )}
         {activeTool === "actions" && (
           <section className="delta-actions-panel">
             <div className="section-title">
@@ -1850,6 +2033,61 @@ function DeltaModeWorkspace({
             <div className="split-actions">
               <button className="danger" onClick={clearAllyCache}><Trash2 size={18} /> Clear cache</button>
               <button onClick={() => setClearCacheOpen(false)}>Cancel</button>
+            </div>
+          </section>
+        </div>
+      )}
+      {finishPacket && (
+        <div className="modal-backdrop" onClick={() => undefined}>
+          <section className="modal delta-finish-modal" onClick={(event) => event.stopPropagation()}>
+            <div className="section-title">
+              <h2>Finish Engagement</h2>
+              <button className="icon-button" onClick={() => setFinishPacket(undefined)} aria-label="Close finish review"><X size={18} /></button>
+            </div>
+            <section className="stack">
+              <h3>Outcome</h3>
+              <MarkdownText text={finishPacket.outcomeSummary} />
+            </section>
+            {finishPacket.lootItems.length > 0 && (
+              <section className="stack">
+                <div className="section-title"><h3>Loot</h3><button onClick={pickUpAllLoot}>Pick Up All</button></div>
+                <div className="loot-review-list">
+                  {finishPacket.lootItems.map((item) => (
+                    <div className="loot-review-row" key={item.id}>
+                      <strong>{item.name}</strong>
+                      <small>{item.pickedQuantity}/{item.quantity}</small>
+                      <input
+                        type="number"
+                        min={0}
+                        max={item.quantity}
+                        value={item.pickedQuantity}
+                        onChange={(event) => updateLootItem(item.id, { pickedQuantity: Number(event.target.value) })}
+                      />
+                      <button onClick={() => updateLootItem(item.id, { pickedQuantity: item.quantity })}>Pick Up</button>
+                      <button onClick={() => updateLootItem(item.id, { pickedQuantity: 0 })}>Drop All</button>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
+            <div className="split-actions">
+              <button className="send-button" onClick={() => continueFromFinish(false)}>Continue</button>
+              <button onClick={() => setFinishPacket(undefined)}>Cancel</button>
+            </div>
+          </section>
+        </div>
+      )}
+      {forfeitConfirmOpen && (
+        <div className="modal-backdrop" onClick={() => setForfeitConfirmOpen(false)}>
+          <section className="modal macro-editor" onClick={(event) => event.stopPropagation()}>
+            <div className="section-title">
+              <h2>Continue in main chat?</h2>
+              <button className="icon-button" onClick={() => setForfeitConfirmOpen(false)} aria-label="Close loot warning"><X size={18} /></button>
+            </div>
+            <p className="notice">You will forfeit any untouched loot.</p>
+            <div className="split-actions">
+              <button className="danger" onClick={() => continueFromFinish(true)}>Continue</button>
+              <button onClick={() => setForfeitConfirmOpen(false)}>Review loot</button>
             </div>
           </section>
         </div>
@@ -2126,6 +2364,7 @@ function ChatScreen({
   onRoute,
   selectedModelId,
   models,
+  onOpenDelta,
   onSettingsSaved
 }: {
   project?: Project;
@@ -2137,6 +2376,7 @@ function ChatScreen({
   onRoute: (route: RouteName) => void;
   selectedModelId: string;
   models: { modelId: string; cosmeticName: string }[];
+  onOpenDelta: (startContext: string) => Promise<void>;
   onSettingsSaved: (modelId: string) => Promise<void>;
 }) {
   const [body, setBody] = useState("");
@@ -2490,6 +2730,12 @@ function ChatScreen({
   }
   async function send() {
     if (!project || !body.trim()) return;
+    const text = body.trim();
+    if (isDeltaModeRequest(text) && chat) {
+      setBody("");
+      await onOpenDelta(text);
+      return;
+    }
     if (!settings.apiKey) {
       alert("Add your OpenRouter API key before sending AI requests. Your draft is still here.");
       return;
@@ -2498,7 +2744,6 @@ function ChatScreen({
       alert("Choose a model before sending.");
       return;
     }
-    const text = body.trim();
     setBody("");
     let chatId = chat?.id;
     let branchId = chat?.activeBranchId;

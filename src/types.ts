@@ -175,6 +175,20 @@ export interface DeltaMessage extends Timestamped {
   modelId?: string;
 }
 
+export interface DeltaLootItem {
+  id: string;
+  name: string;
+  quantity: number;
+  pickedQuantity: number;
+}
+
+export interface DeltaFinishPacket {
+  finalEngagementBeat: string;
+  outcomeSummary: string;
+  lootItems: DeltaLootItem[];
+  parentChatHandoff: string;
+}
+
 export interface DeltaEntity extends Timestamped {
   sessionId: string;
   characterId?: string;

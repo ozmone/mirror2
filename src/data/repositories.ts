@@ -223,6 +223,12 @@ export async function addMessage(chatId: string, branchId: string, role: Message
 export async function getOrCreateDeltaSession(chat: Chat) {
   const existing = await db.deltaSessions.where("chatId").equals(chat.id).and((session) => session.active).first();
   if (existing) {
+    const legacyPlaceholderMessages = await db.deltaMessages
+      .where("sessionId")
+      .equals(existing.id)
+      .and((message) => message.role === "system" && message.body.startsWith("Engagement Summary\n\nDelta Mode workspace initialized."))
+      .primaryKeys() as string[];
+    if (legacyPlaceholderMessages.length) await db.deltaMessages.bulkDelete(legacyPlaceholderMessages);
     const messageCount = await db.deltaMessages.where("sessionId").equals(existing.id).count();
     if (messageCount === 0) {
       const placeholder = await db.deltaEntities
