@@ -430,6 +430,10 @@ small {
   box-shadow: none;
 }
 
+.drawer-backdrop.elevated {
+  z-index: 24;
+}
+
 .drawer {
   position: absolute;
   z-index: 9;
@@ -653,6 +657,60 @@ small {
 
 .message-body {
   line-height: 1.45;
+}
+
+.inventory-update-card {
+  margin-top: 10px;
+  padding: 9px 10px;
+  display: grid;
+  gap: 8px;
+  border-left: 2px solid var(--accent-line);
+  background: color-mix(in srgb, var(--field) 72%, transparent);
+}
+
+.inventory-update-card h3 {
+  margin: 0;
+  color: var(--text);
+  font-size: 0.82rem;
+  font-weight: 760;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.inventory-update-list {
+  display: grid;
+  gap: 4px;
+}
+
+.inventory-update-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  font-size: 0.9rem;
+}
+
+.inventory-update-row span {
+  overflow-wrap: anywhere;
+}
+
+.inventory-update-row.add strong {
+  color: #52b788;
+}
+
+.inventory-update-row.remove strong {
+  color: #e06c75;
+}
+
+.inventory-update-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.inventory-update-actions button {
+  min-height: 32px;
+  padding: 6px 9px;
 }
 
 .markdown-text {
@@ -909,6 +967,15 @@ small {
   padding: 12px;
 }
 
+.inventory-drawer.delta-inventory {
+  position: fixed;
+  z-index: 25;
+  top: calc(116px + env(safe-area-inset-top));
+  right: 14px;
+  width: min(500px, calc(96vw - 24px));
+  max-height: min(68dvh, 580px);
+}
+
 .delta-layer {
   position: fixed;
   inset: 0;
@@ -935,8 +1002,8 @@ small {
   bottom: 0;
   width: min(720px, 96vw);
   display: grid;
-  grid-template-rows: auto auto auto 1fr auto;
-  gap: 10px;
+  grid-template-rows: auto auto 1fr auto;
+  gap: 8px;
   padding: calc(12px + env(safe-area-inset-top)) 12px calc(10px + env(safe-area-inset-bottom));
   background: color-mix(in srgb, var(--glass-strong) 94%, var(--canvas));
   border-left: 1px solid var(--line);
@@ -946,10 +1013,8 @@ small {
 }
 
 .delta-top,
-.delta-hud,
-.delta-settings,
-.delta-summary,
-.delta-conclusion {
+.delta-tool-panel,
+.delta-actions-panel {
   border: 1px solid var(--line-soft);
   background: color-mix(in srgb, var(--surface) 74%, transparent);
   border-radius: var(--radius-sm);
@@ -964,20 +1029,107 @@ small {
 }
 
 .delta-top h2,
-.delta-conclusion h2,
-.delta-summary h2 {
+.delta-tool-panel h2,
+.delta-actions-panel h2 {
   margin: 0;
+}
+
+.delta-top h2 {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .delta-top small {
   color: var(--muted);
 }
 
+.delta-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 0 7px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.delta-toolbar button {
+  min-width: 34px;
+  min-height: 32px;
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+}
+
+.delta-toolbar button.picked {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.delta-tool-panel {
+  position: absolute;
+  z-index: 2;
+  top: calc(92px + env(safe-area-inset-top));
+  right: 12px;
+  width: min(420px, calc(100% - 24px));
+  max-height: min(58dvh, 520px);
+  overflow-y: auto;
+  backdrop-filter: var(--blur-panel);
+}
+
 .delta-entity-list {
   display: grid;
   gap: 5px;
-  max-height: 126px;
+  max-height: 240px;
   overflow-y: auto;
+}
+
+.entity-settings-panel {
+  margin-bottom: 8px;
+  padding: 8px;
+  border-left: 2px solid var(--accent-line);
+  background: color-mix(in srgb, var(--surface) 60%, transparent);
+}
+
+.compact-tabs {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.ally-cache-list {
+  display: grid;
+  gap: 6px;
+}
+
+.ally-cache-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 7px;
+  align-items: center;
+  padding: 7px 8px;
+  border-left: 2px solid var(--line-soft);
+  background: color-mix(in srgb, var(--canvas) 48%, transparent);
+}
+
+.ally-cache-row div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.ally-cache-row small,
+.delta-template-tag {
+  display: block;
+  margin-top: 2px;
+  color: var(--accent);
+  font-size: 0.62rem;
+  font-weight: 760;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.delta-entity-wrap {
+  display: grid;
+  gap: 5px;
 }
 
 .delta-entity {
@@ -989,11 +1141,163 @@ small {
   padding: 4px 6px;
   border-left: 2px solid var(--line);
   background: color-mix(in srgb, var(--canvas) 48%, transparent);
+  color: var(--text);
+  text-align: left;
+  width: 100%;
+  box-shadow: none;
+  cursor: default;
 }
 
 .delta-entity.player {
   border-left-color: var(--accent);
   background: color-mix(in srgb, var(--surface) 80%, var(--accent) 8%);
+}
+
+.delta-entity.ally {
+  border-left-color: #3aa76d;
+}
+
+.delta-entity.neutral {
+  border-left-color: #c7a735;
+}
+
+.delta-entity.hostile {
+  border-left-color: #c65757;
+}
+
+.delta-entity.selected {
+  outline: 1px solid var(--accent-line);
+  background: color-mix(in srgb, var(--surface) 76%, var(--accent) 12%);
+}
+
+.delta-entity select {
+  min-height: 26px;
+  padding: 2px 6px;
+  border-color: var(--line-soft);
+}
+
+.delta-position {
+  grid-column: 1 / 3;
+  color: var(--muted);
+}
+
+.delta-status {
+  grid-column: 3 / -1;
+  color: var(--muted);
+}
+
+.delta-entity-detail {
+  display: grid;
+  gap: 7px;
+  padding: 8px 8px 8px 12px;
+  border-left: 2px solid var(--line-soft);
+  background: color-mix(in srgb, var(--surface) 58%, transparent);
+}
+
+.delta-entity-detail p {
+  margin: 0;
+  color: var(--text-2);
+}
+
+.delta-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 5px;
+}
+
+.delta-stat-grid span {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 4px;
+  align-items: center;
+  padding: 4px 5px;
+  background: color-mix(in srgb, var(--canvas) 52%, transparent);
+}
+
+.delta-stat-grid strong,
+.delta-stat-grid small {
+  justify-self: end;
+}
+
+.delta-settings-editor {
+  gap: 14px;
+}
+
+.ability-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.ability-grid label {
+  gap: 4px;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.ability-grid input {
+  min-width: 0;
+}
+
+.ability-grid.compact {
+  grid-template-columns: repeat(6, minmax(56px, 1fr));
+}
+
+.delta-template-list {
+  display: grid;
+  gap: 10px;
+}
+
+.delta-template-row {
+  display: grid;
+  gap: 10px;
+  padding: 10px;
+  border-left: 2px solid var(--accent-line);
+  background: color-mix(in srgb, var(--surface) 68%, transparent);
+}
+
+.delta-template-row textarea {
+  min-height: 70px;
+}
+
+.delta-category-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 10px;
+  align-items: center;
+  padding: 9px 10px;
+  border-left: 2px solid var(--accent-line);
+  background: color-mix(in srgb, var(--surface) 68%, transparent);
+}
+
+.delta-category-row span {
+  font-weight: 760;
+  overflow-wrap: anywhere;
+}
+
+.import-errors {
+  display: grid;
+  gap: 4px;
+  padding: 8px 10px;
+  border-left: 2px solid #e06c75;
+  background: color-mix(in srgb, #e06c75 12%, transparent);
+}
+
+.import-errors p {
+  margin: 0;
+  color: var(--text);
+}
+
+@media (max-width: 760px) {
+  .ability-grid,
+  .ability-grid.compact {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .delta-category-row {
+    grid-template-columns: 1fr;
+  }
 }
 
 .delta-hp {
@@ -1014,7 +1318,8 @@ small {
   overflow-y: auto;
   display: grid;
   align-content: start;
-  gap: 10px;
+  gap: var(--message-gap);
+  padding: 8px 0;
 }
 
 .delta-messages {
@@ -1043,13 +1348,8 @@ small {
   white-space: nowrap;
 }
 
-.delta-conclusion {
-  display: grid;
-  gap: 8px;
-}
-
 .delta-composer {
-  grid-template-columns: 1fr auto;
+  grid-template-columns: auto 1fr auto;
   border: 1px solid var(--line-soft);
   border-radius: var(--radius-sm);
 }
@@ -1058,9 +1358,68 @@ small {
   width: 100%;
 }
 
+.delta-actions-panel {
+  position: absolute;
+  z-index: 3;
+  left: 12px;
+  right: 12px;
+  bottom: calc(72px + env(safe-area-inset-bottom));
+  max-height: min(48dvh, 430px);
+  overflow-y: auto;
+  backdrop-filter: var(--blur-panel);
+}
+
+.delta-action-tree {
+  display: grid;
+  gap: 5px;
+}
+
+.delta-action-tree .delta-action-tree {
+  margin-left: 14px;
+  padding-left: 10px;
+  border-left: 1px solid var(--line-soft);
+}
+
+.delta-action-node {
+  display: grid;
+  gap: 5px;
+}
+
+.delta-action-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) repeat(4, auto);
+  gap: 5px;
+  align-items: center;
+}
+
+.delta-action-row button {
+  min-height: 30px;
+  padding: 4px 7px;
+}
+
+.delta-action-row button:first-child {
+  justify-content: flex-start;
+  text-align: left;
+  border-color: transparent;
+  background: color-mix(in srgb, var(--surface) 62%, transparent);
+  box-shadow: none;
+}
+
+.split-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
 .delta-archive-preview {
   max-height: min(760px, 86vh);
   overflow: auto;
+}
+
+.macro-editor {
+  display: grid;
+  gap: 10px;
+  width: min(520px, 94vw);
 }
 
 .currency-row,
@@ -1069,6 +1428,26 @@ small {
   grid-template-columns: 1fr 34px 64px 34px;
   gap: 6px;
   align-items: center;
+}
+
+.inventory-item-wrap {
+  display: grid;
+  gap: 6px;
+}
+
+.inline-confirm {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 8px;
+  border-left: 2px solid var(--accent);
+  background: color-mix(in srgb, var(--surface) 72%, var(--accent) 8%);
+  color: var(--text-2);
+}
+
+.inline-confirm span {
+  margin-right: auto;
 }
 
 .currency-row {
@@ -1296,6 +1675,21 @@ small {
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+.inline-setting-pair {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, auto);
+  gap: 8px 12px;
+  align-items: center;
+  padding-left: 12px;
+  border-left: 1px solid var(--line-soft);
+}
+
+@media (max-width: 560px) {
+  .inline-setting-pair {
+    grid-template-columns: 1fr;
+  }
 }
 
 .thumb-strip {

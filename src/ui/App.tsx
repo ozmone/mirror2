@@ -13,10 +13,12 @@ import {
   Clipboard,
   FileText,
   Folder,
+  History,
   Image as ImageIcon,
   KeyRound,
   Menu,
   MessageSquare,
+  Pencil,
   Plus,
   RefreshCw,
   Save,
@@ -29,6 +31,7 @@ import {
   Trash2,
   Upload,
   UserRound,
+  Zap,
   X
 } from "lucide-react";
 import { db, ensureSeedData } from "../data/db";
@@ -36,6 +39,7 @@ import {
   abilities,
   addMessage,
   addDeltaMessage,
+  applyInventoryChange,
   archiveDeltaSession,
   createChat,
   createMemory,
@@ -47,10 +51,14 @@ import {
   getCharacterStats,
   normaliseInventoryName,
   searchMemories,
+  generatedStatsPatch,
+  formatDeltaTemplateTag,
+  toggleStar,
+  upsertDeltaAllyCache,
   validatePointBuy
 } from "../data/repositories";
-import { defaultMemoryInstruction, defaultSettings } from "../data/defaults";
-import { Ability, AppSettings, Character, CharacterBonus, Chat, DeltaEntity, DeltaMessage, DeltaSession, InventoryKind, InventoryItem, InventoryLog, Memory, Message, Project, RouteName } from "../types";
+import { defaultDeltaBases, defaultDeltaJobs, defaultDeltaNpcStats, defaultDeltaPrefixes, defaultMemoryInstruction, defaultSettings } from "../data/defaults";
+import { Ability, AbilityModifiers, AbilityScores, AppSettings, Character, CharacterBonus, Chat, DeltaActionMacro, DeltaAllyCacheEntry, DeltaBaseTemplate, DeltaEntity, DeltaJobTemplate, DeltaMessage, DeltaPrefixTemplate, DeltaSession, InventoryKind, InventoryItem, InventoryLog, InventoryUpdateRequest, Memory, Message, PendingMemory, Project, RouteName } from "../types";
 import { estimateTokens, formatDate, normaliseTag, now, splitTags, uid } from "../utils";
 import { ProjectIcon, projectIcons } from "./icons";
 
@@ -160,6 +168,206 @@ function optionalNumber(value: string) {
   if (value.trim() === "") return undefined;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function cleanAbilityScores(value?: AbilityScores): AbilityScores {
+  const defaults = defaultDeltaNpcStats();
+  return abilities.reduce((scores, ability) => ({ ...scores, [ability]: Number.isFinite(value?.[ability]) ? Number(value?.[ability]) : defaults[ability] }), defaults);
+}
+
+function cleanAbilityModifiers(value?: AbilityModifiers): AbilityModifiers {
+  return abilities.reduce((modifiers, ability) => {
+    const amount = value?.[ability];
+    return Number.isFinite(amount) && amount !== 0 ? { ...modifiers, [ability]: Number(amount) } : modifiers;
+  }, {} as AbilityModifiers);
+}
+
+function isLegacyDefaultTitanBase(item: DeltaBaseTemplate) {
+  return item.id.trim().toLowerCase() === "titan" &&
+    item.label.trim().toUpperCase() === "TITAN" &&
+    Object.keys(cleanAbilityModifiers(item.statModifiers)).length === 0 &&
+    !item.hpBonus &&
+    !item.notes?.trim();
+}
+
+function cleanDeltaPrefixes(value: DeltaPrefixTemplate[]) {
+  return value
+    .map((item) => ({
+      id: item.id.trim() || uid(),
+      label: item.label.trim(),
+      statModifiers: cleanAbilityModifiers(item.statModifiers),
+      notes: item.notes?.trim() || undefined
+    }))
+    .filter((item) => item.label);
+}
+
+function cleanDeltaBases(value: DeltaBaseTemplate[]) {
+  return value
+    .filter((item) => !isLegacyDefaultTitanBase(item))
+    .map((item) => ({
+      id: item.id.trim() || uid(),
+      label: item.label.trim(),
+      statModifiers: cleanAbilityModifiers(item.statModifiers),
+      hpBonus: Number.isFinite(item.hpBonus) && item.hpBonus !== 0 ? Number(item.hpBonus) : undefined,
+      notes: item.notes?.trim() || undefined
+    }))
+    .filter((item) => item.label);
+}
+
+function deltaBaseDraft(value?: DeltaBaseTemplate[]) {
+  const rows = value?.filter((item) => !isLegacyDefaultTitanBase(item));
+  return rows?.length ? rows : defaultDeltaBases();
+}
+
+function cleanDeltaJobs(value: DeltaJobTemplate[]) {
+  return value
+    .map((item) => ({
+      id: item.id.trim() || uid(),
+      label: item.label.trim(),
+      category: item.category.trim(),
+      statModifiers: cleanAbilityModifiers(item.statModifiers),
+      notes: item.notes?.trim() || undefined
+    }))
+    .filter((item) => item.label && item.category);
+}
+
+function categoryFromFilename(filename: string) {
+  return filename.replace(/\.txt$/i, "").trim();
+}
+
+function jobCategories(jobs: DeltaJobTemplate[]) {
+  const counts = new Map<string, number>();
+  for (const job of jobs) {
+    const category = job.category.trim();
+    if (!category) continue;
+    counts.set(category, (counts.get(category) ?? 0) + 1);
+  }
+  return Array.from(counts.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+}
+
+async function parseJobFiles(files: FileList | null) {
+  if (!files?.length) return { jobs: [] as DeltaJobTemplate[], categories: [] as string[], errors: [] as string[] };
+  const jobs: DeltaJobTemplate[] = [];
+  const categories: string[] = [];
+  const errors: string[] = [];
+  for (const file of Array.from(files)) {
+    const category = categoryFromFilename(file.name);
+    if (!category) {
+      errors.push(`${file.name}: filename must contain a category name.`);
+      continue;
+    }
+    const text = await file.text();
+    const parsedRows: DeltaJobTemplate[] = [];
+    text.split(/\r?\n/).forEach((rawLine, lineIndex) => {
+      const line = rawLine.trim();
+      if (!line) return;
+      const fields = line.split(/\s+/);
+      if (fields.length !== 7) {
+        errors.push(`${file.name}:${lineIndex + 1} expected JOB STR DEX CON INT WIS CHA.`);
+        return;
+      }
+      const [label, ...numbers] = fields;
+      const modifiers = numbers.map((value) => Number(value));
+      if (modifiers.some((value) => !Number.isFinite(value))) {
+        errors.push(`${file.name}:${lineIndex + 1} stat modifiers must be numbers.`);
+        return;
+      }
+      parsedRows.push({
+        id: `${category}-${label}`.toLowerCase(),
+        label: label.trim().toUpperCase(),
+        category,
+        statModifiers: {
+          STR: modifiers[0],
+          DEX: modifiers[1],
+          CON: modifiers[2],
+          INT: modifiers[3],
+          WIS: modifiers[4],
+          CHA: modifiers[5]
+        },
+        notes: ""
+      });
+    });
+    if (!errors.some((error) => error.startsWith(`${file.name}:`))) {
+      categories.push(category);
+      jobs.push(...parsedRows);
+    }
+  }
+  return { jobs, categories, errors };
+}
+
+const memoryStopWords = new Set([
+  "about", "after", "again", "against", "also", "because", "before", "being", "between", "could", "every", "from", "have", "into", "just", "like", "more", "much", "need", "only", "over", "really", "should", "some", "that", "their", "them", "then", "there", "these", "thing", "this", "those", "through", "very", "want", "were", "what", "when", "where", "which", "while", "with", "would", "your"
+]);
+
+function extractMemoryConcepts(parts: string[], limit = 16) {
+  const text = parts.join("\n");
+  const properNouns = Array.from(text.matchAll(/\b[A-Z][a-zA-Z0-9'-]{2,}\b/g)).map((match) => match[0].toLowerCase());
+  const words = text
+    .toLowerCase()
+    .split(/[^a-z0-9'-]+/)
+    .map((word) => word.trim())
+    .filter((word) => word.length > 2 && !memoryStopWords.has(word) && !/^\d+$/.test(word));
+  const counts = new Map<string, number>();
+  for (const word of [...properNouns, ...words]) {
+    counts.set(word, (counts.get(word) ?? 0) + (properNouns.includes(word) ? 2 : 1));
+  }
+  return Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, limit)
+    .map(([word]) => word);
+}
+
+function entityDisplayNames(entities: DeltaEntity[]) {
+  return new Map(entities.map((entity) => [entity.id, entity.name]));
+}
+
+function formatEntityNameList(names: string[]) {
+  if (names.length <= 1) return names[0] ?? "";
+  if (names.length === 2) return `${names[0]} and ${names[1]}`;
+  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+}
+
+type DeltaRelationship = DeltaEntity["side"];
+
+const deltaRelationships: DeltaRelationship[] = ["ally", "neutral", "hostile"];
+
+function normaliseDeltaRelationship(value: string): DeltaRelationship {
+  if (value === "ally" || value === "neutral" || value === "hostile") return value;
+  if (value === "party") return "ally";
+  if (value === "opposition") return "hostile";
+  return "neutral";
+}
+
+function deltaRelationshipLabel(value: DeltaRelationship) {
+  if (value === "ally") return "Ally";
+  if (value === "hostile") return "Hostile";
+  return "Neutral";
+}
+
+function statModifier(value?: number) {
+  if (typeof value !== "number") return "";
+  const modifier = Math.floor((value - 10) / 2);
+  return modifier >= 0 ? `+${modifier}` : `${modifier}`;
+}
+
+function deltaEntityStats(entity: DeltaEntity) {
+  return [
+    ["STR", entity.str],
+    ["DEX", entity.dex],
+    ["CON", entity.con],
+    ["INT", entity.int],
+    ["WIS", entity.wis],
+    ["CHA", entity.cha]
+  ] as const;
+}
+
+function visiblePositionValue(value?: string) {
+  if (!value || value.trim().toLowerCase() === "unset") return "";
+  return value;
+}
+
+function entityPositionLabel(entity: DeltaEntity) {
+  return [visiblePositionValue(entity.distanceFromPlayer), visiblePositionValue(entity.elevation)].filter(Boolean).join(", ");
 }
 
 function openRouterContent(text: string, images: { dataUrl: string; mimeType: string }[]) {
@@ -317,6 +525,117 @@ const characterTools = [
   }
 ] as const;
 
+const inventoryTools = [
+  {
+    type: "function",
+    function: {
+      name: "update_inventory_item",
+      description: "Add or subtract a quantity from the current chat inventory or gear. Use a positive delta for gained items and a negative delta for spent/lost/removed items. Item names should be singular stack names where possible.",
+      parameters: {
+        type: "object",
+        properties: {
+          kind: { type: "string", enum: ["inventory", "gear", "currency"], description: "Use inventory for carried items/ammo/consumables, gear for worn/equipped clothing/equipment, and currency for the chat currency amount." },
+          name: { type: "string", description: "Singular item stack name, or the currency name when kind is currency." },
+          delta: { type: "number", description: "Quantity change. Example: -12 when 12 rounds are used, 32 when 32 rounds are picked up." },
+          logSentence: { type: "string", description: "One terse narrative sentence explaining this exact inventory/gear change." }
+        },
+        required: ["kind", "name", "delta", "logSentence"]
+      }
+    }
+  }
+] as const;
+
+const memoryTools = [
+  {
+    type: "function",
+    function: {
+      name: "save_memory",
+      description: "Save or propose one durable memory using the project's memory instruction. Do not save transient scene actions, minor details, duplicates, or speculation.",
+      parameters: {
+        type: "object",
+        properties: {
+          text: { type: "string", description: "One durable memory fact that will remain useful later." },
+          tags: { type: "array", items: { type: "string" }, description: "Relevant names, places, topics, or continuity tags." },
+          reason: { type: "string", description: "Brief reason this is worth remembering." },
+          confidence: { type: "number", description: "Confidence from 0 to 1." }
+        },
+        required: ["text", "tags", "reason", "confidence"]
+      }
+    }
+  }
+] as const;
+
+const deltaEntityTools = [
+  {
+    type: "function",
+    function: {
+      name: "list_delta_job_categories",
+      description: "List available Delta JOB categories for generated entities. Use this before selecting a JOB when categories exist.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_delta_jobs_for_category",
+      description: "Return the JOB templates for one readable category. Pick a JOB label from this list when it fits the narrative.",
+      parameters: {
+        type: "object",
+        properties: {
+          category: { type: "string", description: "Readable JOB category name." }
+        },
+        required: ["category"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "create_delta_entity",
+      description: "Create one current Delta entity. Use saved characterId for known saved characters; otherwise use readable PREFIX, BASE, and optional JOB labels when project templates fit. Do not invent hidden template IDs.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          side: { type: "string", enum: ["ally", "neutral", "hostile"] },
+          characterId: { type: "string", description: "Optional saved character ID returned by find_characters." },
+          prefix: { type: "string", description: "Optional readable PREFIX label, such as DEX." },
+          base: { type: "string", description: "Optional readable BASE label, such as LIGHT." },
+          job: { type: "string", description: "Optional readable JOB label, such as ROGUE." },
+          jobCategory: { type: "string", description: "Optional readable JOB category used only to look up modifiers." },
+          statusText: { type: "string" },
+          distanceFromPlayer: { type: "string" },
+          elevation: { type: "string" }
+        },
+        required: ["name", "side"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "update_delta_entity",
+      description: "Update an existing current Delta entity by entityId. Template values are readable labels only.",
+      parameters: {
+        type: "object",
+        properties: {
+          entityId: { type: "string" },
+          name: { type: "string" },
+          side: { type: "string", enum: ["ally", "neutral", "hostile"] },
+          prefix: { type: "string" },
+          base: { type: "string" },
+          job: { type: "string" },
+          jobCategory: { type: "string" },
+          statusText: { type: "string" },
+          distanceFromPlayer: { type: "string" },
+          elevation: { type: "string" }
+        },
+        required: ["entityId"]
+      }
+    }
+  }
+] as const;
+
 export function App() {
   const [ready, setReady] = useState(false);
   const [settings, setSettings] = useState<AppSettings>(defaultSettings());
@@ -337,6 +656,8 @@ export function App() {
   const [deltaMessages, setDeltaMessages] = useState<DeltaMessage[]>([]);
   const [deltaEntities, setDeltaEntities] = useState<DeltaEntity[]>([]);
   const [archivedDeltaSessions, setArchivedDeltaSessions] = useState<DeltaSession[]>([]);
+  const [deltaActionMacros, setDeltaActionMacros] = useState<DeltaActionMacro[]>([]);
+  const [deltaAllyCache, setDeltaAllyCache] = useState<DeltaAllyCacheEntry[]>([]);
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const selectedProject = projects.find((project) => project.id === selectedProjectId);
   const editingProject = projects.find((project) => project.id === (editingProjectId ?? selectedProjectId));
@@ -348,7 +669,27 @@ export function App() {
     setDeltaMessages([]);
     setDeltaEntities([]);
     setArchivedDeltaSessions([]);
+    setDeltaActionMacros([]);
+    setDeltaAllyCache([]);
   }, [selectedChatId]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (deltaOpen) {
+        event.preventDefault();
+        window.history.back();
+      } else if (inventoryOpen) {
+        event.preventDefault();
+        setInventoryOpen(false);
+      } else if (drawerOpen) {
+        event.preventDefault();
+        setDrawerOpen(false);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [deltaOpen, inventoryOpen, drawerOpen]);
 
   async function refresh() {
     const [nextSettings, nextProjects, unsortedChats] = await Promise.all([
@@ -449,16 +790,20 @@ export function App() {
     const chat = await db.chats.get(id);
     if (!chat) return;
     if (!confirm(`Delete chat thread "${chat.title}"? This removes its messages and stars.`)) return;
-    await db.transaction("rw", [db.chats, db.branches, db.messages, db.stars, db.deltaSessions, db.deltaMessages, db.deltaEntities], async () => {
+    await db.transaction("rw", [db.chats, db.branches, db.messages, db.stars, db.inventoryItems, db.inventoryLogs, db.deltaSessions, db.deltaMessages, db.deltaEntities, db.deltaAllyCache, db.deltaActionMacros], async () => {
       const deltaSessionIds = (await db.deltaSessions.where("chatId").equals(id).primaryKeys()) as string[];
       await db.stars.where("chatId").equals(id).delete();
       await db.messages.where("chatId").equals(id).delete();
       await db.branches.where("chatId").equals(id).delete();
+      await db.inventoryItems.where("chatId").equals(id).delete();
+      await db.inventoryLogs.where("chatId").equals(id).delete();
       if (deltaSessionIds.length) {
         await db.deltaMessages.where("sessionId").anyOf(deltaSessionIds).delete();
         await db.deltaEntities.where("sessionId").anyOf(deltaSessionIds).delete();
       }
       await db.deltaSessions.where("chatId").equals(id).delete();
+      await db.deltaAllyCache.where("chatId").equals(id).delete();
+      await db.deltaActionMacros.where("chatId").equals(id).delete();
       await db.chats.delete(id);
     });
     if (selectedChatId === id) {
@@ -471,30 +816,39 @@ export function App() {
   async function openDeltaMode() {
     if (!selectedProject || !selectedChat) return;
     const session = await getOrCreateDeltaSession(selectedChat);
-    const [nextMessages, nextEntities, archivedSessions] = await Promise.all([
+    const [nextMessages, nextEntities, archivedSessions, actionMacros, allyCache] = await Promise.all([
       db.deltaMessages.where("sessionId").equals(session.id).toArray(),
       db.deltaEntities.where("sessionId").equals(session.id).toArray(),
-      db.deltaSessions.where("chatId").equals(selectedChat.id).and((item) => !item.active).toArray()
+      db.deltaSessions.where("chatId").equals(selectedChat.id).and((item) => !item.active).toArray(),
+      db.deltaActionMacros.where("chatId").equals(selectedChat.id).toArray(),
+      db.deltaAllyCache.where("chatId").equals(selectedChat.id).toArray()
     ]);
     setDeltaSession(session);
     setDeltaMessages(nextMessages.sort((a, b) => a.sequence - b.sequence));
     setDeltaEntities(nextEntities.sort((a, b) => a.orderIndex - b.orderIndex));
     setArchivedDeltaSessions(archivedSessions.sort((a, b) => b.updatedAt - a.updatedAt));
+    setDeltaActionMacros(actionMacros.sort((a, b) => a.orderIndex - b.orderIndex));
+    setDeltaAllyCache(allyCache.sort((a, b) => b.updatedAt - a.updatedAt));
     setDeltaOpen(true);
+    window.history.pushState({ mirrorDeltaMode: true }, "", window.location.href);
   }
 
   async function refreshDeltaMode() {
     if (!deltaSession) return;
-    const [session, nextMessages, nextEntities, archivedSessions] = await Promise.all([
+    const [session, nextMessages, nextEntities, archivedSessions, actionMacros, allyCache] = await Promise.all([
       db.deltaSessions.get(deltaSession.id),
       db.deltaMessages.where("sessionId").equals(deltaSession.id).toArray(),
       db.deltaEntities.where("sessionId").equals(deltaSession.id).toArray(),
-      db.deltaSessions.where("chatId").equals(deltaSession.chatId).and((item) => !item.active).toArray()
+      db.deltaSessions.where("chatId").equals(deltaSession.chatId).and((item) => !item.active).toArray(),
+      db.deltaActionMacros.where("chatId").equals(deltaSession.chatId).toArray(),
+      db.deltaAllyCache.where("chatId").equals(deltaSession.chatId).toArray()
     ]);
     if (session) setDeltaSession(session);
     setDeltaMessages(nextMessages.sort((a, b) => a.sequence - b.sequence));
     setDeltaEntities(nextEntities.sort((a, b) => a.orderIndex - b.orderIndex));
     setArchivedDeltaSessions(archivedSessions.sort((a, b) => b.updatedAt - a.updatedAt));
+    setDeltaActionMacros(actionMacros.sort((a, b) => a.orderIndex - b.orderIndex));
+    setDeltaAllyCache(allyCache.sort((a, b) => b.updatedAt - a.updatedAt));
   }
 
   async function applyUpdate() {
@@ -535,15 +889,20 @@ export function App() {
           </div>
         ) : undefined}
       />
-      {selectedProject && <InventoryDrawer open={inventoryOpen} project={selectedProject} onClose={() => setInventoryOpen(false)} onRefresh={refresh} />}
+      {selectedProject && selectedChat && <InventoryDrawer open={inventoryOpen} project={selectedProject} chat={selectedChat} elevated={deltaOpen} onClose={() => setInventoryOpen(false)} onRefresh={refresh} />}
       {selectedProject && selectedChat && deltaOpen && deltaSession && (
         <DeltaModeWorkspace
           project={selectedProject}
           chat={selectedChat}
+          settings={settings}
+          selectedModelId={selectedModelId}
           session={deltaSession}
           messages={deltaMessages}
           entities={deltaEntities}
           archivedSessions={archivedDeltaSessions}
+          actionMacros={deltaActionMacros}
+          allyCache={deltaAllyCache}
+          onOpenInventory={() => setInventoryOpen(true)}
           onClose={() => setDeltaOpen(false)}
           onRefresh={refreshDeltaMode}
         />
@@ -621,42 +980,42 @@ function Header({ title, subtitle, onMenu, right }: { title: string; subtitle?: 
   );
 }
 
-function InventoryDrawer({ open, project, onClose, onRefresh }: { open: boolean; project: Project; onClose: () => void; onRefresh: () => Promise<void> }) {
+function InventoryDrawer({ open, project, chat, elevated, onClose, onRefresh }: { open: boolean; project: Project; chat: Chat; elevated?: boolean; onClose: () => void; onRefresh: () => Promise<void> }) {
   const defaultTab = project.inventoryEnabled ? "inventory" : "gear";
   const [tab, setTab] = useState<"inventory" | "gear" | "log">(defaultTab);
   const [items, setItems] = useState<InventoryItem[]>([]);
   const [logs, setLogs] = useState<InventoryLog[]>([]);
-  const [currencyAmount, setCurrencyAmount] = useState(project.currencyAmount?.toString() ?? "");
+  const [currencyAmount, setCurrencyAmount] = useState(chat.currencyAmount?.toString() ?? "");
   const [saved, showSaved] = useSavedNotice();
   useEffect(() => {
-    setCurrencyAmount(project.currencyAmount?.toString() ?? "");
+    setCurrencyAmount(chat.currencyAmount?.toString() ?? "");
     setTab(project.inventoryEnabled ? "inventory" : "gear");
-  }, [project.id, project.inventoryEnabled, project.gearEnabled, project.currencyAmount]);
+  }, [chat.id, chat.currencyAmount, project.inventoryEnabled, project.gearEnabled]);
   async function load() {
     const [nextItems, nextLogs] = await Promise.all([
-      db.inventoryItems.where("projectId").equals(project.id).toArray(),
-      db.inventoryLogs.where("projectId").equals(project.id).reverse().sortBy("updatedAt")
+      db.inventoryItems.where("chatId").equals(chat.id).toArray(),
+      db.inventoryLogs.where("chatId").equals(chat.id).reverse().sortBy("updatedAt")
     ]);
-    setItems(nextItems.sort((a, b) => a.kind.localeCompare(b.kind) || a.name.localeCompare(b.name)));
+    setItems(nextItems.sort((a, b) => a.kind.localeCompare(b.kind) || a.createdAt - b.createdAt));
     setLogs(nextLogs);
   }
-  useEffect(() => { if (open) load(); }, [open, project.id]);
+  useEffect(() => { if (open) load(); }, [open, chat.id]);
   if (!open) return null;
   const shownItems = items.filter((item) => item.kind === tab);
   async function saveCurrency() {
-    await db.projects.update(project.id, { currencyAmount: currencyAmount === "" ? undefined : Number(currencyAmount), updatedAt: now() });
+    await db.chats.update(chat.id, { currencyAmount: currencyAmount === "" ? undefined : Number(currencyAmount), updatedAt: now() });
     showSaved();
     await onRefresh();
   }
   async function addItem(kind: InventoryKind) {
     const timestamp = now();
-    await db.inventoryItems.add({ id: uid(), projectId: project.id, kind, name: "", normalisedName: "", quantity: 1, createdAt: timestamp, updatedAt: timestamp });
+    await db.inventoryItems.add({ id: uid(), projectId: project.id, chatId: chat.id, kind, name: "", normalisedName: "", quantity: 1, createdAt: timestamp, updatedAt: timestamp });
     await load();
   }
   return (
     <>
-      <button className="drawer-backdrop" onClick={onClose} aria-label="Close inventory" />
-      <aside className="inventory-drawer">
+      <button className={`drawer-backdrop ${elevated ? "elevated" : ""}`} onClick={onClose} aria-label="Close inventory" />
+      <aside className={`inventory-drawer ${elevated ? "delta-inventory" : ""}`}>
         <div className="section-title">
           <h2>Inventory</h2>
           <button className="icon-button" onClick={onClose} aria-label="Close inventory"><X size={20} /></button>
@@ -688,21 +1047,52 @@ function InventoryDrawer({ open, project, onClose, onRefresh }: { open: boolean;
 function InventoryItemRow({ item, onRefresh }: { item: InventoryItem; onRefresh: () => Promise<void> }) {
   const [name, setName] = useState(item.name);
   const [quantity, setQuantity] = useState(item.quantity);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [pressTimer, setPressTimer] = useState<number>();
   useEffect(() => {
     setName(item.name);
     setQuantity(item.quantity);
   }, [item.id, item.name, item.quantity]);
+  function startPress() {
+    window.clearTimeout(pressTimer);
+    setPressTimer(window.setTimeout(() => setDeleteOpen(true), 520));
+  }
+  function cancelPress() {
+    window.clearTimeout(pressTimer);
+  }
   async function save(nextQuantity = quantity) {
     const singular = normaliseInventoryName(name);
     await db.inventoryItems.update(item.id, { name: singular, normalisedName: singular, quantity: Math.max(0, nextQuantity), updatedAt: now() });
     await onRefresh();
   }
+  async function remove() {
+    await db.inventoryItems.delete(item.id);
+    setDeleteOpen(false);
+    await onRefresh();
+  }
   return (
-    <div className="inventory-row">
-      <input value={name} onChange={(event) => setName(event.target.value)} onBlur={() => save()} placeholder={item.kind === "gear" ? "gear name" : "item name"} />
-      <button onClick={() => { const next = Math.max(0, quantity - 1); setQuantity(next); save(next); }}>-</button>
-      <input type="number" value={quantity} onChange={(event) => setQuantity(Number(event.target.value))} onBlur={() => save()} />
-      <button onClick={() => { const next = quantity + 1; setQuantity(next); save(next); }}>+</button>
+    <div className="inventory-item-wrap">
+      <div className="inventory-row">
+        <input
+          value={name}
+          onChange={(event) => setName(event.target.value)}
+          onBlur={() => save()}
+          onPointerDown={startPress}
+          onPointerUp={cancelPress}
+          onPointerLeave={cancelPress}
+          placeholder={item.kind === "gear" ? "gear name" : "item name"}
+        />
+        <button onClick={() => { const next = Math.max(0, quantity - 1); setQuantity(next); save(next); }}>-</button>
+        <input type="number" value={quantity} onChange={(event) => setQuantity(Number(event.target.value))} onBlur={() => save()} />
+        <button onClick={() => { const next = quantity + 1; setQuantity(next); save(next); }}>+</button>
+      </div>
+      {deleteOpen && (
+        <div className="inline-confirm">
+          <span>Delete {name || "this item"}?</span>
+          <button onClick={remove}>Delete</button>
+          <button onClick={() => setDeleteOpen(false)}>Cancel</button>
+        </div>
+      )}
     </div>
   );
 }
@@ -710,115 +1100,696 @@ function InventoryItemRow({ item, onRefresh }: { item: InventoryItem; onRefresh:
 function DeltaModeWorkspace({
   project,
   chat,
+  settings,
+  selectedModelId,
   session,
   messages,
   entities,
   archivedSessions,
+  actionMacros,
+  allyCache,
+  onOpenInventory,
   onClose,
   onRefresh
 }: {
   project: Project;
   chat: Chat;
+  settings: AppSettings;
+  selectedModelId: string;
   session: DeltaSession;
   messages: DeltaMessage[];
   entities: DeltaEntity[];
   archivedSessions: DeltaSession[];
+  actionMacros: DeltaActionMacro[];
+  allyCache: DeltaAllyCacheEntry[];
+  onOpenInventory: () => void;
   onClose: () => void;
   onRefresh: () => Promise<void>;
 }) {
   const [body, setBody] = useState("");
-  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [activeTool, setActiveTool] = useState<"entities" | "inventory" | "settings" | "history" | "actions">();
+  const [actionsEditMode, setActionsEditMode] = useState(false);
+  const [entitySettingsOpen, setEntitySettingsOpen] = useState(false);
+  const [entitySettingsTab, setEntitySettingsTab] = useState<"entities" | "ally-cache">("entities");
+  const [cacheEditId, setCacheEditId] = useState<string>();
+  const [cacheDraftTag, setCacheDraftTag] = useState("");
+  const [cacheImportStatus, setCacheImportStatus] = useState("");
+  const [clearCacheOpen, setClearCacheOpen] = useState(false);
+  const [expandedEntityId, setExpandedEntityId] = useState<string>();
+  const [projectCharacters, setProjectCharacters] = useState<Character[]>([]);
   const [settingsDraft, setSettingsDraft] = useState(session.settings);
+  const [playerCharacterId, setPlayerCharacterId] = useState(chat.deltaPlayerCharacterId ?? "");
   const [previewSession, setPreviewSession] = useState<DeltaSession>();
   const [previewMessages, setPreviewMessages] = useState<DeltaMessage[]>([]);
+  const [pendingEntityMacro, setPendingEntityMacro] = useState<DeltaActionMacro>();
+  const [selectedEntityIds, setSelectedEntityIds] = useState<Set<string>>(new Set());
+  const [macroDraft, setMacroDraft] = useState<{
+    macro?: DeltaActionMacro;
+    parentId?: string;
+    folder: boolean;
+    label: string;
+    template: string;
+    requestEntitySelection: boolean;
+  }>();
+  const composerRef = useRef<HTMLTextAreaElement>(null);
   const [saved, showSaved] = useSavedNotice();
+  const archiveLimitOptions = [0, 1, 3, 5, 8, 12, 16, 20, 30, 40, 50, Infinity];
   useEffect(() => setSettingsDraft(session.settings), [session.id, session.settings]);
+  useEffect(() => setPlayerCharacterId(chat.deltaPlayerCharacterId ?? ""), [chat.id, chat.deltaPlayerCharacterId]);
+  useEffect(() => {
+    const closeFromHistory = () => onClose();
+    window.addEventListener("popstate", closeFromHistory);
+    return () => window.removeEventListener("popstate", closeFromHistory);
+  }, [onClose]);
+  useEffect(() => {
+    if (activeTool !== "entities") return;
+    void db.characters
+      .where("projectId")
+      .equals(project.id)
+      .toArray()
+      .then((rows) => setProjectCharacters(rows.sort((a, b) => (a.orderIndex ?? Number.MAX_SAFE_INTEGER) - (b.orderIndex ?? Number.MAX_SAFE_INTEGER) || a.normalisedName.localeCompare(b.normalisedName))));
+  }, [activeTool, project.id]);
+  async function deltaOpenRouterRequest(payload: Record<string, unknown>) {
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${settings.apiKey}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": location.origin,
+        "X-Title": "Mirror 2.0"
+      },
+      body: JSON.stringify(payload)
+    });
+    if (!response.ok) throw new Error((await response.text()) || `OpenRouter request failed (${response.status})`);
+    return response;
+  }
+  async function deltaCharacterPatch(character: Character) {
+    return characterStatsPatch(character);
+  }
+  function deltaToolArgs(toolCall: OpenRouterToolCall) {
+    try {
+      return JSON.parse(toolCall.function.arguments || "{}") as Record<string, unknown>;
+    } catch {
+      return {};
+    }
+  }
+  async function runDeltaTool(toolCall: OpenRouterToolCall) {
+    const args = deltaToolArgs(toolCall);
+    const stringArg = (key: string) => typeof args[key] === "string" ? String(args[key]).trim() : "";
+    switch (toolCall.function.name) {
+      case "find_characters":
+        return findCharacters(project.id, stringArg("nameQuery"));
+      case "get_character_identity":
+        return stringArg("characterId") ? getCharacterIdentity(project.id, stringArg("characterId")) : { error: "characterId is required." };
+      case "get_character_bio":
+        return stringArg("characterId") ? getCharacterBio(project.id, stringArg("characterId")) : { error: "characterId is required." };
+      case "get_character_stats":
+        return stringArg("characterId") ? getCharacterStats(project.id, stringArg("characterId")) : { error: "characterId is required." };
+      case "list_delta_job_categories": {
+        const counts = jobCategories(project.deltaJobs ?? []);
+        return counts.map(([category, count]) => ({ category, count }));
+      }
+      case "get_delta_jobs_for_category": {
+        const category = stringArg("category").toLowerCase();
+        return (project.deltaJobs ?? [])
+          .filter((job) => job.category.trim().toLowerCase() === category)
+          .map((job) => ({ label: job.label, category: job.category, statModifiers: job.statModifiers, notes: job.notes ?? "" }));
+      }
+      case "create_delta_entity": {
+        const characterId = stringArg("characterId");
+        const character = characterId ? await db.characters.get(characterId) : undefined;
+        const timestamp = now();
+        const basePatch = character && character.projectId === project.id
+          ? await deltaCharacterPatch(character)
+          : generatedStatsPatch(project, { prefix: stringArg("prefix"), base: stringArg("base"), job: stringArg("job"), jobCategory: stringArg("jobCategory") });
+        const entity: DeltaEntity = {
+          id: uid(),
+          sessionId: session.id,
+          ...basePatch,
+          name: character && character.projectId === project.id ? character.name : stringArg("name") || "Unnamed entity",
+          side: normaliseDeltaRelationship(stringArg("side")) as DeltaRelationship,
+          statusText: stringArg("statusText"),
+          distanceFromPlayer: stringArg("distanceFromPlayer"),
+          elevation: stringArg("elevation"),
+          orderIndex: entities.length + 1,
+          createdAt: timestamp,
+          updatedAt: timestamp
+        };
+        await db.deltaEntities.add(entity);
+        await upsertDeltaAllyCache(chat.id, entity);
+        return { created: entity.name, entityId: entity.id, templateTag: entity.templateTag ?? "" };
+      }
+      case "update_delta_entity": {
+        const entity = await db.deltaEntities.get(stringArg("entityId"));
+        if (!entity || entity.sessionId !== session.id) return { error: "Entity not found in this active Delta engagement." };
+        const templateRequested = ["prefix", "base", "job"].some((key) => stringArg(key));
+        const patch = templateRequested && !entity.characterId
+          ? generatedStatsPatch(project, { prefix: stringArg("prefix"), base: stringArg("base"), job: stringArg("job"), jobCategory: stringArg("jobCategory") })
+          : {};
+        const next: Partial<DeltaEntity> = {
+          ...patch,
+          name: stringArg("name") || entity.name,
+          side: stringArg("side") ? normaliseDeltaRelationship(stringArg("side")) : entity.side,
+          statusText: stringArg("statusText") || entity.statusText,
+          distanceFromPlayer: stringArg("distanceFromPlayer") || entity.distanceFromPlayer,
+          elevation: stringArg("elevation") || entity.elevation,
+          updatedAt: now()
+        };
+        await db.deltaEntities.update(entity.id, next);
+        await upsertDeltaAllyCache(chat.id, { ...entity, ...next });
+        return { updated: next.name, entityId: entity.id, templateTag: "templateTag" in next ? next.templateTag ?? "" : entity.templateTag ?? "" };
+      }
+      default:
+        return { error: `Unknown Delta tool ${toolCall.function.name}.` };
+    }
+  }
+  async function completeDeltaTurn(history: OpenRouterMessage[], toolLog: string[]) {
+    let messagesToSend = history;
+    for (let index = 0; index < 4; index += 1) {
+      const response = await deltaOpenRouterRequest({
+        model: session.settings.modelId || chat.modelId || selectedModelId || settings.defaultModelId,
+        messages: messagesToSend,
+        tools: [...characterTools, ...deltaEntityTools],
+        temperature: session.settings.temperature ?? 0,
+        top_p: session.settings.topP ?? 0,
+        ...(session.settings.maxTokens ? { max_tokens: session.settings.maxTokens } : {})
+      });
+      const json = await response.json() as OpenRouterResponse;
+      const assistantMessage = json.choices?.[0]?.message;
+      const toolCalls = assistantMessage?.tool_calls ?? [];
+      if (!toolCalls.length) return assistantMessage?.content ?? "";
+      messagesToSend = [
+        ...messagesToSend,
+        { role: "assistant", content: assistantMessage?.content ?? "", tool_calls: toolCalls }
+      ];
+      for (const toolCall of toolCalls) {
+        const result = await runDeltaTool(toolCall);
+        toolLog.push(toolCall.function.name);
+        messagesToSend.push({ role: "tool", tool_call_id: toolCall.id, content: JSON.stringify(result) });
+      }
+    }
+    return "Delta tools reached their turn limit. Continue from the current engagement state.";
+  }
   async function send() {
     const clean = body.trim();
     if (!clean || !session.active) return;
+    if (!settings.apiKey) {
+      setBody(clean);
+      alert("Add your OpenRouter API key before sending Delta AI requests. Your draft is still here.");
+      return;
+    }
+    const model = session.settings.modelId || chat.modelId || selectedModelId || settings.defaultModelId;
+    if (!model) {
+      setBody(clean);
+      alert("Choose a model before sending Delta AI requests. Your draft is still here.");
+      return;
+    }
     setBody("");
     await addDeltaMessage(session.id, "user", clean);
+    const timestamp = now();
+    const replyId = uid();
+    await db.deltaMessages.add({ id: replyId, sessionId: session.id, sequence: messages.length + 1, role: "assistant", body: "...", status: "pending", modelId: model, createdAt: timestamp, updatedAt: timestamp });
+    await onRefresh();
+    const allCharacters = await db.characters.where("projectId").equals(project.id).toArray();
+    const context = [
+      `You are in Delta Mode, a separate active messaging workspace attached to this chat. Do not include archived engagements in reasoning.`,
+      `Project: ${project.name}`,
+      project.instructions ? `Project instructions:\n${project.instructions}` : "",
+      project.worldSetting ? `World setting:\n${project.worldSetting}` : "",
+      `Saved project character names:\n${allCharacters.map((character) => `- ${character.name} (${character.id})`).join("\n") || "(none)"}`,
+      `Current entity list:\n${entities.map((entity) => `- ${entity.id}: ${entity.name}, ${entity.side}${entity.templateTag ? `, ${entity.templateTag}` : ""}${entity.statusText ? `, ${entity.statusText}` : ""}${entityPositionLabel(entity) ? `, ${entityPositionLabel(entity)}` : ""}`).join("\n") || "(none)"}`,
+      `Chat-scoped ally cache:\n${allyCache.map((entry) => `- ${entry.name}${entry.templateTag ? `, ${entry.templateTag}` : ""}`).join("\n") || "(none)"}`,
+      `Available PREFIX labels: ${(project.deltaPrefixes ?? []).map((item) => item.label).join(", ") || "(none)"}`,
+      `Available BASE labels: ${(project.deltaBases ?? []).map((item) => item.label).join(", ") || "(none)"}`,
+      `Available JOB categories: ${jobCategories(project.deltaJobs ?? []).map(([category, count]) => `${category} (${count})`).join(", ") || "(none)"}`,
+      "When an engagement introduces participants, keep the entity list current. Use saved character IDs for known saved characters. For generated/unlinked entities, use readable PREFIX-BASE JOB labels only when suitable. Do not add A/B/C/D suffixes to actual names."
+    ].filter(Boolean).join("\n\n");
+    const requestMessages: OpenRouterMessage[] = [
+      { role: "system", content: context },
+      ...messages.map((message) => ({ role: message.role as OpenRouterMessage["role"], content: message.body })),
+      { role: "user", content: clean }
+    ];
+    const toolLog: string[] = [];
+    try {
+      const reply = await completeDeltaTurn(requestMessages, toolLog);
+      await db.deltaMessages.update(replyId, { body: reply || "", status: "complete", updatedAt: now() });
+    } catch (error) {
+      await db.deltaMessages.update(replyId, { body: error instanceof Error ? error.message : "OpenRouter request failed.", status: "failed", updatedAt: now() });
+    }
     await onRefresh();
   }
   async function archiveCurrent() {
     if (!confirm("Archive this Delta engagement? It will remain visible as a read-only record for this chat.")) return;
-    await archiveDeltaSession(session.id);
+    await archiveDeltaSession(session.id, session.title);
+    await pruneArchivedDeltaSessions();
     await onRefresh();
-    onClose();
+    window.history.back();
+  }
+  async function pruneArchivedDeltaSessions() {
+    const limit = settingsDraft.maxHistoryMessages;
+    if (limit === undefined) return;
+    const archived = await db.deltaSessions.where("chatId").equals(chat.id).and((item) => !item.active).toArray();
+    const removals = archived.sort((a, b) => b.updatedAt - a.updatedAt).slice(limit);
+    if (removals.length === 0) return;
+    const ids = removals.map((item) => item.id);
+    await db.transaction("rw", [db.deltaSessions, db.deltaMessages, db.deltaEntities], async () => {
+      await db.deltaMessages.where("sessionId").anyOf(ids).delete();
+      await db.deltaEntities.where("sessionId").anyOf(ids).delete();
+      await db.deltaSessions.where("id").anyOf(ids).delete();
+    });
   }
   async function openArchived(sessionRecord: DeltaSession) {
     const archivedMessages = await db.deltaMessages.where("sessionId").equals(sessionRecord.id).toArray();
     setPreviewSession(sessionRecord);
     setPreviewMessages(archivedMessages.sort((a, b) => a.sequence - b.sequence));
   }
+  async function renameArchived(sessionRecord: DeltaSession) {
+    const title = prompt("Rename archived engagement", sessionRecord.title)?.trim();
+    if (!title) return;
+    await db.deltaSessions.update(sessionRecord.id, { title, updatedAt: now() });
+    setPreviewSession({ ...sessionRecord, title, updatedAt: now() });
+    await onRefresh();
+  }
   async function saveSettings() {
     await db.deltaSessions.update(session.id, { settings: settingsDraft, updatedAt: now() });
+    await pruneArchivedDeltaSessions();
     showSaved();
     await onRefresh();
   }
+  async function renameActiveEngagement() {
+    const title = prompt("Name this Delta engagement", session.title)?.trim();
+    if (!title || title === session.title) return;
+    await db.deltaSessions.update(session.id, { title, updatedAt: now() });
+    await onRefresh();
+  }
+  function insertMacro(template: string) {
+    const textarea = composerRef.current;
+    const start = textarea?.selectionStart ?? body.length;
+    const end = textarea?.selectionEnd ?? body.length;
+    const next = `${body.slice(0, start)}${template}${body.slice(end)}`;
+    setBody(next);
+    window.setTimeout(() => {
+      composerRef.current?.focus();
+      const cursor = start + template.length;
+      composerRef.current?.setSelectionRange(cursor, cursor);
+    }, 0);
+  }
+  function chooseMacro(macro: DeltaActionMacro) {
+    if (macro.template === undefined) return;
+    if (macro.requestEntitySelection) {
+      setPendingEntityMacro(macro);
+      setSelectedEntityIds(new Set());
+      setActiveTool("entities");
+      return;
+    }
+    insertMacro(macro.template);
+  }
+  function insertPendingEntityMacro() {
+    if (!pendingEntityMacro?.template) return;
+    const namesById = entityDisplayNames(entities);
+    const names = entities
+      .filter((entity) => selectedEntityIds.has(entity.id))
+      .map((entity) => namesById.get(entity.id) ?? entity.name);
+    const targetText = formatEntityNameList(names);
+    const template = pendingEntityMacro.template.includes("{target}")
+      ? pendingEntityMacro.template.split("{target}").join(targetText)
+      : `${pendingEntityMacro.template}${pendingEntityMacro.template.endsWith(" ") ? "" : " "}${targetText}`;
+    insertMacro(template);
+    setPendingEntityMacro(undefined);
+    setSelectedEntityIds(new Set());
+    setActiveTool("actions");
+  }
+  function toggleSelectedEntity(id: string) {
+    setSelectedEntityIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+  async function updateEntityRelationship(entity: DeltaEntity, side: DeltaRelationship) {
+    await db.deltaEntities.update(entity.id, { side, updatedAt: now() });
+    if (side === "ally") await upsertDeltaAllyCache(chat.id, { ...entity, side });
+    await onRefresh();
+  }
+  async function characterStatsPatch(character: Character) {
+    const bonuses = await db.characterBonuses.where("characterId").equals(character.id).toArray();
+    const total = (base: number, stat: Ability) => base + bonuses.filter((bonus) => bonus.stat === stat).reduce((sum, bonus) => sum + bonus.value, 0);
+    return {
+      characterId: character.id,
+      name: character.name,
+      str: total(character.str, "STR"),
+      dex: total(character.dex, "DEX"),
+      con: total(character.con, "CON"),
+      int: total(character.int, "INT"),
+      wis: total(character.wis, "WIS"),
+      cha: total(character.cha, "CHA"),
+      templateTag: undefined,
+      prefix: undefined,
+      base: undefined,
+      job: undefined,
+      generatedStatsSource: undefined
+    };
+  }
+  async function addCharacterEntity(characterId: string) {
+    const character = await db.characters.get(characterId);
+    if (!character || character.projectId !== project.id) return;
+    const timestamp = now();
+    const stats = await characterStatsPatch(character);
+    await db.deltaEntities.add({
+      id: uid(),
+      sessionId: session.id,
+      ...stats,
+      side: "neutral",
+      currentHp: 10,
+      maxHp: 10,
+      statusText: "Awaiting engagement status.",
+      distanceFromPlayer: "",
+      elevation: "",
+      orderIndex: entities.length,
+      createdAt: timestamp,
+      updatedAt: timestamp
+    });
+    await onRefresh();
+  }
+  async function refreshEntityCharacterStats(entity: DeltaEntity) {
+    if (!entity.characterId) return;
+    const character = await db.characters.get(entity.characterId);
+    if (!character || character.projectId !== project.id) return;
+    await db.deltaEntities.update(entity.id, { ...(await characterStatsPatch(character)), updatedAt: now() });
+    await onRefresh();
+  }
+  async function linkCharacterToEntity(entity: DeltaEntity, characterId: string) {
+    const character = await db.characters.get(characterId);
+    if (!character || character.projectId !== project.id) return;
+    await db.deltaEntities.update(entity.id, { ...(await characterStatsPatch(character)), updatedAt: now() });
+    if (entity.id === playerEntityId) await db.chats.update(chat.id, { deltaPlayerCharacterId: character.id, updatedAt: now() });
+    await onRefresh();
+  }
+  async function setPlayerCharacterData(characterId: string) {
+    const player = entities.find((entity) => entity.id === playerEntityId);
+    const patch = characterId ? await db.characters.get(characterId) : undefined;
+    if (characterId && (!patch || patch.projectId !== project.id)) return;
+    await db.chats.update(chat.id, { deltaPlayerCharacterId: characterId || undefined, updatedAt: now() });
+    setPlayerCharacterId(characterId);
+    if (player && patch) await db.deltaEntities.update(player.id, { ...(await characterStatsPatch(patch)), updatedAt: now() });
+    await onRefresh();
+  }
+  function parseTemplateTag(value: string) {
+    const clean = value.trim().toUpperCase().replace(/\s+/g, " ");
+    const [first, job] = clean.split(" ");
+    const [prefix, base] = first?.includes("-") ? first.split("-") : [undefined, first];
+    return { prefix, base, job, templateTag: formatDeltaTemplateTag(prefix, base, job) };
+  }
+  async function saveCacheTag(entry: DeltaAllyCacheEntry) {
+    const parsed = parseTemplateTag(cacheDraftTag);
+    const patch = generatedStatsPatch(project, parsed);
+    await db.deltaAllyCache.update(entry.id, {
+      ...patch,
+      templateTag: parsed.templateTag,
+      prefix: parsed.prefix,
+      base: parsed.base,
+      job: parsed.job,
+      updatedAt: now()
+    });
+    setCacheEditId(undefined);
+    setCacheDraftTag("");
+    await onRefresh();
+  }
+  function exportAllyCache() {
+    downloadJson(`mirror-delta-ally-cache-${chat.title || chat.id}.json`, {
+      schemaVersion: 1,
+      exportedAt: new Date().toISOString(),
+      chatTitle: chat.title,
+      allyCache
+    });
+  }
+  async function importAllyCache(file: File | undefined) {
+    if (!file) return;
+    try {
+      const parsed = JSON.parse(await file.text()) as { allyCache?: DeltaAllyCacheEntry[] };
+      if (!Array.isArray(parsed.allyCache)) {
+        setCacheImportStatus("Invalid ally cache file.");
+        return;
+      }
+      const timestamp = now();
+      const rows = parsed.allyCache
+        .filter((entry) => entry.name?.trim())
+        .map((entry) => ({ ...entry, id: uid(), chatId: chat.id, createdAt: timestamp, updatedAt: timestamp }));
+      if (rows.length) await db.deltaAllyCache.bulkAdd(rows);
+      setCacheImportStatus(`Imported ${rows.length} ally cache entr${rows.length === 1 ? "y" : "ies"}.`);
+      await onRefresh();
+    } catch {
+      setCacheImportStatus("Import failed.");
+    }
+  }
+  async function clearAllyCache() {
+    await db.deltaAllyCache.where("chatId").equals(chat.id).delete();
+    setClearCacheOpen(false);
+    await onRefresh();
+  }
+  async function removeEntity(entity: DeltaEntity) {
+    if (entity.id === playerEntityId) return;
+    if (!confirm(`Remove ${entity.name} from this Delta engagement?`)) return;
+    await db.deltaEntities.delete(entity.id);
+    if (expandedEntityId === entity.id) setExpandedEntityId(undefined);
+    await onRefresh();
+  }
+  function addMacro(parentId: string | undefined, folder: boolean) {
+    setMacroDraft({ parentId, folder, label: "", template: "", requestEntitySelection: false });
+  }
+  function editMacro(macro: DeltaActionMacro) {
+    setMacroDraft({
+      macro,
+      parentId: macro.parentId,
+      folder: macro.template === undefined,
+      label: macro.label,
+      template: macro.template ?? "",
+      requestEntitySelection: macro.requestEntitySelection ?? false
+    });
+  }
+  async function saveMacroDraft() {
+    if (!macroDraft) return;
+    const label = macroDraft.label.trim();
+    if (!label) return;
+    const timestamp = now();
+    if (macroDraft.macro) {
+      await db.deltaActionMacros.update(macroDraft.macro.id, {
+        label,
+        template: macroDraft.folder ? undefined : macroDraft.template,
+        requestEntitySelection: macroDraft.folder ? false : macroDraft.requestEntitySelection,
+        updatedAt: timestamp
+      });
+    } else {
+      const siblings = actionMacros.filter((macro) => macro.parentId === macroDraft.parentId);
+      await db.deltaActionMacros.add({
+        id: uid(),
+        chatId: chat.id,
+        parentId: macroDraft.parentId,
+        label,
+        template: macroDraft.folder ? undefined : macroDraft.template,
+        requestEntitySelection: macroDraft.folder ? false : macroDraft.requestEntitySelection,
+        orderIndex: (Math.max(-1, ...siblings.map((macro) => macro.orderIndex)) + 1),
+        createdAt: timestamp,
+        updatedAt: timestamp
+      });
+    }
+    setMacroDraft(undefined);
+    await onRefresh();
+  }
+  async function deleteMacro(macro: DeltaActionMacro) {
+    if (!confirm(`Delete "${macro.label}" and anything inside it?`)) return;
+    const ids = new Set<string>([macro.id]);
+    let grew = true;
+    while (grew) {
+      grew = false;
+      for (const item of actionMacros) {
+        if (item.parentId && ids.has(item.parentId) && !ids.has(item.id)) {
+          ids.add(item.id);
+          grew = true;
+        }
+      }
+    }
+    await db.deltaActionMacros.bulkDelete(Array.from(ids));
+    await onRefresh();
+  }
   const playerEntityId = settingsDraft.playerEntityId ?? entities[0]?.id;
+  const namesByEntityId = entityDisplayNames(entities);
   return (
     <div className="delta-layer">
-      <button className="delta-dim" onClick={onClose} aria-label="Close Delta Mode" />
+      <div className="delta-dim" aria-hidden="true" />
       <aside className="delta-workspace">
         <div className="delta-top">
           <div>
+            <h2><Swords size={18} /> {session.title}</h2>
             <small>{project.name} / {chat.title}</small>
-            <h2>Delta Mode</h2>
           </div>
-          <div className="split-actions">
-            <button className="icon-button" onClick={() => setSettingsOpen(!settingsOpen)} aria-label="Delta settings"><Settings size={18} /></button>
-            <button className="icon-button" onClick={onClose} aria-label="Close Delta Mode"><X size={18} /></button>
-          </div>
+          <button className="icon-button" onClick={renameActiveEngagement} aria-label="Rename Delta engagement" title="Rename engagement"><Edit3 size={16} /></button>
         </div>
-        <section className="delta-hud">
-          <div className="section-title"><h2>Entity List</h2><span className="save-status">Placeholder</span></div>
-          <div className="delta-entity-list">
-            {entities.map((entity) => {
-              const hp = entity.currentHp ?? 0;
-              const maxHp = entity.maxHp || 1;
-              return (
-                <div className={`delta-entity ${entity.id === playerEntityId ? "player" : ""}`} key={entity.id}>
-                  <span>{entity.name}</span>
-                  <div className="delta-hp"><i style={{ width: `${Math.max(0, Math.min(100, (hp / maxHp) * 100))}%` }} /></div>
-                  <small>{hp}/{maxHp} HP</small>
-                  <small>{entity.statusText || "No status"}</small>
+        <nav className="delta-toolbar" aria-label="Delta tools">
+          <button className={activeTool === "entities" ? "picked" : ""} onClick={() => setActiveTool(activeTool === "entities" ? undefined : "entities")} aria-label="Entity list"><UserRound size={18} /></button>
+          <button onClick={onOpenInventory} aria-label="Inventory"><ShoppingBag size={18} /></button>
+          <button className={activeTool === "settings" ? "picked" : ""} onClick={() => setActiveTool(activeTool === "settings" ? undefined : "settings")} aria-label="Delta settings"><Settings size={18} /></button>
+          <button className={activeTool === "history" ? "picked" : ""} onClick={() => setActiveTool(activeTool === "history" ? undefined : "history")} aria-label="Delta history"><History size={18} /></button>
+        </nav>
+        {activeTool && activeTool !== "actions" && (
+          <section className="delta-tool-panel">
+            {activeTool === "entities" && (
+              <>
+                <div className="section-title">
+                  <h2>{pendingEntityMacro ? "Select Targets" : "Entity List"}</h2>
+                  <div className="split-actions">
+                    <span className="save-status">{pendingEntityMacro ? "Macro target" : `${projectCharacters.length} project characters`}</span>
+                    <button className="icon-button" onClick={() => setEntitySettingsOpen(!entitySettingsOpen)} aria-label="Entity settings"><Settings size={16} /></button>
+                  </div>
                 </div>
-              );
-            })}
-          </div>
-        </section>
-        {settingsOpen && (
-          <section className="delta-settings stack">
-            <div className="settings-tabs">
-              <button className="picked">Chat</button>
-              <button>Entity list</button>
-            </div>
-            <label>Delta compaction memory<textarea value={settingsDraft.compactionMemory} onChange={(event) => setSettingsDraft({ ...settingsDraft, compactionMemory: event.target.value })} /></label>
-            <label>History limit<input type="number" min={1} value={settingsDraft.maxHistoryMessages ?? ""} placeholder="no limit" onChange={(event) => setSettingsDraft({ ...settingsDraft, maxHistoryMessages: event.target.value === "" ? undefined : Number(event.target.value) })} /></label>
-            <label>Player character<select value={playerEntityId ?? ""} onChange={(event) => setSettingsDraft({ ...settingsDraft, playerEntityId: event.target.value })}>{entities.map((entity) => <option value={entity.id} key={entity.id}>{entity.name}</option>)}</select></label>
-            <p className="notice">Future entity-list options will live here, including image uploads and compact display preferences.</p>
-            <div className="split-actions"><button onClick={saveSettings}><Save size={18} /> Save Delta settings</button>{saved && <span className="save-status">Saved</span>}</div>
+                {entitySettingsOpen && (
+                  <section className="entity-settings-panel stack">
+                    <div className="tabs compact-tabs">
+                      <button className={entitySettingsTab === "entities" ? "active" : ""} onClick={() => setEntitySettingsTab("entities")}>Entities</button>
+                      <button className={entitySettingsTab === "ally-cache" ? "active" : ""} onClick={() => setEntitySettingsTab("ally-cache")}>Ally Cache</button>
+                    </div>
+                    {entitySettingsTab === "entities" && (
+                      <>
+                        <label>Highlighted player<select value={playerEntityId ?? ""} onChange={(event) => setSettingsDraft({ ...settingsDraft, playerEntityId: event.target.value })}>{entities.map((entity) => <option value={entity.id} key={entity.id}>{namesByEntityId.get(entity.id) ?? entity.name}</option>)}</select></label>
+                        <label>Player character data
+                          <select value={playerCharacterId} onChange={(event) => void setPlayerCharacterData(event.target.value)}>
+                            <option value="">Not linked</option>
+                            {projectCharacters.map((character) => <option key={character.id} value={character.id}>{character.name}</option>)}
+                          </select>
+                        </label>
+                        <div className="split-actions"><button onClick={saveSettings}><Save size={18} /> Save entity settings</button>{saved && <span className="save-status">Saved</span>}</div>
+                        <label>Add involved character
+                          <select defaultValue="" onChange={(event) => { if (event.target.value) void addCharacterEntity(event.target.value); event.currentTarget.value = ""; }}>
+                            <option value="">Choose from character data...</option>
+                            {projectCharacters.map((character) => <option key={character.id} value={character.id}>{character.name}</option>)}
+                          </select>
+                        </label>
+                        <p className="notice">Linked characters import their current stats from the project character database. Engagement-only entities can use readable PREFIX-BASE JOB tags.</p>
+                      </>
+                    )}
+                    {entitySettingsTab === "ally-cache" && (
+                      <div className="stack">
+                        <div className="split-actions">
+                          <button onClick={exportAllyCache}><Download size={16} /> Export</button>
+                          <label className="file-pick"><Upload size={16} /> Import<input type="file" accept="application/json" onChange={(event) => void importAllyCache(event.target.files?.[0])} /></label>
+                          <button className="danger" onClick={() => setClearCacheOpen(true)}>Clear all</button>
+                        </div>
+                        {cacheImportStatus && <p className="save-status">{cacheImportStatus}</p>}
+                        {allyCache.length === 0 && <p className="notice">No generated allies cached for this chat yet.</p>}
+                        <div className="ally-cache-list">
+                          {allyCache.map((entry) => (
+                            <section className="ally-cache-row" key={entry.id}>
+                              <div>
+                                <strong>{entry.name}</strong>
+                                {cacheEditId === entry.id ? (
+                                  <input value={cacheDraftTag} onChange={(event) => setCacheDraftTag(event.target.value)} placeholder="DEX-LIGHT ROGUE" />
+                                ) : (
+                                  <small>{entry.templateTag || "No template tag"}</small>
+                                )}
+                              </div>
+                              <button className={cacheEditId === entry.id ? "picked" : ""} onClick={() => { setCacheEditId(entry.id); setCacheDraftTag(entry.templateTag ?? ""); }} aria-label={`Edit ${entry.name} cache tag`}><Pencil size={15} /></button>
+                              {cacheEditId === entry.id && <button onClick={() => saveCacheTag(entry)}><Save size={15} /> Save</button>}
+                            </section>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </section>
+                )}
+                <div className="delta-entity-list">
+                  {entities.map((entity) => {
+                    const hp = entity.currentHp ?? 0;
+                    const maxHp = entity.maxHp || 1;
+                    const displayName = namesByEntityId.get(entity.id) ?? entity.name;
+                    const relationship = normaliseDeltaRelationship(entity.side);
+                    return (
+                      <div key={entity.id} className="delta-entity-wrap">
+                        <div
+                          className={`delta-entity ${relationship} ${entity.id === playerEntityId ? "player" : ""} ${selectedEntityIds.has(entity.id) ? "selected" : ""}`}
+                          onClick={() => pendingEntityMacro ? toggleSelectedEntity(entity.id) : setExpandedEntityId(expandedEntityId === entity.id ? undefined : entity.id)}
+                        >
+                          <span>{displayName}{entity.templateTag && <small className="delta-template-tag">{entity.templateTag}</small>}</span>
+                          <div className="delta-hp"><i style={{ width: `${Math.max(0, Math.min(100, (hp / maxHp) * 100))}%` }} /></div>
+                          <small>{hp}/{maxHp} HP</small>
+                          <select
+                            value={relationship}
+                            onClick={(event) => event.stopPropagation()}
+                            onChange={(event) => void updateEntityRelationship(entity, event.target.value as DeltaRelationship)}
+                          >
+                            {deltaRelationships.map((value) => <option key={value} value={value}>{deltaRelationshipLabel(value)}</option>)}
+                          </select>
+                        {entityPositionLabel(entity) && <small className="delta-position">{entityPositionLabel(entity)}</small>}
+                        <small className="delta-status">{entity.statusText || "No status"}</small>
+                      </div>
+                      {expandedEntityId === entity.id && (
+                        <div className="delta-entity-detail">
+                          <p>{entity.statusText || "No current Delta status."}</p>
+                          <label>Character data
+                            <select value={entity.characterId ?? ""} onChange={(event) => { if (event.target.value) void linkCharacterToEntity(entity, event.target.value); }}>
+                              <option value="">Not linked</option>
+                              {projectCharacters.map((character) => <option key={character.id} value={character.id}>{character.name}</option>)}
+                            </select>
+                          </label>
+                          <div className="delta-stat-grid">
+                              {deltaEntityStats(entity).map(([label, value]) => (
+                                <span key={label}><b>{label}</b><strong>{value ?? "-"}</strong><small>{statModifier(value)}</small></span>
+                              ))}
+                            </div>
+                            <div className="split-actions">
+                              {entity.characterId && <button onClick={() => refreshEntityCharacterStats(entity)}>Refresh character stats</button>}
+                              {entity.id !== playerEntityId && <button className="danger" onClick={() => removeEntity(entity)}>Remove</button>}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+                {pendingEntityMacro && (
+                  <div className="split-actions">
+                    <button onClick={insertPendingEntityMacro} disabled={selectedEntityIds.size === 0}>Insert selected</button>
+                    <button onClick={() => { setPendingEntityMacro(undefined); setSelectedEntityIds(new Set()); }}>Cancel</button>
+                  </div>
+                )}
+              </>
+            )}
+            {activeTool === "settings" && (
+              <div className="stack">
+                <label className="range-row">
+                  <span>Archived engagements <b>{settingsDraft.maxHistoryMessages === undefined ? "infinite" : settingsDraft.maxHistoryMessages}</b></span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={archiveLimitOptions.length - 1}
+                    value={settingsDraft.maxHistoryMessages === undefined ? archiveLimitOptions.length - 1 : Math.max(0, archiveLimitOptions.findIndex((value) => value === settingsDraft.maxHistoryMessages))}
+                    onChange={(event) => {
+                      const value = archiveLimitOptions[Number(event.target.value)];
+                      setSettingsDraft({ ...settingsDraft, maxHistoryMessages: value === Infinity ? undefined : value });
+                    }}
+                  />
+                </label>
+                <div className="split-actions"><button onClick={saveSettings}><Save size={18} /> Save Delta settings</button>{saved && <span className="save-status">Saved</span>}</div>
+              </div>
+            )}
+            {activeTool === "history" && (
+              <div className="stack">
+                <div className="section-title"><h2>Delta History</h2><span>{archivedSessions.length}</span></div>
+                <button onClick={archiveCurrent}>Archive current engagement</button>
+                <div className="delta-history-list">
+                  {archivedSessions.length === 0 && <p className="notice">No archived Delta engagements for this chat yet.</p>}
+                  {archivedSessions.map((item) => (
+                    <button key={item.id} onClick={() => openArchived(item)}>
+                      <span>{item.title}</span>
+                      <small>{formatDate(item.archivedAt ?? item.updatedAt)}</small>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
           </section>
         )}
         <div className="delta-body">
-          <section className="delta-summary">
-            <h2>Engagement Summary</h2>
-            <p>This Delta workspace is attached to this chat. Its active notes stay separate from the main transcript and archived engagements stay reference-only.</p>
-          </section>
-          {archivedSessions.length > 0 && (
-            <section className="delta-summary">
-              <div className="section-title"><h2>Delta History</h2><span>{archivedSessions.length}</span></div>
-              <div className="delta-history-list">
-                {archivedSessions.map((item) => (
-                  <button key={item.id} onClick={() => openArchived(item)}>
-                    <span>{item.title}</span>
-                    <small>{formatDate(item.archivedAt ?? item.updatedAt)}</small>
-                  </button>
-                ))}
-              </div>
-            </section>
-          )}
           <div className="delta-messages">
             {messages.map((message) => (
               <article className={`message ${message.role === "user" ? "user" : "assistant"}`} key={message.id}>
@@ -826,26 +1797,69 @@ function DeltaModeWorkspace({
               </article>
             ))}
           </div>
-          <section className="delta-conclusion">
-            <h2>Conclusion</h2>
-            <div className="mini-row"><strong>Engagement Summary</strong><span>Pending outcome</span></div>
-            <div className="mini-row"><strong>Loot</strong><span>Mock item, Mock clue, Mock currency</span></div>
+        </div>
+        <section className="composer delta-composer">
+          <button type="button" onClick={() => setActiveTool(activeTool === "actions" ? undefined : "actions")}><Zap size={18} /> Actions</button>
+          <textarea ref={composerRef} value={body} onChange={(event) => setBody(event.target.value)} placeholder="Write Delta message" rows={2} />
+          <button className="send-button" onClick={send}>Send</button>
+        </section>
+        {activeTool === "actions" && (
+          <section className="delta-actions-panel">
+            <div className="section-title">
+              <h2>Actions</h2>
+              <div className="split-actions">
+                <button className={actionsEditMode ? "picked" : ""} onClick={() => setActionsEditMode(!actionsEditMode)} aria-label="Toggle action editing"><Pencil size={16} /></button>
+                {actionsEditMode && <button onClick={() => addMacro(undefined, true)}>+ Menu</button>}
+                {actionsEditMode && <button onClick={() => addMacro(undefined, false)}>+ Action</button>}
+              </div>
+            </div>
+            {actionMacros.length === 0 && <p className="notice">Create text macros here. Selecting a macro inserts text into the composer without sending it.</p>}
+            <DeltaActionTree macros={actionMacros} parentId={undefined} editMode={actionsEditMode} onChoose={chooseMacro} onAdd={addMacro} onEdit={editMacro} onDelete={deleteMacro} />
+          </section>
+        )}
+      </aside>
+      {macroDraft && (
+        <div className="modal-backdrop" onClick={() => setMacroDraft(undefined)}>
+          <section className="modal macro-editor" onClick={(event) => event.stopPropagation()}>
+            <div className="section-title">
+              <h2>{macroDraft.macro ? "Edit Action" : macroDraft.folder ? "New Menu" : "New Action"}</h2>
+              <button className="icon-button" onClick={() => setMacroDraft(undefined)} aria-label="Close action editor"><X size={18} /></button>
+            </div>
+            <label>Name<input value={macroDraft.label} onChange={(event) => setMacroDraft({ ...macroDraft, label: event.target.value })} /></label>
+            {!macroDraft.folder && (
+              <>
+                <label>Text template<textarea value={macroDraft.template} onChange={(event) => setMacroDraft({ ...macroDraft, template: event.target.value })} rows={4} placeholder="Halle uses basic attack on {target}" /></label>
+                <label className="compact-check"><input type="checkbox" checked={macroDraft.requestEntitySelection} onChange={(event) => setMacroDraft({ ...macroDraft, requestEntitySelection: event.target.checked })} /> Ask me to choose one or more targets before inserting</label>
+              </>
+            )}
             <div className="split-actions">
-              <button onClick={archiveCurrent}>Archive engagement</button>
-              <button onClick={onClose}>Continue</button>
+              <button onClick={saveMacroDraft}><Save size={18} /> Save</button>
+              <button onClick={() => setMacroDraft(undefined)}>Cancel</button>
             </div>
           </section>
         </div>
-        <section className="composer delta-composer">
-          <textarea value={body} onChange={(event) => setBody(event.target.value)} placeholder="Write Delta notes" rows={2} />
-          <button className="send-button" onClick={send}>Send</button>
-        </section>
-      </aside>
+      )}
+      {clearCacheOpen && (
+        <div className="modal-backdrop" onClick={() => setClearCacheOpen(false)}>
+          <section className="modal macro-editor" onClick={(event) => event.stopPropagation()}>
+            <div className="section-title">
+              <h2>Clear Ally Cache</h2>
+              <button className="icon-button" onClick={() => setClearCacheOpen(false)} aria-label="Close clear cache dialog"><X size={18} /></button>
+            </div>
+            <p className="notice">This removes generated ally cache entries for this chat only. It does not delete project characters or Delta messages.</p>
+            <div className="split-actions">
+              <button className="danger" onClick={clearAllyCache}><Trash2 size={18} /> Clear cache</button>
+              <button onClick={() => setClearCacheOpen(false)}>Cancel</button>
+            </div>
+          </section>
+        </div>
+      )}
       {previewSession && (
         <div className="modal-backdrop" onClick={() => setPreviewSession(undefined)}>
           <section className="modal delta-archive-preview" onClick={(event) => event.stopPropagation()}>
             <div className="section-title">
               <h2>{previewSession.title}</h2>
+              <button onClick={() => renameArchived(previewSession)}><Edit3 size={16} /> Rename</button>
               <button className="icon-button" onClick={() => setPreviewSession(undefined)} aria-label="Close archived engagement"><X size={18} /></button>
             </div>
             <p className="notice">Archived Delta engagements are read-only reference records and are not used for future Delta prompts, summaries, or compaction.</p>
@@ -859,6 +1873,74 @@ function DeltaModeWorkspace({
           </section>
         </div>
       )}
+    </div>
+  );
+}
+
+function DeltaActionTree({
+  macros,
+  parentId,
+  editMode,
+  onChoose,
+  onAdd,
+  onEdit,
+  onDelete
+}: {
+  macros: DeltaActionMacro[];
+  parentId?: string;
+  editMode: boolean;
+  onChoose: (macro: DeltaActionMacro) => void;
+  onAdd: (parentId: string | undefined, folder: boolean) => void;
+  onEdit: (macro: DeltaActionMacro) => void;
+  onDelete: (macro: DeltaActionMacro) => void;
+}) {
+  const [openIds, setOpenIds] = useState<Set<string>>(new Set());
+  const children = macros.filter((macro) => macro.parentId === parentId).sort((a, b) => a.orderIndex - b.orderIndex);
+  if (children.length === 0) return null;
+  return (
+    <div className="delta-action-tree">
+      {children.map((macro) => {
+        const isMenu = macro.template === undefined;
+        const open = openIds.has(macro.id);
+        return (
+          <div className="delta-action-node" key={macro.id}>
+            <div className="delta-action-row">
+              <button
+                type="button"
+                onClick={() => {
+                  if (!isMenu) {
+                    onChoose(macro);
+                    return;
+                  }
+                  setOpenIds((current) => {
+                    const next = new Set(current);
+                    if (next.has(macro.id)) next.delete(macro.id);
+                    else next.add(macro.id);
+                    return next;
+                  });
+                }}
+              >
+                {isMenu ? (open ? "v " : "> ") : ""}{macro.label}
+              </button>
+              {editMode && isMenu && <button type="button" onClick={() => onAdd(macro.id, true)}>+ Menu</button>}
+              {editMode && isMenu && <button type="button" onClick={() => onAdd(macro.id, false)}>+ Action</button>}
+              {editMode && <button type="button" onClick={() => onEdit(macro)}>Edit</button>}
+              {editMode && <button type="button" onClick={() => onDelete(macro)}>-</button>}
+            </div>
+            {isMenu && open && (
+              <DeltaActionTree
+                macros={macros}
+                parentId={macro.id}
+                editMode={editMode}
+                onChoose={onChoose}
+                onAdd={onAdd}
+                onEdit={onEdit}
+                onDelete={onDelete}
+              />
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -1073,6 +2155,10 @@ function ChatScreen({
   const [historyNoLimit, setHistoryNoLimit] = useState(!settings.maxHistoryMessages);
   const [compactionEnabled, setCompactionEnabled] = useState(settings.compactionEnabled ?? false);
   const [streamingEnabled, setStreamingEnabled] = useState(settings.streamingEnabled ?? false);
+  const [autoManageInventory, setAutoManageInventory] = useState(settings.autoManageInventory ?? false);
+  const [confirmInventoryUpdates, setConfirmInventoryUpdates] = useState(settings.confirmInventoryUpdates ?? true);
+  const [autoManageGear, setAutoManageGear] = useState(settings.autoManageGear ?? false);
+  const [confirmGearUpdates, setConfirmGearUpdates] = useState(settings.confirmGearUpdates ?? true);
   const [inventoryEnabled, setInventoryEnabled] = useState(project?.inventoryEnabled ?? false);
   const [gearEnabled, setGearEnabled] = useState(project?.gearEnabled ?? false);
   const [attachedImages, setAttachedImages] = useState<File[]>([]);
@@ -1092,6 +2178,10 @@ function ChatScreen({
     setHistoryNoLimit(!settings.maxHistoryMessages);
     setCompactionEnabled(settings.compactionEnabled ?? false);
     setStreamingEnabled(settings.streamingEnabled ?? false);
+    setAutoManageInventory(settings.autoManageInventory ?? false);
+    setConfirmInventoryUpdates(settings.confirmInventoryUpdates ?? true);
+    setAutoManageGear(settings.autoManageGear ?? false);
+    setConfirmGearUpdates(settings.confirmGearUpdates ?? true);
   }, [settings, selectedModelId]);
   useEffect(() => {
     setInventoryEnabled(project?.inventoryEnabled ?? false);
@@ -1117,6 +2207,10 @@ function ChatScreen({
       includeCharacters,
       includeSourceFiles,
       streamingEnabled,
+      autoManageInventory,
+      confirmInventoryUpdates,
+      autoManageGear,
+      confirmGearUpdates,
       updatedAt: timestamp
     });
     if (project) await db.projects.update(project.id, { inventoryEnabled, gearEnabled, updatedAt: timestamp });
@@ -1136,10 +2230,90 @@ function ChatScreen({
     if (temperatureValue !== undefined) payload.temperature = temperatureValue;
     if (topPValue !== undefined) payload.top_p = topPValue;
     if (maxTokensValue !== undefined) payload.max_tokens = maxTokensValue;
-    if (includeCharacters) payload.tools = characterTools;
+    const activeTools = [
+      ...(includeCharacters ? [...characterTools] : []),
+      ...(project && project.memoryMode !== "manual" ? [...memoryTools] : []),
+      ...(((project?.inventoryEnabled && autoManageInventory) || (project?.gearEnabled && autoManageGear)) ? [...inventoryTools] : [])
+    ];
+    if (activeTools.length) payload.tools = activeTools;
     if (stream) payload.stream_options = { include_usage: true };
     return payload;
   }
+
+  async function inventoryContext(chatId: string) {
+    if (!project || (!project.inventoryEnabled && !project.gearEnabled)) return "";
+    const [items, logs, activeChat] = await Promise.all([
+      db.inventoryItems.where("chatId").equals(chatId).toArray(),
+      db.inventoryLogs.where("chatId").equals(chatId).reverse().sortBy("updatedAt"),
+      db.chats.get(chatId)
+    ]);
+    const inventoryRows = project.inventoryEnabled
+      ? items.filter((item) => item.kind === "inventory" && item.name.trim()).map((item) => `- ${item.name}: ${item.quantity}`)
+      : [];
+    const gearRows = project.gearEnabled
+      ? items.filter((item) => item.kind === "gear" && item.name.trim()).map((item) => `- ${item.name}: ${item.quantity}`)
+      : [];
+    const managementLines = [
+      project.inventoryEnabled && autoManageInventory ? "Inventory auto-management is enabled: use update_inventory_item for inventory or currency changes." : "",
+      project.gearEnabled && autoManageGear ? "Gear auto-management is enabled: use update_inventory_item for gear changes." : "",
+      (!autoManageInventory && project.inventoryEnabled) || (!autoManageGear && project.gearEnabled) ? "If auto-management is disabled for a listed section, use the listed inventory/gear as read-only context and do not claim you cannot access it." : "",
+      "When using update_inventory_item, include the exact item or currency name, signed quantity delta, and a terse one-line log sentence. Use kind currency for the listed currency amount."
+    ].filter(Boolean);
+    const parts = [
+      inventoryRows.length || project.currencyName ? `Inventory:\n${project.currencyName ? `- ${project.currencyName}: ${activeChat?.currencyAmount ?? 0}` : ""}${project.currencyName && inventoryRows.length ? "\n" : ""}${inventoryRows.join("\n") || ""}` : "",
+      gearRows.length ? `Gear:\n${gearRows.join("\n")}` : "",
+      logs.length ? `Recent inventory log:\n${logs.slice(0, 8).map((log) => `- ${log.sentence}`).join("\n")}` : "",
+      managementLines.join("\n")
+    ].filter(Boolean);
+    return parts.length ? parts.join("\n\n") : "";
+  }
+
+  async function memoryContext(currentUserMessage: string, selectedHistory: Message[]) {
+    if (!project || project.memoryMode === "manual") return "";
+    const recentScene = selectedHistory.slice(-4).map((message) => message.body);
+    const characterNames = includeCharacters
+      ? (await db.characters.where("projectId").equals(project.id).toArray()).map((character) => character.name)
+      : [];
+    const concepts = extractMemoryConcepts([
+      currentUserMessage,
+      ...recentScene,
+      project.name,
+      includeWorld ? project.worldSetting : "",
+      includeInstructions ? project.instructions : "",
+      ...characterNames
+    ]);
+    const query = concepts.join(" ");
+    const memories = query ? await searchMemories(project.id, concepts, query, 8) : [];
+    if (memories.length) {
+      const timestamp = now();
+      await Promise.all(memories.map(async (memory) => {
+        const row = await db.memories.get(memory.id);
+        if (row) await db.memories.update(row.id, { lastRecalledAt: timestamp, recallCount: (row.recallCount ?? 0) + 1, updatedAt: timestamp });
+      }));
+    }
+    return [
+      `Memory instruction:\n${project.memoryInstruction}`,
+      `Memory retrieval query:\n${query || "(none)"}`,
+      memories.length
+        ? `Retrieved memories for this reply only:\n${memories.map((memory) => `- ${memory.text}${memory.tags.length ? ` [${memory.tags.join(", ")}]` : ""}`).join("\n")}`
+        : "Retrieved memories for this reply only:\n(none)"
+    ].join("\n\n");
+  }
+
+  function shouldConfirmInventoryUpdate(kind: InventoryUpdateRequest["kind"]) {
+    return kind === "gear" ? confirmGearUpdates : confirmInventoryUpdates;
+  }
+
+  function inventoryToolEnabled(kind: InventoryUpdateRequest["kind"]) {
+    if (!project) return false;
+    if (kind === "gear") return project.gearEnabled && autoManageGear;
+    return project.inventoryEnabled && autoManageInventory;
+  }
+
+  function toolsEnabled() {
+    return includeCharacters || (project?.memoryMode !== "manual") || inventoryToolEnabled("inventory") || inventoryToolEnabled("gear");
+  }
+
 
   async function openRouterRequest(payload: Record<string, unknown>) {
     const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -1182,8 +2356,99 @@ function ChatScreen({
     }
   }
 
-  async function resolveCharacterToolCalls(messagesToSend: OpenRouterMessage[], toolLog: string[]) {
-    if (!includeCharacters) return { messages: messagesToSend, usage: undefined as OpenRouterUsage | undefined };
+  async function applyInventoryUpdate(projectId: string, chatId: string, update: InventoryUpdateRequest) {
+    if (update.kind !== "currency") {
+      return applyInventoryChange(projectId, chatId, update.kind, update.name, update.delta, update.logSentence);
+    }
+    const timestamp = now();
+    const activeChat = await db.chats.get(chatId);
+    const quantity = Math.max(0, (activeChat?.currencyAmount ?? 0) + update.delta);
+    await db.transaction("rw", db.chats, db.inventoryLogs, async () => {
+      await db.chats.update(chatId, { currencyAmount: quantity, updatedAt: timestamp });
+      await db.inventoryLogs.add({ id: uid(), projectId, chatId, sentence: update.logSentence.trim(), createdAt: timestamp, updatedAt: timestamp });
+    });
+    return { item: update.name, quantity };
+  }
+
+  async function runInventoryTool(toolCall: OpenRouterToolCall, chatId: string, inventoryUpdates: InventoryUpdateRequest[]) {
+    if (!project) return { error: "No active project." };
+    let args: Record<string, unknown> = {};
+    try {
+      args = JSON.parse(toolCall.function.arguments || "{}") as Record<string, unknown>;
+    } catch {
+      return { error: "Invalid tool arguments." };
+    }
+    const kind: InventoryUpdateRequest["kind"] = args.kind === "gear" ? "gear" : args.kind === "currency" ? "currency" : "inventory";
+    if (!inventoryToolEnabled(kind)) return { error: `${kind} auto-management is disabled.` };
+    const name = kind === "currency" ? (project.currencyName?.trim() || (typeof args.name === "string" ? args.name.trim() : "")) : typeof args.name === "string" ? normaliseInventoryName(args.name) : "";
+    const delta = typeof args.delta === "number" ? args.delta : Number(args.delta);
+    const logSentence = typeof args.logSentence === "string" ? args.logSentence.trim() : "";
+    if (!name || !Number.isFinite(delta) || delta === 0) return { error: "A non-empty item name and non-zero delta are required." };
+    if (!logSentence) return { error: "A one-line log sentence is required." };
+    const update: InventoryUpdateRequest = {
+      id: uid(),
+      kind,
+      name,
+      delta,
+      logSentence,
+      status: shouldConfirmInventoryUpdate(kind) ? "pending" : "applied"
+    };
+    inventoryUpdates.push(update);
+    if (update.status === "pending") {
+      return { queuedForConfirmation: true, kind, name, delta };
+    }
+    const result = await applyInventoryUpdate(project.id, chatId, update);
+    return { applied: Boolean(result), kind, name, delta, quantity: result?.quantity };
+  }
+
+  async function runMemoryTool(toolCall: OpenRouterToolCall, chatId: string, sourceMessageIds: string[]) {
+    if (!project) return { error: "No active project." };
+    let args: Record<string, unknown> = {};
+    try {
+      args = JSON.parse(toolCall.function.arguments || "{}") as Record<string, unknown>;
+    } catch {
+      return { error: "Invalid tool arguments." };
+    }
+    if (toolCall.function.name === "save_memory") {
+      if (project.memoryMode === "manual") return { disabled: true, reason: "Project memory mode is manual." };
+      const text = typeof args.text === "string" ? args.text.trim() : "";
+      const tags = Array.isArray(args.tags) ? args.tags.filter((tag): tag is string => typeof tag === "string").map((tag) => tag.trim()).filter(Boolean) : [];
+      const reason = typeof args.reason === "string" ? args.reason.trim() : "";
+      const confidence = typeof args.confidence === "number" ? args.confidence : Number(args.confidence);
+      if (!text) return { error: "Memory text is required." };
+      if (project.memoryMode === "approval") {
+        const timestamp = now();
+        await db.pendingMemories.add({
+          id: uid(),
+          projectId: project.id,
+          text,
+          tags,
+          reason,
+          confidence: Number.isFinite(confidence) ? confidence : 0.5,
+          sourceMessageIds,
+          createdAt: timestamp,
+          updatedAt: timestamp
+        });
+        return { proposedForApproval: true };
+      }
+      const memory = await createMemory(project.id, text, tags, "automatic", sourceMessageIds);
+      return { saved: true, id: memory.id };
+    }
+    return { error: `Unknown tool ${toolCall.function.name}.` };
+  }
+
+  async function runToolCall(toolCall: OpenRouterToolCall, chatId: string, inventoryUpdates: InventoryUpdateRequest[], sourceMessageIds: string[]) {
+    if (toolCall.function.name === "update_inventory_item") {
+      return runInventoryTool(toolCall, chatId, inventoryUpdates);
+    }
+    if (toolCall.function.name === "save_memory") {
+      return runMemoryTool(toolCall, chatId, sourceMessageIds);
+    }
+    return runCharacterTool(toolCall);
+  }
+
+  async function resolveToolCalls(messagesToSend: OpenRouterMessage[], toolLog: string[], inventoryUpdates: InventoryUpdateRequest[], chatId: string, sourceMessageIds: string[]) {
+    if (!toolsEnabled()) return { messages: messagesToSend, usage: undefined as OpenRouterUsage | undefined };
     let nextMessages = [...messagesToSend];
     let usage: OpenRouterUsage | undefined;
     for (let index = 0; index < 4; index += 1) {
@@ -1202,7 +2467,7 @@ function ChatScreen({
         }
       ];
       for (const toolCall of toolCalls) {
-        const result = await runCharacterTool(toolCall);
+        const result = await runToolCall(toolCall, chatId, inventoryUpdates, sourceMessageIds);
         toolLog.push(toolCall.function.name);
         nextMessages.push({
           role: "tool",
@@ -1214,8 +2479,8 @@ function ChatScreen({
     return { messages: nextMessages, usage };
   }
 
-  async function completeWithCharacterTools(messagesToSend: OpenRouterMessage[], toolLog: string[]) {
-    const resolved = await resolveCharacterToolCalls(messagesToSend, toolLog);
+  async function completeWithTools(messagesToSend: OpenRouterMessage[], toolLog: string[], inventoryUpdates: InventoryUpdateRequest[], chatId: string, sourceMessageIds: string[]) {
+    const resolved = await resolveToolCalls(messagesToSend, toolLog, inventoryUpdates, chatId, sourceMessageIds);
     const replyText = typeof resolved.assistantMessage?.content === "string" ? resolved.assistantMessage.content : "";
     return {
       replyText,
@@ -1252,19 +2517,23 @@ function ChatScreen({
         ? await db.sourceFiles.where("projectId").equals(project.id).and((file) => Boolean(file.textContent)).toArray()
         : [];
       const activeChat = await db.chats.get(chatId);
-      const systemParts = [
-        `Project: ${project.name}`,
-        includeInstructions && project.instructions ? `Project instructions:\n${project.instructions}` : "",
-        includeWorld && project.worldSetting ? `World setting:\n${project.worldSetting}` : "",
-        compactionEnabled && activeChat?.compactionMemory ? `Compaction memory:\n${activeChat.compactionMemory}` : "",
-        sourceFiles.length ? `Source files:\n${sourceFiles.map((file) => `# ${file.name}\n${file.textContent}`).join("\n\n")}` : ""
-      ].filter(Boolean);
+      const inventoryDetails = await inventoryContext(chatId);
       const allHistory = await db.messages
         .where("[chatId+branchId+sequence]")
         .between([chatId, branchId, Dexie.minKey], [chatId, branchId, Dexie.maxKey])
         .toArray();
       const historyLimit = historyNoLimit ? undefined : optionalNumber(maxHistory);
       const selectedHistory = historyLimit ? allHistory.slice(-historyLimit) : allHistory;
+      const memoryDetails = await memoryContext(text, selectedHistory);
+      const systemParts = [
+        `Project: ${project.name}`,
+        includeInstructions && project.instructions ? `Project instructions:\n${project.instructions}` : "",
+        includeWorld && project.worldSetting ? `World setting:\n${project.worldSetting}` : "",
+        compactionEnabled && activeChat?.compactionMemory ? `Compaction memory:\n${activeChat.compactionMemory}` : "",
+        sourceFiles.length ? `Source files:\n${sourceFiles.map((file) => `# ${file.name}\n${file.textContent}`).join("\n\n")}` : "",
+        memoryDetails,
+        inventoryDetails
+      ].filter(Boolean);
       const images = await Promise.all(attachedImages.map(fileToDataUrl));
       const requestMessages: OpenRouterMessage[] = [
         ...(systemParts.length ? [{ role: "system" as const, content: systemParts.join("\n\n") }] : []),
@@ -1274,6 +2543,7 @@ function ChatScreen({
         }))
       ];
       const toolLog: string[] = [];
+      const inventoryUpdates: InventoryUpdateRequest[] = [];
       const requestInfo = {
         settings: [
           `Model: ${draftModelId}`,
@@ -1289,24 +2559,30 @@ function ChatScreen({
           `Characters: ${includeCharacters ? "on" : "off"}`,
           `Source files: ${includeSourceFiles ? "on" : "off"}`,
           `Compaction memory: ${compactionEnabled ? "on" : "off"}`,
+          `Project memories: ${project.memoryMode !== "manual" ? project.memoryMode : "manual/off"}`,
+          `Auto inventory: ${inventoryToolEnabled("inventory") ? "on" : "off"}`,
+          `Confirm inventory: ${confirmInventoryUpdates ? "on" : "off"}`,
+          `Auto gear: ${inventoryToolEnabled("gear") ? "on" : "off"}`,
+          `Confirm gear: ${confirmGearUpdates ? "on" : "off"}`,
           `Images: ${attachedImages.length}`
         ],
-        toolCalls: toolLog
+        toolCalls: toolLog,
+        inventoryUpdates
       };
-      const canStreamDirectly = streamingEnabled && !includeCharacters;
+      const canStreamDirectly = streamingEnabled && !toolsEnabled();
       const reply = await addMessage(chatId, branchId, "assistant", canStreamDirectly ? "" : "...");
       await db.messages.update(reply.id, { modelId: draftModelId, status: canStreamDirectly ? "streaming" : "pending", requestInfo });
       await onRefresh();
       try {
-        if (includeCharacters) {
-          const completed = await completeWithCharacterTools(requestMessages, toolLog);
+        if (toolsEnabled()) {
+          const completed = await completeWithTools(requestMessages, toolLog, inventoryUpdates, chatId, selectedHistory.map((message) => message.id));
           await db.messages.update(reply.id, {
             body: completed.replyText || "(No response text returned.)",
             inputTokens: completed.inputTokens,
             outputTokens: completed.outputTokens ?? estimateTokens(completed.replyText),
             estimatedTokens: !completed.outputTokens,
             status: "complete",
-            requestInfo: { ...requestInfo, toolCalls: toolLog.length ? toolLog : ["None"] },
+            requestInfo: { ...requestInfo, toolCalls: toolLog.length ? toolLog : ["None"], inventoryUpdates },
             updatedAt: now()
           });
           setAttachedImages([]);
@@ -1419,13 +2695,7 @@ function ChatScreen({
       ? await db.sourceFiles.where("projectId").equals(project.id).and((file) => Boolean(file.textContent)).toArray()
       : [];
     const activeChat = await db.chats.get(chatId);
-    const systemParts = [
-      `Project: ${project.name}`,
-      includeInstructions && project.instructions ? `Project instructions:\n${project.instructions}` : "",
-      includeWorld && project.worldSetting ? `World setting:\n${project.worldSetting}` : "",
-      compactionEnabled && activeChat?.compactionMemory ? `Compaction memory:\n${activeChat.compactionMemory}` : "",
-      sourceFiles.length ? `Source files:\n${sourceFiles.map((file) => `# ${file.name}\n${file.textContent}`).join("\n\n")}` : ""
-    ].filter(Boolean);
+    const inventoryDetails = await inventoryContext(chatId);
     const allHistory = await db.messages
       .where("[chatId+branchId+sequence]")
       .between([chatId, branchId, Dexie.minKey], [chatId, branchId, promptMessage.sequence])
@@ -1434,6 +2704,16 @@ function ChatScreen({
     const historyLimit = historyNoLimit ? undefined : optionalNumber(maxHistory);
     const limitedHistory = historyLimit ? orderedHistory.slice(-historyLimit) : orderedHistory;
     const selectedHistory = limitedHistory.some((row) => row.id === promptMessage.id) ? limitedHistory : [...limitedHistory, promptMessage].sort((a, b) => a.sequence - b.sequence);
+    const memoryDetails = await memoryContext(promptMessage.body, selectedHistory);
+    const systemParts = [
+      `Project: ${project.name}`,
+      includeInstructions && project.instructions ? `Project instructions:\n${project.instructions}` : "",
+      includeWorld && project.worldSetting ? `World setting:\n${project.worldSetting}` : "",
+      compactionEnabled && activeChat?.compactionMemory ? `Compaction memory:\n${activeChat.compactionMemory}` : "",
+      sourceFiles.length ? `Source files:\n${sourceFiles.map((file) => `# ${file.name}\n${file.textContent}`).join("\n\n")}` : "",
+      memoryDetails,
+      inventoryDetails
+    ].filter(Boolean);
     const requestMessages: OpenRouterMessage[] = [
       ...(systemParts.length ? [{ role: "system" as const, content: systemParts.join("\n\n") }] : []),
       ...selectedHistory.map((historyMessage) => ({
@@ -1442,6 +2722,7 @@ function ChatScreen({
       }))
     ];
     const toolLog: string[] = [];
+    const inventoryUpdates: InventoryUpdateRequest[] = [];
     const requestInfo = {
       settings: [
         `Model: ${draftModelId}`,
@@ -1457,9 +2738,15 @@ function ChatScreen({
         `Characters: ${includeCharacters ? "on" : "off"}`,
         `Source files: ${includeSourceFiles ? "on" : "off"}`,
         `Compaction memory: ${compactionEnabled ? "on" : "off"}`,
+        `Project memories: ${project.memoryMode !== "manual" ? project.memoryMode : "manual/off"}`,
+        `Auto inventory: ${inventoryToolEnabled("inventory") ? "on" : "off"}`,
+        `Confirm inventory: ${confirmInventoryUpdates ? "on" : "off"}`,
+        `Auto gear: ${inventoryToolEnabled("gear") ? "on" : "off"}`,
+        `Confirm gear: ${confirmGearUpdates ? "on" : "off"}`,
         "Images: 0"
       ],
-      toolCalls: toolLog
+      toolCalls: toolLog,
+      inventoryUpdates
     };
     let reply: Message | undefined;
     await db.transaction("rw", db.messages, db.stars, db.chats, async () => {
@@ -1472,7 +2759,7 @@ function ChatScreen({
         await db.stars.where("messageId").anyOf(messageIds).delete();
         await db.messages.bulkDelete(messageIds);
       }
-      const canStreamDirectly = streamingEnabled && !includeCharacters;
+      const canStreamDirectly = streamingEnabled && !toolsEnabled();
       reply = await addMessage(chatId, branchId, "assistant", canStreamDirectly ? "" : "...");
       await db.messages.update(reply.id, { modelId: draftModelId, status: canStreamDirectly ? "streaming" : "pending", requestInfo });
       await db.chats.update(chatId, { updatedAt: timestamp });
@@ -1480,15 +2767,15 @@ function ChatScreen({
     if (!reply) return;
     await onRefresh();
     try {
-      if (includeCharacters) {
-        const completed = await completeWithCharacterTools(requestMessages, toolLog);
+      if (toolsEnabled()) {
+        const completed = await completeWithTools(requestMessages, toolLog, inventoryUpdates, chatId, selectedHistory.map((message) => message.id));
         await db.messages.update(reply.id, {
           body: completed.replyText || "(No response text returned.)",
           inputTokens: completed.inputTokens,
           outputTokens: completed.outputTokens ?? estimateTokens(completed.replyText),
           estimatedTokens: !completed.outputTokens,
           status: "complete",
-          requestInfo: { ...requestInfo, toolCalls: toolLog.length ? toolLog : ["None"] },
+          requestInfo: { ...requestInfo, toolCalls: toolLog.length ? toolLog : ["None"], inventoryUpdates },
           updatedAt: now()
         });
         await onRefresh();
@@ -1546,6 +2833,36 @@ function ChatScreen({
     await onRefresh();
   }
 
+  async function handleInventoryUpdateAction(message: Message, action: "confirm" | "edit" | "reject") {
+    const updates = message.requestInfo?.inventoryUpdates ?? [];
+    const pendingUpdates = updates.filter((update) => update.status === "pending");
+    if (!pendingUpdates.length) return;
+    const status: InventoryUpdateRequest["status"] = action === "confirm" ? "confirmed" : action === "edit" ? "edit" : "rejected";
+    if (action === "confirm" && project) {
+      for (const update of pendingUpdates) {
+        await applyInventoryUpdate(project.id, message.chatId, update);
+      }
+    }
+    await db.messages.update(message.id, {
+      requestInfo: {
+        ...message.requestInfo,
+        settings: message.requestInfo?.settings ?? [],
+        toggles: message.requestInfo?.toggles ?? [],
+        toolCalls: message.requestInfo?.toolCalls ?? [],
+        inventoryUpdates: updates.map((update) => update.status === "pending" ? { ...update, status } : update)
+      },
+      updatedAt: now()
+    });
+    const nextDraft =
+      action === "confirm"
+        ? "((OOC: Inventory update confirmed.))"
+        : action === "edit"
+          ? "((OOC: Inventory update edit;\n\n))"
+          : "((OOC: Inventory update rejected because;\n\n))";
+    setBody((current) => current.trim() ? `${current}\n${nextDraft}` : nextDraft);
+    await onRefresh();
+  }
+
   if (!project) {
     return <EmptyState title="Choose a project" body="Open the sidebar and select a project before starting a chat." />;
   }
@@ -1563,6 +2880,7 @@ function ChatScreen({
             onExpand={() => setExpandedMessageId(expandedMessageId === message.id ? undefined : message.id)}
             onEdit={editMessage}
             onResend={resendFromMessage}
+            onInventoryUpdateAction={handleInventoryUpdateAction}
             onRefresh={onRefresh}
           />
         ))}
@@ -1604,7 +2922,19 @@ function ChatScreen({
                 <label className="compact-check"><input type="checkbox" checked={includeCharacters} onChange={(event) => setIncludeCharacters(event.target.checked)} /> Characters</label>
                 <label className="compact-check"><input type="checkbox" checked={includeSourceFiles} onChange={(event) => setIncludeSourceFiles(event.target.checked)} /> Source files</label>
                 <label className="compact-check"><input type="checkbox" checked={inventoryEnabled} onChange={(event) => setInventoryEnabled(event.target.checked)} /> Enable inventory</label>
+                {inventoryEnabled && (
+                  <div className="inline-setting-pair">
+                    <label className="compact-check"><input type="checkbox" checked={autoManageInventory} onChange={(event) => setAutoManageInventory(event.target.checked)} /> Auto manage Inventory</label>
+                    <label className="compact-check"><input type="checkbox" checked={confirmInventoryUpdates} onChange={(event) => setConfirmInventoryUpdates(event.target.checked)} /> Use confirmation</label>
+                  </div>
+                )}
                 <label className="compact-check"><input type="checkbox" checked={gearEnabled} onChange={(event) => setGearEnabled(event.target.checked)} /> Enable gear</label>
+                {gearEnabled && (
+                  <div className="inline-setting-pair">
+                    <label className="compact-check"><input type="checkbox" checked={autoManageGear} onChange={(event) => setAutoManageGear(event.target.checked)} /> Auto manage Gear</label>
+                    <label className="compact-check"><input type="checkbox" checked={confirmGearUpdates} onChange={(event) => setConfirmGearUpdates(event.target.checked)} /> Use confirmation</label>
+                  </div>
+                )}
                 <label className="compact-check"><input type="checkbox" checked={compactionEnabled} onChange={(event) => setCompactionEnabled(event.target.checked)} /> Compaction memory</label>
                 <button onClick={() => onRoute("compaction")}><BookOpen size={18} /> Open compaction memory</button>
                 <label className="compact-check"><input type="checkbox" checked={streamingEnabled} onChange={(event) => setStreamingEnabled(event.target.checked)} /> Streaming</label>
@@ -1639,6 +2969,7 @@ function MessageRow({
   onExpand,
   onEdit,
   onResend,
+  onInventoryUpdateAction,
   onRefresh
 }: {
   projectId: string;
@@ -1647,6 +2978,7 @@ function MessageRow({
   onExpand: () => void;
   onEdit: (message: Message, nextBody: string) => Promise<Message>;
   onResend: (message: Message) => Promise<void>;
+  onInventoryUpdateAction: (message: Message, action: "confirm" | "edit" | "reject") => Promise<void>;
   onRefresh: () => Promise<void>;
 }) {
   const [infoOpen, setInfoOpen] = useState(false);
@@ -1654,7 +2986,6 @@ function MessageRow({
   const [draftBody, setDraftBody] = useState(message.body);
   useEffect(() => setDraftBody(message.body), [message.id, message.body]);
   async function star() {
-    const { toggleStar } = await import("../data/repositories");
     await toggleStar(projectId, message);
     await onRefresh();
   }
@@ -1678,6 +3009,12 @@ function MessageRow({
       <article className={`message ${message.role}`} onClick={onExpand}>
         {expanded && message.role === "assistant" && message.modelId && <div className="message-model">{message.modelId}</div>}
         <div className="message-body"><MarkdownText text={message.body} /></div>
+        {message.role === "assistant" && (
+          <InventoryUpdateCard
+            updates={(message.requestInfo?.inventoryUpdates ?? []).filter((update) => update.status === "pending")}
+            onAction={(action) => onInventoryUpdateAction(message, action)}
+          />
+        )}
         <div className={`message-meta ${expanded ? "show" : ""}`}>
           <button aria-label="Edit message" title="Edit" onClick={(event) => { event.stopPropagation(); setEditOpen(true); }}><Edit3 size={16} /></button>
           <button aria-label={message.starred ? "Unstar message" : "Star message"} title={message.starred ? "Unstar" : "Star"} onClick={(event) => { event.stopPropagation(); star(); }}><Star size={16} fill={message.starred ? "currentColor" : "none"} /></button>
@@ -1706,6 +3043,28 @@ function MessageRow({
         </div>
       )}
     </>
+  );
+}
+
+function InventoryUpdateCard({ updates, onAction }: { updates: InventoryUpdateRequest[]; onAction: (action: "confirm" | "edit" | "reject") => Promise<void> }) {
+  if (!updates.length) return null;
+  return (
+    <div className="inventory-update-card" onClick={(event) => event.stopPropagation()}>
+      <h3>Inventory Update</h3>
+      <div className="inventory-update-list">
+        {updates.map((update) => (
+          <div className={`inventory-update-row ${update.delta > 0 ? "add" : "remove"}`} key={update.id}>
+            <span>{update.name}</span>
+            <strong>{update.delta > 0 ? "+" : ""}{update.delta}</strong>
+          </div>
+        ))}
+      </div>
+      <div className="inventory-update-actions">
+        <button type="button" onClick={() => onAction("confirm")}>Confirm</button>
+        <button type="button" onClick={() => onAction("edit")}>Edit</button>
+        <button type="button" onClick={() => onAction("reject")}>Reject</button>
+      </div>
+    </div>
   );
 }
 
@@ -1776,13 +3135,19 @@ function ProjectCard({ project, active, index, total, onSelect, onEdit, projects
     const count = await db.messages.where("chatId").anyOf((await db.chats.where("projectId").equals(project.id).primaryKeys()) as string[]).count();
     const ok = count > 0 ? prompt(`Deleting this project removes chats, messages, stars, archives, characters, and memories. Type DELETE ${project.name} to continue.`) === `DELETE ${project.name}` : confirm("Delete this project and its associated records?");
     if (!ok) return;
-    await db.transaction("rw", [db.projects, db.chats, db.branches, db.messages, db.stars, db.archives, db.archiveEntries, db.characters, db.characterBonuses, db.memories, db.deltaSessions, db.deltaMessages, db.deltaEntities], async () => {
+    await db.transaction("rw", [db.projects, db.chats, db.branches, db.messages, db.stars, db.archives, db.archiveEntries, db.characters, db.characterBonuses, db.memories, db.inventoryItems, db.inventoryLogs, db.deltaSessions, db.deltaMessages, db.deltaEntities, db.deltaAllyCache, db.deltaActionMacros], async () => {
       const chatIds = (await db.chats.where("projectId").equals(project.id).primaryKeys()) as string[];
       const archiveIds = (await db.archives.where("projectId").equals(project.id).primaryKeys()) as string[];
       const characterIds = (await db.characters.where("projectId").equals(project.id).primaryKeys()) as string[];
       const deltaSessionIds = chatIds.length ? (await db.deltaSessions.where("chatId").anyOf(chatIds).primaryKeys()) as string[] : [];
       await db.messages.where("chatId").anyOf(chatIds).delete();
       await db.branches.where("chatId").anyOf(chatIds).delete();
+      if (chatIds.length) {
+        await db.inventoryItems.where("chatId").anyOf(chatIds).delete();
+        await db.inventoryLogs.where("chatId").anyOf(chatIds).delete();
+      }
+      if (chatIds.length) await db.deltaActionMacros.where("chatId").anyOf(chatIds).delete();
+      if (chatIds.length) await db.deltaAllyCache.where("chatId").anyOf(chatIds).delete();
       await db.chats.where("projectId").equals(project.id).delete();
       await db.stars.where("projectId").equals(project.id).delete();
       await db.archiveEntries.where("archiveId").anyOf(archiveIds).delete();
@@ -1817,16 +3182,38 @@ function ProjectCard({ project, active, index, total, onSelect, onEdit, projects
 
 function ProjectEditPage({ project, onRefresh, onDone }: { project: Project; onRefresh: () => Promise<void>; onDone: () => void }) {
   const [draft, setDraft] = useState(project);
+  const [tab, setTab] = useState<"general" | "delta">("general");
+  const [deltaStats, setDeltaStats] = useState<AbilityScores>(cleanAbilityScores(project.deltaDefaultNpcStats));
+  const [deltaPrefixes, setDeltaPrefixes] = useState<DeltaPrefixTemplate[]>(project.deltaPrefixes?.length ? project.deltaPrefixes : defaultDeltaPrefixes());
+  const [deltaBases, setDeltaBases] = useState<DeltaBaseTemplate[]>(deltaBaseDraft(project.deltaBases));
+  const [deltaJobs, setDeltaJobs] = useState<DeltaJobTemplate[]>(project.deltaJobs ?? defaultDeltaJobs());
   const [showIconPicker, setShowIconPicker] = useState(false);
   const [saved, showSaved] = useSavedNotice();
-  useEffect(() => setDraft(project), [project]);
+  const [deltaSaved, showDeltaSaved] = useSavedNotice();
+  useEffect(() => {
+    setDraft(project);
+    setDeltaStats(cleanAbilityScores(project.deltaDefaultNpcStats));
+    setDeltaPrefixes(project.deltaPrefixes?.length ? project.deltaPrefixes : defaultDeltaPrefixes());
+    setDeltaBases(deltaBaseDraft(project.deltaBases));
+    setDeltaJobs(project.deltaJobs ?? defaultDeltaJobs());
+  }, [project.id]);
   async function save() {
     await db.projects.put({ ...draft, updatedAt: now() });
     showSaved();
     await onRefresh();
   }
+  async function saveDeltaPatch(patch: Pick<Project, "deltaDefaultNpcStats"> | Pick<Project, "deltaPrefixes"> | Pick<Project, "deltaBases"> | Pick<Project, "deltaJobs">) {
+    await db.projects.update(project.id, { ...patch, updatedAt: now() });
+    showDeltaSaved();
+    await onRefresh();
+  }
   return (
     <Page>
+      <div className="settings-tabs">
+        <button className={tab === "general" ? "picked" : ""} onClick={() => setTab("general")}><Folder size={18} /> General</button>
+        <button className={tab === "delta" ? "picked" : ""} onClick={() => setTab("delta")}><Swords size={18} /> Delta</button>
+      </div>
+      {tab === "general" && (
       <section className="item-card stack">
         <button className="project-icon-edit" onClick={() => setShowIconPicker(!showIconPicker)} aria-label="Change project icon">
           <ProjectIcon name={draft.iconName} color={draft.iconColor} size={36} />
@@ -1850,7 +3237,6 @@ function ProjectEditPage({ project, onRefresh, onDone }: { project: Project; onR
         {draft.inventoryEnabled && (
           <>
             <label>Currency name<input value={draft.currencyName ?? ""} onChange={(event) => setDraft({ ...draft, currencyName: event.target.value })} placeholder="currency name" /></label>
-            <label>{draft.currencyName || "Currency"} amount<input type="number" value={draft.currencyAmount ?? ""} onChange={(event) => setDraft({ ...draft, currencyAmount: event.target.value === "" ? undefined : Number(event.target.value) })} /></label>
           </>
         )}
         <label className="compact-check"><input type="checkbox" checked={draft.gearEnabled} onChange={(event) => setDraft({ ...draft, gearEnabled: event.target.checked })} /> Enable gear</label>
@@ -1860,7 +3246,147 @@ function ProjectEditPage({ project, onRefresh, onDone }: { project: Project; onR
         <textarea value={draft.memoryInstruction} onChange={(event) => setDraft({ ...draft, memoryInstruction: event.target.value })} />
         <div className="split-actions"><button onClick={save}><Save size={18} /> Save</button><button onClick={onDone}>Done</button>{saved && <span className="save-status">Saved</span>}</div>
       </section>
+      )}
+      {tab === "delta" && (
+        <section className="item-card stack delta-settings-editor">
+          <section className="panel stack">
+            <div className="section-title"><h2>Default NPC Values</h2></div>
+            <p className="notice">Starting stats for generated Delta characters that do not have saved character stats.</p>
+            <AbilityScoreEditor value={deltaStats} onChange={setDeltaStats} />
+            <div className="split-actions"><button onClick={() => saveDeltaPatch({ deltaDefaultNpcStats: cleanAbilityScores(deltaStats) })}><Save size={18} /> Save Default NPC Values</button>{deltaSaved && <span className="save-status">Saved</span>}</div>
+          </section>
+
+          <section className="panel stack">
+            <div className="section-title"><h2>PREFIXES</h2></div>
+            <p className="notice">PREFIX templates are the first part of [PREFIX]-[BASE] [JOB].</p>
+            <DeltaPrefixEditor value={deltaPrefixes} onChange={setDeltaPrefixes} />
+            <div className="split-actions">
+              <button onClick={() => setDeltaPrefixes([...deltaPrefixes, { id: uid(), label: "", statModifiers: {}, notes: "" }])}><Plus size={18} /> Add PREFIX</button>
+              <button onClick={() => saveDeltaPatch({ deltaPrefixes: cleanDeltaPrefixes(deltaPrefixes) })}><Save size={18} /> Save PREFIXES</button>
+              {deltaSaved && <span className="save-status">Saved</span>}
+            </div>
+          </section>
+
+          <section className="panel stack">
+            <div className="section-title"><h2>BASES</h2></div>
+            <p className="notice">BASE templates are modifiers applied on top of Default NPC Values, not full repeated stat blocks.</p>
+            <DeltaBaseEditor value={deltaBases} onChange={setDeltaBases} />
+            <div className="split-actions">
+              <button onClick={() => setDeltaBases([...deltaBases, { id: uid(), label: "", statModifiers: {}, notes: "" }])}><Plus size={18} /> Add BASE</button>
+              <button onClick={() => saveDeltaPatch({ deltaBases: cleanDeltaBases(deltaBases) })}><Save size={18} /> Save BASES</button>
+              {deltaSaved && <span className="save-status">Saved</span>}
+            </div>
+          </section>
+
+          <section className="panel stack">
+            <div className="section-title"><h2>JOBS</h2></div>
+            <p className="notice">Upload one or more .txt files. Each file is one JOB category; each line must be JOB STR DEX CON INT WIS CHA.</p>
+            <DeltaJobImport value={deltaJobs} onChange={setDeltaJobs} />
+            <div className="split-actions"><button onClick={() => saveDeltaPatch({ deltaJobs: cleanDeltaJobs(deltaJobs) })}><Save size={18} /> Save JOBS</button>{deltaSaved && <span className="save-status">Saved</span>}</div>
+          </section>
+          <div className="split-actions"><button onClick={onDone}>Done</button></div>
+        </section>
+      )}
     </Page>
+  );
+}
+
+function AbilityScoreEditor({ value, onChange }: { value: AbilityScores; onChange: (value: AbilityScores) => void }) {
+  return (
+    <div className="ability-grid">
+      {abilities.map((ability) => (
+        <label key={ability}>{ability}<input type="number" value={value[ability]} onChange={(event) => onChange({ ...value, [ability]: Number(event.target.value) })} /></label>
+      ))}
+    </div>
+  );
+}
+
+function AbilityModifierEditor({ value, onChange }: { value: AbilityModifiers; onChange: (value: AbilityModifiers) => void }) {
+  return (
+    <div className="ability-grid compact">
+      {abilities.map((ability) => (
+        <label key={ability}>{ability}<input type="number" value={value[ability] ?? 0} onChange={(event) => onChange({ ...value, [ability]: Number(event.target.value) })} /></label>
+      ))}
+    </div>
+  );
+}
+
+function DeltaPrefixEditor({ value, onChange }: { value: DeltaPrefixTemplate[]; onChange: (value: DeltaPrefixTemplate[]) => void }) {
+  function update(index: number, patch: Partial<DeltaPrefixTemplate>) {
+    onChange(value.map((item, itemIndex) => itemIndex === index ? { ...item, ...patch } : item));
+  }
+  return (
+    <div className="delta-template-list">
+      {value.length === 0 && <p className="notice">No PREFIX templates are set up for this project.</p>}
+      {value.map((item, index) => (
+        <section className="delta-template-row" key={item.id || index}>
+          <div className="form-row">
+            <label>ID<input value={item.id} onChange={(event) => update(index, { id: event.target.value })} /></label>
+            <label>Label<input value={item.label} onChange={(event) => update(index, { label: event.target.value.toUpperCase() })} placeholder="PREFIX" /></label>
+            <button className="danger" onClick={() => onChange(value.filter((_, itemIndex) => itemIndex !== index))}><Trash2 size={16} /> Remove</button>
+          </div>
+          <AbilityModifierEditor value={item.statModifiers} onChange={(statModifiers) => update(index, { statModifiers })} />
+          <label>Notes<textarea value={item.notes ?? ""} onChange={(event) => update(index, { notes: event.target.value })} /></label>
+        </section>
+      ))}
+    </div>
+  );
+}
+
+function DeltaBaseEditor({ value, onChange }: { value: DeltaBaseTemplate[]; onChange: (value: DeltaBaseTemplate[]) => void }) {
+  function update(index: number, patch: Partial<DeltaBaseTemplate>) {
+    onChange(value.map((item, itemIndex) => itemIndex === index ? { ...item, ...patch } : item));
+  }
+  return (
+    <div className="delta-template-list">
+      {value.length === 0 && <p className="notice">No BASE templates are set up for this project.</p>}
+      {value.map((item, index) => (
+        <section className="delta-template-row" key={item.id || index}>
+          <div className="form-row">
+            <label>ID<input value={item.id} onChange={(event) => update(index, { id: event.target.value })} /></label>
+            <label>Label<input value={item.label} onChange={(event) => update(index, { label: event.target.value.toUpperCase() })} placeholder="BASE" /></label>
+            <label>HP bonus<input type="number" value={item.hpBonus ?? 0} onChange={(event) => update(index, { hpBonus: Number(event.target.value) })} /></label>
+            <button className="danger" onClick={() => onChange(value.filter((_, itemIndex) => itemIndex !== index))}><Trash2 size={16} /> Remove</button>
+          </div>
+          <AbilityModifierEditor value={item.statModifiers} onChange={(statModifiers) => update(index, { statModifiers })} />
+          <label>Notes<textarea value={item.notes ?? ""} onChange={(event) => update(index, { notes: event.target.value })} /></label>
+        </section>
+      ))}
+    </div>
+  );
+}
+
+function DeltaJobImport({ value, onChange }: { value: DeltaJobTemplate[]; onChange: (value: DeltaJobTemplate[]) => void }) {
+  const [errors, setErrors] = useState<string[]>([]);
+  async function importFiles(files: FileList | null) {
+    const parsed = await parseJobFiles(files);
+    setErrors(parsed.errors);
+    if (parsed.errors.length) return;
+    const replacing = new Set(parsed.categories);
+    onChange([...value.filter((job) => !replacing.has(job.category)), ...parsed.jobs]);
+  }
+  function deleteCategory(category: string) {
+    if (!confirm(`Delete JOB category "${category}" from this draft?`)) return;
+    onChange(value.filter((job) => job.category !== category));
+  }
+  const categories = jobCategories(value);
+  return (
+    <div className="delta-template-list">
+      <label className="file-pick"><Upload size={18} /> Import JOB .txt files<input type="file" accept=".txt,text/plain" multiple onChange={(event) => void importFiles(event.target.files)} /></label>
+      {errors.length > 0 && (
+        <div className="import-errors">
+          {errors.map((error) => <p key={error}>{error}</p>)}
+        </div>
+      )}
+      {categories.length === 0 && <p className="notice">No JOB categories are set up for this project.</p>}
+      {categories.map(([category, count]) => (
+        <section className="delta-category-row" key={category}>
+          <span>{category}</span>
+          <small>{count} JOB{count === 1 ? "" : "S"}</small>
+          <button className="danger" onClick={() => deleteCategory(category)}><Trash2 size={16} /> Delete category</button>
+        </section>
+      ))}
+    </div>
   );
 }
 
@@ -1980,10 +3506,16 @@ function ModelLibrary() {
 
 function MemoriesPage({ project }: { project?: Project }) {
   const [memories, setMemories] = useState<Memory[]>([]);
+  const [pendingMemories, setPendingMemories] = useState<PendingMemory[]>([]);
   const [text, setText] = useState("");
   const [tags, setTags] = useState("");
   const [query, setQuery] = useState("");
-  async function load() { if (project) setMemories(await db.memories.where("projectId").equals(project.id).reverse().sortBy("updatedAt")); }
+  async function load() {
+    if (project) {
+      setMemories(await db.memories.where("projectId").equals(project.id).reverse().sortBy("updatedAt"));
+      setPendingMemories(await db.pendingMemories.where("projectId").equals(project.id).reverse().sortBy("updatedAt"));
+    }
+  }
   useEffect(() => { load(); }, [project?.id]);
   if (!project) return <EmptyState title="No project selected" body="Choose a project to manage memories." />;
   const projectId = project.id;
@@ -2001,6 +3533,12 @@ function MemoriesPage({ project }: { project?: Project }) {
       <input value={tags} onChange={(event) => setTags(event.target.value)} placeholder="tags, comma separated" />
       <button onClick={add}><Plus size={18} /> Add memory</button>
       <div className="form-row"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search by tag or text" /><button onClick={runSearch}><Search size={18} /></button></div>
+      {pendingMemories.length > 0 && (
+        <section className="panel stack">
+          <div className="section-title"><h2>Pending Memories</h2><span>{pendingMemories.length}</span></div>
+          {pendingMemories.map((memory) => <PendingMemoryCard key={memory.id} memory={memory} onRefresh={load} />)}
+        </section>
+      )}
       {memories.map((memory) => <EditableMemory key={memory.id} memory={memory} onRefresh={load} />)}
     </Page>
   );
@@ -2023,6 +3561,45 @@ function CompactionPage({ chat, onRefresh }: { chat: Chat; onRefresh: () => Prom
         <div className="split-actions"><button onClick={save}><Save size={18} /> Save compaction memory</button>{saved && <span className="save-status">Saved</span>}</div>
       </section>
     </Page>
+  );
+}
+
+function PendingMemoryCard({ memory, onRefresh }: { memory: PendingMemory; onRefresh: () => Promise<void> }) {
+  const [draftText, setDraftText] = useState(memory.text);
+  const [draftTags, setDraftTags] = useState(memory.tags.join(", "));
+  const [saved, showSaved] = useSavedNotice();
+  useEffect(() => {
+    setDraftText(memory.text);
+    setDraftTags(memory.tags.join(", "));
+  }, [memory.id, memory.text, memory.tags]);
+  async function saveDraft() {
+    await db.pendingMemories.update(memory.id, { text: draftText, tags: splitTags(draftTags), updatedAt: now() });
+    showSaved();
+    await onRefresh();
+  }
+  async function approve() {
+    await createMemory(memory.projectId, draftText, splitTags(draftTags), "approved automatic", memory.sourceMessageIds);
+    await db.pendingMemories.delete(memory.id);
+    await onRefresh();
+  }
+  async function reject() {
+    if (!confirm("Reject this pending memory?")) return;
+    await db.pendingMemories.delete(memory.id);
+    await onRefresh();
+  }
+  return (
+    <section className="item-card stack">
+      <textarea value={draftText} onChange={(event) => setDraftText(event.target.value)} />
+      <input value={draftTags} onChange={(event) => setDraftTags(event.target.value)} placeholder="tags, comma separated" />
+      {memory.reason && <small>Reason: {memory.reason}</small>}
+      <small>Confidence: {Math.round((memory.confidence ?? 0) * 100)}%</small>
+      <div className="split-actions">
+        <button onClick={approve}><Save size={18} /> Approve</button>
+        <button onClick={saveDraft}>Save edit</button>
+        <button className="danger" onClick={reject}><Trash2 size={18} /> Reject</button>
+        {saved && <span className="save-status">Saved</span>}
+      </div>
+    </section>
   );
 }
 
@@ -2521,7 +4098,9 @@ function DataSettingsContent() {
       inventoryLogs: await db.inventoryLogs.toArray(),
       deltaSessions: await db.deltaSessions.toArray(),
       deltaMessages: await db.deltaMessages.toArray(),
-      deltaEntities: await db.deltaEntities.toArray()
+      deltaEntities: await db.deltaEntities.toArray(),
+      deltaAllyCache: await db.deltaAllyCache.toArray(),
+      deltaActionMacros: await db.deltaActionMacros.toArray()
     };
     downloadJson("mirror-backup.json", data);
   }
@@ -2533,11 +4112,11 @@ function DataSettingsContent() {
         setImportStatus("Invalid import file.");
         return;
       }
-      const counts = ["projects", "chats", "branches", "messages", "stars", "archives", "archiveEntries", "memories", "characters", "modelLibrary", "sourceFiles", "inventoryItems", "inventoryLogs", "deltaSessions", "deltaMessages", "deltaEntities"]
+      const counts = ["projects", "chats", "branches", "messages", "stars", "archives", "archiveEntries", "memories", "characters", "modelLibrary", "sourceFiles", "inventoryItems", "inventoryLogs", "deltaSessions", "deltaMessages", "deltaEntities", "deltaAllyCache", "deltaActionMacros"]
         .map((key) => `${key}: ${Array.isArray(parsed[key]) ? parsed[key].length : 0}`)
         .join(", ");
       if (!confirm(`Import this backup?\n${counts}`)) return;
-      await db.transaction("rw", [db.settings, db.projects, db.chats, db.branches, db.messages, db.stars, db.archives, db.archiveEntries, db.memories, db.characters, db.modelLibrary, db.sourceFiles, db.inventoryItems, db.inventoryLogs, db.deltaSessions, db.deltaMessages, db.deltaEntities], async () => {
+      await db.transaction("rw", [db.settings, db.projects, db.chats, db.branches, db.messages, db.stars, db.archives, db.archiveEntries, db.memories, db.characters, db.modelLibrary, db.sourceFiles, db.inventoryItems, db.inventoryLogs, db.deltaSessions, db.deltaMessages, db.deltaEntities, db.deltaAllyCache, db.deltaActionMacros], async () => {
         if (parsed.settings && typeof parsed.settings === "object") await db.settings.put(parsed.settings as AppSettings);
         if (Array.isArray(parsed.projects)) await db.projects.bulkPut(parsed.projects as Project[]);
         if (Array.isArray(parsed.chats)) await db.chats.bulkPut(parsed.chats as Chat[]);
@@ -2555,6 +4134,8 @@ function DataSettingsContent() {
         if (Array.isArray(parsed.deltaSessions)) await db.deltaSessions.bulkPut(parsed.deltaSessions as DeltaSession[]);
         if (Array.isArray(parsed.deltaMessages)) await db.deltaMessages.bulkPut(parsed.deltaMessages as DeltaMessage[]);
         if (Array.isArray(parsed.deltaEntities)) await db.deltaEntities.bulkPut(parsed.deltaEntities as DeltaEntity[]);
+        if (Array.isArray(parsed.deltaAllyCache)) await db.deltaAllyCache.bulkPut(parsed.deltaAllyCache as DeltaAllyCacheEntry[]);
+        if (Array.isArray(parsed.deltaActionMacros)) await db.deltaActionMacros.bulkPut(parsed.deltaActionMacros as DeltaActionMacro[]);
       });
       setImportStatus("Import complete.");
     } catch {

@@ -1,7 +1,7 @@
 import Dexie from "dexie";
 import { db } from "./db";
-import { defaultMemoryInstruction } from "./defaults";
-import { Ability, Character, CharacterBonus, Chat, DeltaSession, InventoryKind, Memory, Message, Project } from "../types";
+import { defaultDeltaBases, defaultDeltaJobs, defaultDeltaNpcStats, defaultDeltaPrefixes, defaultMemoryInstruction } from "./defaults";
+import { Ability, AbilityModifiers, AbilityScores, Character, CharacterBonus, Chat, DeltaAllyCacheEntry, DeltaEntity, DeltaSession, InventoryKind, Memory, Message, Project } from "../types";
 import { estimateTokens, fallbackChatTitle, normaliseTag, now, uid } from "../utils";
 
 export const abilities: Ability[] = ["STR", "DEX", "CON", "INT", "WIS", "CHA"];
@@ -16,6 +16,124 @@ export function validatePointBuy(scores: Pick<Character, "str" | "dex" | "con" |
     const value = scores[ability.toLowerCase() as Lowercase<Ability>];
     return value >= 8 && value <= 15;
   }) && totalPointCost(scores) <= 27;
+}
+
+function abilityModifier(score: number) {
+  return Math.floor((score - 10) / 2);
+}
+
+function applyModifiers(scores: AbilityScores, modifiers?: AbilityModifiers) {
+  const next = { ...scores };
+  for (const ability of abilities) next[ability] += modifiers?.[ability] ?? 0;
+  return next;
+}
+
+function normaliseTemplateValue(value?: string) {
+  return value?.trim().toUpperCase() || undefined;
+}
+
+export function formatDeltaTemplateTag(prefix?: string, base?: string, job?: string) {
+  const cleanPrefix = normaliseTemplateValue(prefix);
+  const cleanBase = normaliseTemplateValue(base);
+  const cleanJob = normaliseTemplateValue(job);
+  const first = cleanPrefix && cleanBase ? `${cleanPrefix}-${cleanBase}` : cleanPrefix ?? cleanBase;
+  return [first, cleanJob].filter(Boolean).join(" ") || undefined;
+}
+
+export function generatedDeltaStats(project: Project, template: { prefix?: string; base?: string; job?: string; jobCategory?: string }) {
+  const baseStats = project.deltaDefaultNpcStats ?? defaultDeltaNpcStats();
+  let scores = { ...baseStats };
+  const prefix = normaliseTemplateValue(template.prefix);
+  const base = normaliseTemplateValue(template.base);
+  const job = normaliseTemplateValue(template.job);
+  const jobCategory = template.jobCategory?.trim().toLowerCase();
+  const prefixTemplate = (project.deltaPrefixes ?? []).find((item) => item.label.trim().toUpperCase() === prefix);
+  const baseTemplate = (project.deltaBases ?? []).find((item) => item.label.trim().toUpperCase() === base);
+  const jobTemplate = (project.deltaJobs ?? []).find((item) => {
+    if (item.label.trim().toUpperCase() !== job) return false;
+    if (!jobCategory) return true;
+    return item.category.trim().toLowerCase() === jobCategory;
+  });
+  scores = applyModifiers(scores, prefixTemplate?.statModifiers);
+  scores = applyModifiers(scores, baseTemplate?.statModifiers);
+  scores = applyModifiers(scores, jobTemplate?.statModifiers);
+  const hpBonus = baseTemplate?.hpBonus ?? 0;
+  const maxHp = Math.max(1, 10 + abilityModifier(scores.CON) + hpBonus);
+  return {
+    scores,
+    hpBonus,
+    maxHp,
+    templateTag: formatDeltaTemplateTag(prefix, base, job),
+    prefix,
+    base,
+    job
+  };
+}
+
+export function generatedStatsPatch(project: Project, template: { prefix?: string; base?: string; job?: string; jobCategory?: string }) {
+  const generated = generatedDeltaStats(project, template);
+  return {
+    str: generated.scores.STR,
+    dex: generated.scores.DEX,
+    con: generated.scores.CON,
+    int: generated.scores.INT,
+    wis: generated.scores.WIS,
+    cha: generated.scores.CHA,
+    maxHp: generated.maxHp,
+    currentHp: generated.maxHp,
+    templateTag: generated.templateTag,
+    prefix: generated.prefix,
+    base: generated.base,
+    job: generated.job,
+    generatedStatsSource: generated.templateTag ? "generated-template" as const : undefined
+  };
+}
+
+async function characterEntityPatch(character: Character) {
+  const bonuses = await db.characterBonuses.where("characterId").equals(character.id).toArray();
+  const total = (base: number, stat: Ability) => base + bonuses.filter((bonus) => bonus.stat === stat).reduce((sum, bonus) => sum + bonus.value, 0);
+  return {
+    characterId: character.id,
+    name: character.name,
+    str: total(character.str, "STR"),
+    dex: total(character.dex, "DEX"),
+    con: total(character.con, "CON"),
+    int: total(character.int, "INT"),
+    wis: total(character.wis, "WIS"),
+    cha: total(character.cha, "CHA"),
+    templateTag: undefined,
+    prefix: undefined,
+    base: undefined,
+    job: undefined,
+    generatedStatsSource: undefined
+  };
+}
+
+export async function upsertDeltaAllyCache(chatId: string, entity: DeltaEntity) {
+  if (entity.side !== "ally" || entity.characterId || entity.generatedStatsSource !== "generated-template") return;
+  const timestamp = now();
+  const existing = await db.deltaAllyCache.where("chatId").equals(chatId).and((item) => item.name.trim().toLowerCase() === entity.name.trim().toLowerCase()).first();
+  const patch: Omit<DeltaAllyCacheEntry, "id" | "createdAt"> = {
+    chatId,
+    name: entity.name,
+    templateTag: entity.templateTag,
+    prefix: entity.prefix,
+    base: entity.base,
+    job: entity.job,
+    generatedStatsSource: entity.generatedStatsSource,
+    currentHp: entity.currentHp,
+    maxHp: entity.maxHp,
+    statusText: entity.statusText,
+    str: entity.str,
+    dex: entity.dex,
+    con: entity.con,
+    int: entity.int,
+    wis: entity.wis,
+    cha: entity.cha,
+    updatedAt: timestamp
+  };
+  if (existing) await db.deltaAllyCache.update(existing.id, patch);
+  else await db.deltaAllyCache.add({ id: uid(), ...patch, createdAt: timestamp });
 }
 
 export function normaliseInventoryName(value: string) {
@@ -44,7 +162,11 @@ export async function createProject(name: string) {
     memoryInstruction: defaultMemoryInstruction,
     locked: false,
     inventoryEnabled: false,
-    gearEnabled: false
+    gearEnabled: false,
+    deltaDefaultNpcStats: defaultDeltaNpcStats(),
+    deltaPrefixes: defaultDeltaPrefixes(),
+    deltaBases: defaultDeltaBases(),
+    deltaJobs: defaultDeltaJobs()
   };
   await db.projects.add(project);
   return project;
@@ -100,45 +222,55 @@ export async function addMessage(chatId: string, branchId: string, role: Message
 
 export async function getOrCreateDeltaSession(chat: Chat) {
   const existing = await db.deltaSessions.where("chatId").equals(chat.id).and((session) => session.active).first();
-  if (existing) return existing;
+  if (existing) {
+    const messageCount = await db.deltaMessages.where("sessionId").equals(existing.id).count();
+    if (messageCount === 0) {
+      const placeholder = await db.deltaEntities
+        .where("sessionId")
+        .equals(existing.id)
+        .and((entity) => entity.name === "Opposition" && entity.statusText === "Placeholder")
+        .first();
+      if (placeholder) await db.deltaEntities.delete(placeholder.id);
+    }
+    return existing;
+  }
   const timestamp = now();
   const session: DeltaSession = {
     id: uid(),
     chatId: chat.id,
     projectId: chat.projectId,
-    title: "Delta Mode",
+    title: "New Engagement",
     active: true,
     settings: {
-      compactionMemory: "",
       temperature: 0,
       topP: 0
     },
     createdAt: timestamp,
     updatedAt: timestamp
   };
-  await db.transaction("rw", db.deltaSessions, db.deltaEntities, db.deltaMessages, async () => {
+  const playerCharacter = chat.deltaPlayerCharacterId ? await db.characters.get(chat.deltaPlayerCharacterId) : undefined;
+  const playerPatch = playerCharacter && playerCharacter.projectId === chat.projectId
+    ? await characterEntityPatch(playerCharacter)
+    : {
+        name: "Player character",
+        currentHp: 10,
+        maxHp: 10,
+        statusText: "Ready",
+        distanceFromPlayer: "0m",
+        elevation: "ground"
+      };
+  await db.transaction("rw", db.deltaSessions, db.deltaEntities, async () => {
     await db.deltaSessions.add(session);
     await db.deltaEntities.bulkAdd([
-      { id: uid(), sessionId: session.id, name: "Player character", side: "party", currentHp: 10, maxHp: 10, statusText: "Ready", orderIndex: 0, createdAt: timestamp, updatedAt: timestamp },
-      { id: uid(), sessionId: session.id, name: "Opposition", side: "opposition", currentHp: 10, maxHp: 10, statusText: "Placeholder", orderIndex: 1, createdAt: timestamp, updatedAt: timestamp }
+      { id: uid(), sessionId: session.id, ...playerPatch, side: "ally", orderIndex: 0, createdAt: timestamp, updatedAt: timestamp }
     ]);
-    await db.deltaMessages.add({
-      id: uid(),
-      sessionId: session.id,
-      sequence: 0,
-      role: "system",
-      body: "Engagement Summary\n\nDelta Mode workspace initialized. Use this space for temporary structured engagement notes without changing the main chat.",
-      status: "complete",
-      createdAt: timestamp,
-      updatedAt: timestamp
-    });
   });
   return session;
 }
 
-export async function archiveDeltaSession(sessionId: string) {
+export async function archiveDeltaSession(sessionId: string, title: string) {
   const timestamp = now();
-  await db.deltaSessions.update(sessionId, { active: false, archivedAt: timestamp, updatedAt: timestamp });
+  await db.deltaSessions.update(sessionId, { title, active: false, archivedAt: timestamp, updatedAt: timestamp });
 }
 
 export async function addDeltaMessage(sessionId: string, role: "user" | "assistant" | "system", body: string) {
@@ -175,7 +307,7 @@ export async function toggleStar(projectId: string, message: Message) {
   return true;
 }
 
-export async function createMemory(projectId: string, text: string, tags: string[]) {
+export async function createMemory(projectId: string, text: string, tags: string[], sourceType: Memory["sourceType"] = "manual", sourceMessageIds?: string[]) {
   const timestamp = now();
   const normalisedTags = Array.from(new Set(tags.map(normaliseTag).filter(Boolean)));
   const memory: Memory = {
@@ -184,7 +316,8 @@ export async function createMemory(projectId: string, text: string, tags: string
     text,
     normalisedTags,
     visibleTags: tags.filter(Boolean),
-    sourceType: "manual",
+    sourceType,
+    sourceMessageIds,
     createdAt: timestamp,
     updatedAt: timestamp,
     recallCount: 0,
@@ -197,15 +330,18 @@ export async function createMemory(projectId: string, text: string, tags: string
 
 export async function searchMemories(projectId: string, tags: string[], query = "", limit = 8) {
   const normalised = tags.map(normaliseTag).filter(Boolean);
+  const queryTerms = Array.from(new Set(query.toLowerCase().split(/[^a-z0-9]+/).filter((term) => term.length > 2)));
   const all = await db.memories.where("projectId").equals(projectId).and((memory) => !memory.archived).toArray();
   return all
     .map((memory) => {
       const tagHits = normalised.filter((tag) => memory.normalisedTags.some((saved) => saved === tag || saved.startsWith(tag))).length;
       const queryHit = query && memory.text.toLowerCase().includes(query.toLowerCase()) ? 1 : 0;
+      const memoryText = `${memory.text} ${memory.visibleTags.join(" ")}`.toLowerCase();
+      const termHits = queryTerms.filter((term) => memoryText.includes(term)).length;
       const userRelevance = memory.relevance ?? 5;
-      return { memory, relevance: tagHits * 2 + queryHit + userRelevance / 10 };
+      return { memory, relevance: tagHits * 3 + queryHit * 2 + termHits + userRelevance / 10 };
     })
-    .filter((item) => item.relevance > 0 || (!normalised.length && !query))
+    .filter((item) => item.relevance > 0.9 || (!normalised.length && !query))
     .sort((a, b) => b.relevance - a.relevance || b.memory.updatedAt - a.memory.updatedAt)
     .slice(0, limit)
     .map(({ memory, relevance }) => ({
@@ -217,13 +353,13 @@ export async function searchMemories(projectId: string, tags: string[], query = 
     }));
 }
 
-export async function applyInventoryChange(projectId: string, kind: InventoryKind, rawName: string, delta: number, logSentence: string) {
+export async function applyInventoryChange(projectId: string, chatId: string, kind: InventoryKind, rawName: string, delta: number, logSentence: string) {
   const name = normaliseInventoryName(rawName);
   if (!name || !Number.isFinite(delta) || delta === 0) return null;
   const timestamp = now();
   const existingItems = await db.inventoryItems
-    .where("projectId")
-    .equals(projectId)
+    .where("chatId")
+    .equals(chatId)
     .and((item) => item.kind === kind && item.normalisedName === name)
     .toArray();
   const existing = existingItems[0];
@@ -235,11 +371,11 @@ export async function applyInventoryChange(projectId: string, kind: InventoryKin
       const duplicateIds = existingItems.slice(1).map((item) => item.id);
       if (duplicateIds.length) await db.inventoryItems.bulkDelete(duplicateIds);
     } else if (delta > 0) {
-      await db.inventoryItems.add({ id: uid(), projectId, kind, name, normalisedName: name, quantity, createdAt: timestamp, updatedAt: timestamp });
+      await db.inventoryItems.add({ id: uid(), projectId, chatId, kind, name, normalisedName: name, quantity, createdAt: timestamp, updatedAt: timestamp });
     } else {
       return;
     }
-    await db.inventoryLogs.add({ id: uid(), projectId, sentence: logSentence.trim(), createdAt: timestamp, updatedAt: timestamp });
+    await db.inventoryLogs.add({ id: uid(), projectId, chatId, sentence: logSentence.trim(), createdAt: timestamp, updatedAt: timestamp });
   });
   return { item: name, quantity };
 }

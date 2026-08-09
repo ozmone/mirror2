@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { db } from "./db";
-import { defaultSettings, sampleProject } from "./defaults";
-import { applyInventoryChange, createMemory, getCharacterBio, getCharacterIdentity, getCharacterStats, normaliseInventoryName, searchMemories, validatePointBuy } from "./repositories";
+import { defaultDeltaBases, defaultSettings, sampleProject } from "./defaults";
+import { applyInventoryChange, createChat, createMemory, formatDeltaTemplateTag, generatedDeltaStats, getCharacterBio, getCharacterIdentity, getCharacterStats, normaliseInventoryName, searchMemories, validatePointBuy } from "./repositories";
 import { Character } from "../types";
 
 describe("local data rules", () => {
@@ -84,17 +84,38 @@ describe("local data rules", () => {
   it("normalises inventory item names to singular and logs changes", async () => {
     const project = sampleProject();
     await testDb.projects.add(project);
+    const chatId = await createChat(project.id, "Inventory test");
 
     expect(normaliseInventoryName("Acorns")).toBe("acorn");
-    const added = await applyInventoryChange(project.id, "inventory", "Acorns", 2, "Found 2 acorns under the tree.");
-    const removed = await applyInventoryChange(project.id, "inventory", "acorn", -1, "Lost 1 acorn.");
+    const added = await applyInventoryChange(project.id, chatId, "inventory", "Acorns", 2, "Found 2 acorns under the tree.");
+    const removed = await applyInventoryChange(project.id, chatId, "inventory", "acorn", -1, "Lost 1 acorn.");
 
-    const item = await db.inventoryItems.where("projectId").equals(project.id).and((row) => row.kind === "inventory" && row.normalisedName === "acorn").first();
-    const logs = (await db.inventoryLogs.where("projectId").equals(project.id).toArray()).sort((a, b) => a.createdAt - b.createdAt);
+    const item = await db.inventoryItems.where("chatId").equals(chatId).and((row) => row.kind === "inventory" && row.normalisedName === "acorn").first();
+    const logs = (await db.inventoryLogs.where("chatId").equals(chatId).toArray()).sort((a, b) => a.createdAt - b.createdAt);
     expect(added).toEqual({ item: "acorn", quantity: 2 });
     expect(removed).toEqual({ item: "acorn", quantity: 1 });
     expect(item?.quantity).toBe(1);
     expect(logs.map((log) => log.sentence)).toEqual(["Found 2 acorns under the tree.", "Lost 1 acorn."]);
+  });
+
+  it("keeps Delta generated template tags readable and derives stats from labels", () => {
+    const project = {
+      ...sampleProject(),
+      deltaDefaultNpcStats: { STR: 10, DEX: 10, CON: 10, INT: 10, WIS: 10, CHA: 10 },
+      deltaPrefixes: [{ id: "prefix-dex", label: "DEX", statModifiers: { DEX: 3 } }],
+      deltaBases: defaultDeltaBases(),
+      deltaJobs: [{ id: "job-rogue", label: "ROGUE", category: "street", statModifiers: { DEX: 2, CHA: 1 } }]
+    };
+
+    expect(formatDeltaTemplateTag("DEX", "LIGHT", "ROGUE")).toBe("DEX-LIGHT ROGUE");
+    const generated = generatedDeltaStats(project, { prefix: "DEX", base: "LIGHT", job: "ROGUE", jobCategory: "street" });
+
+    expect(generated.templateTag).toBe("DEX-LIGHT ROGUE");
+    expect(generated.prefix).toBe("DEX");
+    expect(generated.base).toBe("LIGHT");
+    expect(generated.job).toBe("ROGUE");
+    expect(generated.scores).toEqual({ STR: 8, DEX: 19, CON: 10, INT: 10, WIS: 10, CHA: 11 });
+    expect(generated.maxHp).toBe(5);
   });
 
   it("can prepare settings for backup without an API key", async () => {

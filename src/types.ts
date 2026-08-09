@@ -70,6 +70,19 @@ export interface AppSettings extends Timestamped {
   includeCharacters?: boolean;
   includeSourceFiles?: boolean;
   streamingEnabled?: boolean;
+  autoManageInventory?: boolean;
+  confirmInventoryUpdates?: boolean;
+  autoManageGear?: boolean;
+  confirmGearUpdates?: boolean;
+}
+
+export interface InventoryUpdateRequest {
+  id: string;
+  kind: InventoryKind | "currency";
+  name: string;
+  delta: number;
+  logSentence: string;
+  status: "pending" | "confirmed" | "edit" | "rejected" | "applied";
 }
 
 export interface Project extends Timestamped {
@@ -89,7 +102,10 @@ export interface Project extends Timestamped {
   inventoryEnabled: boolean;
   gearEnabled: boolean;
   currencyName?: string;
-  currencyAmount?: number;
+  deltaDefaultNpcStats?: AbilityScores;
+  deltaPrefixes?: DeltaPrefixTemplate[];
+  deltaBases?: DeltaBaseTemplate[];
+  deltaJobs?: DeltaJobTemplate[];
 }
 
 export interface Chat extends Timestamped {
@@ -100,6 +116,8 @@ export interface Chat extends Timestamped {
   activeBranchId: string;
   archived: boolean;
   compactionMemory: string;
+  currencyAmount?: number;
+  deltaPlayerCharacterId?: string;
 }
 
 export interface Branch extends Timestamped {
@@ -126,6 +144,7 @@ export interface Message extends Timestamped {
     settings: string[];
     toggles: string[];
     toolCalls: string[];
+    inventoryUpdates?: InventoryUpdateRequest[];
   };
 }
 
@@ -135,7 +154,6 @@ export interface DeltaModeSettings {
   topP?: number;
   maxTokens?: number;
   maxHistoryMessages?: number;
-  compactionMemory: string;
   playerEntityId?: string;
 }
 
@@ -159,12 +177,54 @@ export interface DeltaMessage extends Timestamped {
 
 export interface DeltaEntity extends Timestamped {
   sessionId: string;
+  characterId?: string;
   name: string;
-  side: "party" | "opposition" | "neutral";
+  side: "ally" | "neutral" | "hostile";
   currentHp?: number;
   maxHp?: number;
   statusText?: string;
+  distanceFromPlayer?: string;
+  elevation?: string;
+  str?: number;
+  dex?: number;
+  con?: number;
+  int?: number;
+  wis?: number;
+  cha?: number;
+  templateTag?: string;
+  prefix?: string;
+  base?: string;
+  job?: string;
+  generatedStatsSource?: "generated-template";
   imageAttachmentId?: string;
+  orderIndex: number;
+}
+
+export interface DeltaAllyCacheEntry extends Timestamped {
+  chatId: string;
+  name: string;
+  templateTag?: string;
+  prefix?: string;
+  base?: string;
+  job?: string;
+  generatedStatsSource?: "generated-template";
+  currentHp?: number;
+  maxHp?: number;
+  statusText?: string;
+  str?: number;
+  dex?: number;
+  con?: number;
+  int?: number;
+  wis?: number;
+  cha?: number;
+}
+
+export interface DeltaActionMacro extends Timestamped {
+  chatId: string;
+  parentId?: string;
+  label: string;
+  template?: string;
+  requestEntitySelection?: boolean;
   orderIndex: number;
 }
 
@@ -213,6 +273,7 @@ export type InventoryKind = "inventory" | "gear";
 
 export interface InventoryItem extends Timestamped {
   projectId: string;
+  chatId: string;
   kind: InventoryKind;
   name: string;
   normalisedName: string;
@@ -221,6 +282,7 @@ export interface InventoryItem extends Timestamped {
 
 export interface InventoryLog extends Timestamped {
   projectId: string;
+  chatId: string;
   sentence: string;
 }
 
@@ -252,6 +314,31 @@ export interface CharacterBonus extends Timestamped {
 }
 
 export type Ability = "STR" | "DEX" | "CON" | "INT" | "WIS" | "CHA";
+export type AbilityScores = Record<Ability, number>;
+export type AbilityModifiers = Partial<Record<Ability, number>>;
+
+export interface DeltaPrefixTemplate {
+  id: string;
+  label: string;
+  statModifiers: AbilityModifiers;
+  notes?: string;
+}
+
+export interface DeltaBaseTemplate {
+  id: string;
+  label: string;
+  statModifiers: AbilityModifiers;
+  hpBonus?: number;
+  notes?: string;
+}
+
+export interface DeltaJobTemplate {
+  id: string;
+  label: string;
+  category: string;
+  statModifiers: AbilityModifiers;
+  notes?: string;
+}
 
 export interface Memory extends Timestamped {
   projectId: string;
