@@ -3127,7 +3127,7 @@ function ChatScreen({
     if (maxTokensValue !== undefined) payload.max_tokens = maxTokensValue;
     const activeTools = [
       ...deltaImminentTools,
-      ...(includeCharacters ? [...characterTools] : []),
+      ...characterTools,
       ...(project && project.memoryMode !== "manual" ? [...memoryTools] : []),
       ...(((project?.inventoryEnabled && autoManageInventory) || (project?.gearEnabled && autoManageGear)) ? [...inventoryTools] : []),
       ...(imageContextMessageId ? [...imageContextTools] : [])
@@ -3136,6 +3136,28 @@ function ChatScreen({
     if (forceImageContextTool) payload.tool_choice = { type: "function", function: { name: "save_image_context" } };
     if (stream) payload.stream_options = { include_usage: true };
     return payload;
+  }
+
+  async function characterLibraryContext() {
+    if (!project || !includeCharacters) return "";
+    const characters = (await db.characters.where("projectId").equals(project.id).toArray())
+      .sort((a, b) => (a.orderIndex ?? Number.MAX_SAFE_INTEGER) - (b.orderIndex ?? Number.MAX_SAFE_INTEGER) || a.normalisedName.localeCompare(b.normalisedName));
+    if (!characters.length) return "Project character library:\n(none)";
+    const rows = await Promise.all(characters.map(async (character) => {
+      const stats = await characterTemplateStats(project, character);
+      return [
+        `## ${character.name}`,
+        "Identity:",
+        `- Age: ${character.age || ""}`,
+        `- Gender: ${character.gender || ""}`,
+        `- Personality: ${character.personality || ""}`,
+        `- Misc: ${character.misc || ""}`,
+        `Bio:\n${character.bio || ""}`,
+        `Stats: STR ${stats.STR}, DEX ${stats.DEX}, CON ${stats.CON}, INT ${stats.INT}, WIS ${stats.WIS}, CHA ${stats.CHA}`,
+        stats.templateTag ? `Template tag: ${stats.templateTag}` : ""
+      ].filter(Boolean).join("\n");
+    }));
+    return `Project character library:\n${rows.join("\n\n")}`;
   }
 
   async function inventoryContext(chatId: string) {
@@ -3564,6 +3586,7 @@ function ChatScreen({
         ? await db.sourceFiles.where("projectId").equals(project.id).and((file) => Boolean(file.textContent)).toArray()
         : [];
       const activeChat = await db.chats.get(chatId);
+      const characterDetails = await characterLibraryContext();
       const inventoryDetails = await inventoryContext(chatId);
       const allHistory = await db.messages
         .where("[chatId+branchId+sequence]")
@@ -3578,6 +3601,7 @@ function ChatScreen({
         "Delta Mode boundary: the main chat must not run structured fights, hostile standoffs, tactical engagements, mission commitments, or combat-like confrontations as ordinary roleplay once they become imminent. When the current reply would initiate or clearly commit to that kind of engagement, call prepare_delta_engagement with a short immersive setup instead of continuing the scene as normal chat. Use this only when the engagement is imminent, not for ordinary tension.",
         includeInstructions && project.instructions ? `Project instructions:\n${project.instructions}` : "",
         includeWorld && project.worldSetting ? `World setting:\n${project.worldSetting}` : "",
+        characterDetails,
         compactionEnabled && activeChat?.compactionMemory ? `Compaction memory:\n${activeChat.compactionMemory}` : "",
         sourceFiles.length ? `Source files:\n${sourceFiles.map((file) => `# ${file.name}\n${file.textContent}`).join("\n\n")}` : "",
         attachedFileDetails,
@@ -3759,6 +3783,7 @@ function ChatScreen({
       ? await db.sourceFiles.where("projectId").equals(project.id).and((file) => Boolean(file.textContent)).toArray()
       : [];
     const activeChat = await db.chats.get(chatId);
+    const characterDetails = await characterLibraryContext();
     const inventoryDetails = await inventoryContext(chatId);
     const allHistory = await db.messages
       .where("[chatId+branchId+sequence]")
@@ -3775,6 +3800,7 @@ function ChatScreen({
       "Delta Mode boundary: the main chat must not run structured fights, hostile standoffs, tactical engagements, mission commitments, or combat-like confrontations as ordinary roleplay once they become imminent. When the current reply would initiate or clearly commit to that kind of engagement, call prepare_delta_engagement with a short immersive setup instead of continuing the scene as normal chat. Use this only when the engagement is imminent, not for ordinary tension.",
       includeInstructions && project.instructions ? `Project instructions:\n${project.instructions}` : "",
       includeWorld && project.worldSetting ? `World setting:\n${project.worldSetting}` : "",
+      characterDetails,
       compactionEnabled && activeChat?.compactionMemory ? `Compaction memory:\n${activeChat.compactionMemory}` : "",
       sourceFiles.length ? `Source files:\n${sourceFiles.map((file) => `# ${file.name}\n${file.textContent}`).join("\n\n")}` : "",
       resendImages.length ? "An image is attached to the latest user message. First call save_image_context exactly once with a detailed concise visual extraction. It is hidden from the user. Then answer the user normally from the image." : "",
