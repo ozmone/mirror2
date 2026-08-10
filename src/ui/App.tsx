@@ -788,7 +788,7 @@ const deltaImminentTools = [
       parameters: {
         type: "object",
         properties: {
-          brief: { type: "string", description: "Short immersive in-world setup for the imminent engagement: who, what, where, why, immediate pressure, and likely opposition. Do not speak as an assistant." },
+          brief: { type: "string", description: "Short in-world third-person scene beat for the imminent engagement. Continue the user's roleplay voice. Ground the exact immediate location, lighting/cover/proximity, what is happening right now, what pressure forces the engagement, and any important character reaction. Do not write a cast list, mission synopsis, objective block, or assistant-facing explanation." },
           playerCharacterName: { type: "string", description: "Likely player-controlled character name, if known." },
           avoidLabel: { type: "string", description: "Button label for avoiding the engagement, usually Escape for danger or Cancel for a proposed mission." },
           avoidPrompt: { type: "string", description: "Short UI question asking what the player does to avoid or cancel the engagement." }
@@ -3474,9 +3474,13 @@ function ChatScreen({
           {
             role: "system",
             content: [
-              "Create a concise immersive Delta Brief from the recent chat context. Return only valid JSON.",
+              "Create a concise immersive Delta Mode imminent scene beat from the recent chat context. Return only valid JSON.",
               "Shape: {\"brief\":\"\",\"playerCharacterName\":\"\",\"avoidLabel\":\"\",\"avoidPrompt\":\"\"}",
-              "brief: short in-world setup with who, what, where, why, objective, named allies, and named hostiles. Do not speak as an assistant. Do not ask a question.",
+              "brief: write in the same third-person narrative style as the user's roleplay. It must feel like the next paragraph in the scene, not a summary, report, cast list, mission briefing, or movie trailer.",
+              "brief: include concrete immediate details: exact place/terrain/interior, lighting or visibility, distance/proximity, what the threat is physically doing now, what the player character can perceive, and why the moment is about to become structured.",
+              "brief: do not introduce known characters back to the user with roles or biographies. Use names naturally. If Jaeger or another known character is present, include a brief immersive reaction, gesture, or line when context supports it.",
+              "brief: do not use labels such as Allies, Hostiles, Objective, Mission, Target, or PLAYER CHARACTER inside the brief text. Do not speak to the user. Do not ask a question.",
+              "brief length: 2 to 5 compact sentences, maximum 120 words.",
               "playerCharacterName: the likely player-controlled character name if the context implies one; otherwise use the lead/protagonist character name; otherwise empty.",
               "avoidLabel: use Cancel for a proposed mission/commitment, Escape for immediate danger, or empty if avoidance does not make sense.",
               "avoidPrompt: short question for what the player does to avoid or cancel the engagement."
@@ -3582,6 +3586,7 @@ function ChatScreen({
           updatedAt: timestamp
         })));
       }
+      if (!createdChatId) await onRefresh();
       const sourceFiles = includeSourceFiles
         ? await db.sourceFiles.where("projectId").equals(project.id).and((file) => Boolean(file.textContent)).toArray()
         : [];
@@ -3598,7 +3603,7 @@ function ChatScreen({
       const memoryDetails = await memoryContext(text, selectedHistory);
       const systemParts = [
         `Project: ${project.name}`,
-        "Delta Mode boundary: the main chat must not run structured fights, hostile standoffs, tactical engagements, mission commitments, or combat-like confrontations as ordinary roleplay once they become imminent. When the current reply would initiate or clearly commit to that kind of engagement, call prepare_delta_engagement with a short immersive setup instead of continuing the scene as normal chat. Use this only when the engagement is imminent, not for ordinary tension.",
+        "Delta Mode boundary: the main chat must not run structured fights, hostile standoffs, tactical engagements, mission commitments, or combat-like confrontations as ordinary roleplay once they become imminent. When the current reply would initiate or clearly commit to that kind of engagement, call prepare_delta_engagement with a short in-world third-person scene beat instead of continuing the scene as normal chat. Use this only when the engagement is imminent, not for ordinary tension.",
         includeInstructions && project.instructions ? `Project instructions:\n${project.instructions}` : "",
         includeWorld && project.worldSetting ? `World setting:\n${project.worldSetting}` : "",
         characterDetails,
@@ -3645,7 +3650,8 @@ function ChatScreen({
       const canStreamDirectly = streamingEnabled && !toolsEnabled(images.length ? userMessageId : undefined);
       const reply = await addMessage(chatId, branchId, "assistant", canStreamDirectly ? "" : "...");
       await db.messages.update(reply.id, { modelId: draftModelId, status: canStreamDirectly ? "streaming" : "pending", requestInfo });
-      await onRefresh();
+      if (createdChatId) await onChatCreated(createdChatId);
+      else await onRefresh();
       try {
         if (toolsEnabled(images.length ? userMessageId : undefined)) {
           const completed = await completeWithTools(requestMessages, toolLog, inventoryUpdates, chatId, selectedHistory.map((message) => message.id), images.length ? userMessageId : undefined);
@@ -3797,7 +3803,7 @@ function ChatScreen({
     const resendImages = promptMessage.attachmentContext ? [] : await storedMessageImages(promptMessage.id);
     const systemParts = [
       `Project: ${project.name}`,
-      "Delta Mode boundary: the main chat must not run structured fights, hostile standoffs, tactical engagements, mission commitments, or combat-like confrontations as ordinary roleplay once they become imminent. When the current reply would initiate or clearly commit to that kind of engagement, call prepare_delta_engagement with a short immersive setup instead of continuing the scene as normal chat. Use this only when the engagement is imminent, not for ordinary tension.",
+      "Delta Mode boundary: the main chat must not run structured fights, hostile standoffs, tactical engagements, mission commitments, or combat-like confrontations as ordinary roleplay once they become imminent. When the current reply would initiate or clearly commit to that kind of engagement, call prepare_delta_engagement with a short in-world third-person scene beat instead of continuing the scene as normal chat. Use this only when the engagement is imminent, not for ordinary tension.",
       includeInstructions && project.instructions ? `Project instructions:\n${project.instructions}` : "",
       includeWorld && project.worldSetting ? `World setting:\n${project.worldSetting}` : "",
       characterDetails,
