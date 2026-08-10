@@ -102,7 +102,7 @@ describe("local data rules", () => {
     const project = {
       ...sampleProject(),
       deltaDefaultNpcStats: { STR: 10, DEX: 10, CON: 10, INT: 10, WIS: 10, CHA: 10 },
-      deltaPrefixes: [{ id: "prefix-dex", label: "DEX", statModifiers: { DEX: 3 } }],
+      deltaPrefixes: [{ id: "prefix-dex", label: "DEX", statModifiers: { DEX: 1 } }],
       deltaBases: defaultDeltaBases(),
       deltaJobs: [{ id: "job-rogue", label: "ROGUE", category: "street", statModifiers: { DEX: 2, CHA: 1 } }]
     };
@@ -114,8 +114,56 @@ describe("local data rules", () => {
     expect(generated.prefix).toBe("DEX");
     expect(generated.base).toBe("LIGHT");
     expect(generated.job).toBe("ROGUE");
-    expect(generated.scores).toEqual({ STR: 8, DEX: 19, CON: 10, INT: 10, WIS: 10, CHA: 11 });
-    expect(generated.maxHp).toBe(5);
+    expect(generated.scores).toEqual({ STR: 9, DEX: 15, CON: 9, INT: 10, WIS: 10, CHA: 11 });
+    expect(generated.maxHp).toBe(4);
+  });
+
+  it("applies character PREFIX BASE JOB tags to saved character stats", async () => {
+    const project = {
+      ...sampleProject(),
+      deltaDefaultNpcStats: { STR: 10, DEX: 10, CON: 10, INT: 10, WIS: 10, CHA: 10 },
+      deltaPrefixes: [{ id: "prefix-int", label: "INT", statModifiers: { INT: 1 } }],
+      deltaBases: defaultDeltaBases(),
+      deltaJobs: [{ id: "job-sharpshooter", label: "SHARPSHOOTER", category: "ranged", statModifiers: { DEX: 2, WIS: 1 } }]
+    };
+    const character: Character = {
+      id: "legolas",
+      projectId: project.id,
+      name: "Legolas",
+      normalisedName: "legolas",
+      age: "",
+      gender: "",
+      personality: "",
+      misc: "",
+      bio: "",
+      statsEnabled: true,
+      str: 10,
+      dex: 14,
+      con: 10,
+      int: 11,
+      wis: 12,
+      cha: 10,
+      prefix: "INT",
+      base: "LIGHT",
+      jobCategory: "ranged",
+      job: "SHARPSHOOTER",
+      createdAt: 1,
+      updatedAt: 1
+    };
+    await testDb.projects.add(project);
+    await testDb.characters.add(character);
+
+    expect(await getCharacterStats(project.id, character.id)).toEqual({
+      character: "Legolas",
+      stats: {
+        STR: 9,
+        DEX: 18,
+        CON: 9,
+        INT: 12,
+        WIS: 13,
+        CHA: 10
+      }
+    });
   });
 
   it("can prepare settings for backup without an API key", async () => {

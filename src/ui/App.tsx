@@ -1,5 +1,5 @@
 import type React from "react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import Dexie from "dexie";
 import {
   Archive,
@@ -15,11 +15,11 @@ import {
   Folder,
   History,
   Image as ImageIcon,
-  Dices,
   KeyRound,
   Menu,
   MessageSquare,
   Pencil,
+  Paperclip,
   Plus,
   RefreshCw,
   Save,
@@ -52,13 +52,17 @@ import {
   getCharacterStats,
   normaliseInventoryName,
   searchMemories,
+  generatedDeltaStats,
   generatedStatsPatch,
   formatDeltaTemplateTag,
+  characterTemplateStats,
+  effectiveDeltaPrefixes,
+  effectiveDeltaBases,
   toggleStar,
   upsertDeltaAllyCache,
   validatePointBuy
 } from "../data/repositories";
-import { defaultDeltaBases, defaultDeltaJobs, defaultDeltaNpcStats, defaultDeltaPrefixes, defaultMemoryInstruction, defaultSettings } from "../data/defaults";
+import { defaultDeltaBases, defaultDeltaJobs, defaultDeltaNpcStats, defaultDeltaPrefixes, defaultDeltaSystemPrompt, defaultMemoryInstruction, defaultSettings } from "../data/defaults";
 import { Ability, AbilityModifiers, AbilityScores, AppSettings, Character, CharacterBonus, Chat, DeltaActionMacro, DeltaAllyCacheEntry, DeltaBaseTemplate, DeltaEntity, DeltaFinishPacket, DeltaJobTemplate, DeltaLootItem, DeltaMessage, DeltaPrefixTemplate, DeltaSession, InventoryKind, InventoryItem, InventoryLog, InventoryUpdateRequest, Memory, Message, PendingMemory, Project, RouteName } from "../types";
 import { estimateTokens, formatDate, normaliseTag, now, splitTags, uid } from "../utils";
 import { ProjectIcon, projectIcons } from "./icons";
@@ -217,7 +221,7 @@ function cleanDeltaBases(value: DeltaBaseTemplate[]) {
 
 function deltaBaseDraft(value?: DeltaBaseTemplate[]) {
   const rows = value?.filter((item) => !isLegacyDefaultTitanBase(item));
-  return rows?.length ? rows : defaultDeltaBases();
+  return effectiveDeltaBases(rows);
 }
 
 function cleanDeltaJobs(value: DeltaJobTemplate[]) {
@@ -251,6 +255,20 @@ function isDeltaModeRequest(text: string) {
   return /\bdelta(?:\s+mode)?\b/.test(clean) && /\b(open|start|switch|enter|launch|run(?:ning)?|test(?:ing)?|try|use|begin|engage|engagement)\b/.test(clean);
 }
 
+function isDeltaFinishRequest(text: string) {
+  return /\b(finish|end|close)\s+(?:this\s+)?(?:delta\s+)?engagement\b|\bclose\s+delta(?:\s+mode)?\b/i.test(text);
+}
+
+const deltaDiceImages: Record<number, string> = {
+  4: "dice/d4.png",
+  6: "dice/d6.png",
+  8: "dice/d8.png",
+  9: "dice/d9.png",
+  12: "dice/d12.png",
+  20: "dice/d20.png",
+  100: "dice/d100.png"
+};
+
 function extractJsonObject(text: string) {
   const start = text.indexOf("{");
   const end = text.lastIndexOf("}");
@@ -278,6 +296,32 @@ function parseDeltaFinishPacket(text: string): DeltaFinishPacket {
     lootItems,
     parentChatHandoff: String(parsed.parentChatHandoff ?? "").trim()
   };
+}
+
+function parseDeltaBriefPacket(text: string) {
+  try {
+    const parsed = JSON.parse(extractJsonObject(text)) as { brief?: unknown; playerCharacterName?: unknown; avoidLabel?: unknown; avoidPrompt?: unknown };
+    return {
+      brief: typeof parsed.brief === "string" ? parsed.brief.trim() : "",
+      playerCharacterName: typeof parsed.playerCharacterName === "string" ? parsed.playerCharacterName.trim() : "",
+      avoidLabel: typeof parsed.avoidLabel === "string" ? parsed.avoidLabel.trim() : "",
+      avoidPrompt: typeof parsed.avoidPrompt === "string" ? parsed.avoidPrompt.trim() : ""
+    };
+  } catch {
+    return { brief: "", playerCharacterName: "", avoidLabel: "", avoidPrompt: "" };
+  }
+}
+
+function parseDeltaAvoidPacket(text: string) {
+  try {
+    const parsed = JSON.parse(extractJsonObject(text)) as { escaped?: unknown; responseText?: unknown };
+    return {
+      escaped: Boolean(parsed.escaped),
+      responseText: typeof parsed.responseText === "string" ? parsed.responseText.trim() : ""
+    };
+  } catch {
+    return { escaped: false, responseText: text.trim() };
+  }
 }
 
 async function parseJobFiles(files: FileList | null) {
@@ -396,6 +440,28 @@ function deltaEntityStats(entity: DeltaEntity) {
   ] as const;
 }
 
+function fitComposerTextarea(textarea: HTMLTextAreaElement | null) {
+  if (!textarea) return;
+  const styles = window.getComputedStyle(textarea);
+  const lineHeight = Number.parseFloat(styles.lineHeight) || 22;
+  const padding = Number.parseFloat(styles.paddingTop) + Number.parseFloat(styles.paddingBottom);
+  const tenLineHeight = Math.ceil(lineHeight * 10 + padding);
+  const viewportHeight = window.visualViewport?.height ?? window.innerHeight;
+  const viewportCap = Math.max(104, Math.floor(viewportHeight * 0.42));
+  const maxHeight = Math.min(240, tenLineHeight, viewportCap);
+  textarea.style.height = "auto";
+  textarea.style.height = `${Math.min(textarea.scrollHeight, maxHeight)}px`;
+  textarea.style.overflowY = textarea.scrollHeight > maxHeight ? "auto" : "hidden";
+}
+
+function keepComposerVisible(textarea: HTMLTextAreaElement | null) {
+  if (!textarea || document.activeElement !== textarea) return;
+  window.requestAnimationFrame(() => textarea.scrollIntoView({ block: "center", inline: "nearest" }));
+  window.setTimeout(() => {
+    if (document.activeElement === textarea) textarea.scrollIntoView({ block: "center", inline: "nearest" });
+  }, 180);
+}
+
 function visiblePositionValue(value?: string) {
   if (!value || value.trim().toLowerCase() === "unset") return "";
   return value;
@@ -413,13 +479,62 @@ function openRouterContent(text: string, images: { dataUrl: string; mimeType: st
   ];
 }
 
-function fileToDataUrl(file: File) {
-  return new Promise<{ dataUrl: string; mimeType: string }>((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve({ dataUrl: String(reader.result), mimeType: file.type });
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(file);
-  });
+async function imageForOpenRouter(file: File) {
+  if (!file.type.startsWith("image/")) throw new Error(`${file.name} is not an image.`);
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const element = new Image();
+      element.onload = () => resolve(element);
+      element.onerror = () => reject(new Error(`Could not read ${file.name}.`));
+      element.src = objectUrl;
+    });
+    const maxDimension = 1600;
+    const scale = Math.min(1, maxDimension / Math.max(image.naturalWidth, image.naturalHeight));
+    const width = Math.max(1, Math.round(image.naturalWidth * scale));
+    const height = Math.max(1, Math.round(image.naturalHeight * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error(`Could not prepare ${file.name}.`);
+    context.drawImage(image, 0, 0, width, height);
+    return { dataUrl: canvas.toDataURL("image/jpeg", 0.86), mimeType: "image/jpeg" };
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
+function messageHistoryText(message: Message) {
+  return message.attachmentContext
+    ? `${message.body}\n\n[Attachment context for this message:\n${message.attachmentContext}]`
+    : message.body;
+}
+
+function chatHistoryContent(history: Message[], currentMessageId: string | undefined, currentImages: { dataUrl: string; mimeType: string }[]) {
+  return history.map((message) => ({
+    role: (message.role === "system" ? "system" : message.role === "assistant" ? "assistant" : "user") as OpenRouterMessage["role"],
+    content: message.id === currentMessageId && currentImages.length ? openRouterContent(message.body, currentImages) : messageHistoryText(message)
+  }));
+}
+
+async function storedMessageImages(messageId: string) {
+  const attachments = await db.attachments.where("[ownerType+ownerId]").equals(["message", messageId]).toArray();
+  return Promise.all(attachments.filter((attachment) => attachment.mimeType.startsWith("image/")).map((attachment) => imageForOpenRouter(new File([attachment.blob], attachment.name || "image", { type: attachment.mimeType }))));
+}
+
+function canReadChatFile(file: File) {
+  return file.type.startsWith("text/") || /\.(txt|md|json|csv|log|yaml|yml|xml)$/i.test(file.name);
+}
+
+async function chatFileContext(files: File[]) {
+  if (!files.length) return "";
+  const unsupported = files.find((file) => !canReadChatFile(file));
+  if (unsupported) throw new Error(`${unsupported.name} cannot be sent as chat text. Attach text, Markdown, JSON, CSV, log, YAML, or XML files here.`);
+  const oversized = files.find((file) => file.size > 1_000_000);
+  if (oversized) throw new Error(`${oversized.name} is too large to include in one chat reply. Keep attached text files under 1 MB.`);
+  const contents = await Promise.all(files.map(async (file) => `# Attached file: ${file.name}\n${await file.text()}`));
+  return `Attached files for this reply:\n${contents.join("\n\n")}`;
 }
 
 function renderInlineMarkdown(text: string) {
@@ -470,6 +585,35 @@ function MarkdownText({ text, emptyText }: { text: string; emptyText?: string })
   );
 }
 
+function DeltaTurnText({ text }: { text: string }) {
+  const lines = text.split(/\r?\n/);
+  return (
+    <div className="delta-turn-lines">
+      {lines.map((line, index) => (
+        <div className="delta-turn-line" key={index} style={{ animationDelay: `${index * 110}ms` }}>
+          <MarkdownText text={line} emptyText=" " />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function cinematicMarker() {
+  return "\ud83c\udf9e\ufe0f";
+}
+
+function cleanDeltaCinematic(text: string) {
+  return text.replace(/^(\ud83c\udf9e\ufe0f|ðŸŽžï¸)\s*/, "");
+}
+
+function splitDeltaCinematic(text: string) {
+  const lines = text.split(/\r?\n/);
+  const cinematic: string[] = [];
+  while (lines[0]?.trim().startsWith(cinematicMarker())) cinematic.push(lines.shift() ?? "");
+  while (lines[0]?.trim().startsWith("🎞️")) cinematic.push(lines.shift() ?? "");
+  return { cinematic: cinematic.map(cleanDeltaCinematic).join("\n").trim(), turn: lines.join("\n").trim() };
+}
+
 type OpenRouterMessage = {
   role: "system" | "user" | "assistant" | "tool";
   content?: unknown;
@@ -499,6 +643,13 @@ type OpenRouterResponse = {
     };
   }[];
   usage?: OpenRouterUsage;
+};
+
+type DeltaImminentProposal = {
+  brief: string;
+  playerCharacterName?: string;
+  avoidLabel?: string;
+  avoidPrompt?: string;
 };
 
 const characterTools = [
@@ -580,6 +731,23 @@ const inventoryTools = [
   }
 ] as const;
 
+const imageContextTools = [
+  {
+    type: "function",
+    function: {
+      name: "save_image_context",
+      description: "Store a hidden, detailed visual extraction for the image attached to the current user message. Call this exactly once before replying normally. Use dense factual structured lines, not prose: medium/style, subjects and appearance, setting, actions, objects, composition, colours/lighting, visible text, notable details, and uncertainties. Do not include commentary, advice, or claims beyond the image.",
+      parameters: {
+        type: "object",
+        properties: {
+          context: { type: "string", description: "Detailed concise visual extraction in structured lines." }
+        },
+        required: ["context"]
+      }
+    }
+  }
+] as const;
+
 const memoryTools = [
   {
     type: "function",
@@ -600,7 +768,41 @@ const memoryTools = [
   }
 ] as const;
 
+const deltaImminentTools = [
+  {
+    type: "function",
+    function: {
+      name: "prepare_delta_engagement",
+      description: "Create a pending Delta Mode imminent card when the main chat reaches a confrontation, mission commitment, fight, hostile standoff, or structured engagement. Do not use this for ordinary tension or casual disagreement.",
+      parameters: {
+        type: "object",
+        properties: {
+          brief: { type: "string", description: "Short immersive in-world setup for the imminent engagement: who, what, where, why, immediate pressure, and likely opposition. Do not speak as an assistant." },
+          playerCharacterName: { type: "string", description: "Likely player-controlled character name, if known." },
+          avoidLabel: { type: "string", description: "Button label for avoiding the engagement, usually Escape for danger or Cancel for a proposed mission." },
+          avoidPrompt: { type: "string", description: "Short UI question asking what the player does to avoid or cancel the engagement." }
+        },
+        required: ["brief"]
+      }
+    }
+  }
+] as const;
+
 const deltaEntityTools = [
+  {
+    type: "function",
+    function: {
+      name: "set_delta_engagement_name",
+      description: "Set the concise, in-world name for this active engagement. Use it once when an engagement begins, based on the location, activity, or case. Never call it Delta Mode, New Engagement, or Untitled Engagement.",
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "A concise in-world engagement title." }
+        },
+        required: ["title"]
+      }
+    }
+  },
   {
     type: "function",
     function: {
@@ -627,7 +829,7 @@ const deltaEntityTools = [
     type: "function",
     function: {
       name: "create_delta_entity",
-      description: "Create one current Delta entity. Use saved characterId for known saved characters; otherwise use readable PREFIX, BASE, and optional JOB labels when project templates fit. Do not invent hidden template IDs.",
+      description: "Create one current Delta entity. Use saved characterId for known saved characters; otherwise apply readable PREFIX, BASE, and optional JOB labels from the project templates so generated stats are created. Do not invent hidden template IDs.",
       parameters: {
         type: "object",
         properties: {
@@ -649,6 +851,58 @@ const deltaEntityTools = [
   {
     type: "function",
     function: {
+      name: "finish_delta_engagement",
+      description: "Finish the current Delta engagement when its narrative outcome is resolved. This opens the proper finish, loot, archive, and parent-chat handoff flow. Do not write an assistant-style closing message instead.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "set_delta_player_entity",
+      description: "Mark the current player-controlled entity for turn ownership. Use this after creating or linking the player character named by the Delta Brief.",
+      parameters: {
+        type: "object",
+        properties: {
+          entityId: { type: "string", description: "Entity ID returned by create_delta_entity or already present in the current entity list." }
+        },
+        required: ["entityId"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "request_delta_roll",
+      description: "Lock Delta Mode until the user rolls the required dice. Use this whenever the GM needs authoritative client-generated roll results. After calling this, stop your response at the roll request.",
+      parameters: {
+        type: "object",
+        properties: {
+          die: { type: "number", description: "Required die sides. Use 4, 6, 8, 9, 12, 20, or 100." },
+          count: { type: "number", description: "How many of this die the user must roll. Defaults to 1." },
+          label: { type: "string", description: "Short roleplay-facing roll label, such as initiative, lockpick, damage, or resist fear." }
+        },
+        required: ["die", "label"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "request_delta_action",
+      description: "Pause Delta Mode for the player's response using a short floating prompt. The prompt is UI state only and is not added to the transcript. Use this instead of writing 'what do you do' into the Delta log.",
+      parameters: {
+        type: "object",
+        properties: {
+          prompt: { type: "string", description: "Short in-world prompt asking for the player's action." }
+        },
+        required: ["prompt"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
       name: "update_delta_entity",
       description: "Update an existing current Delta entity by entityId. Template values are readable labels only.",
       parameters: {
@@ -662,6 +916,9 @@ const deltaEntityTools = [
           job: { type: "string" },
           jobCategory: { type: "string" },
           statusText: { type: "string" },
+          currentHp: { type: "number", description: "Current HP after the resolved event." },
+          maxHp: { type: "number", description: "Maximum HP only when it must be corrected." },
+          initiative: { type: "number", description: "Initiative result used to order the entity list." },
           distanceFromPlayer: { type: "string" },
           elevation: { type: "string" }
         },
@@ -694,6 +951,7 @@ export function App() {
   const [deltaActionMacros, setDeltaActionMacros] = useState<DeltaActionMacro[]>([]);
   const [deltaAllyCache, setDeltaAllyCache] = useState<DeltaAllyCacheEntry[]>([]);
   const [deltaStartContext, setDeltaStartContext] = useState("");
+  const [selectedChatActiveDelta, setSelectedChatActiveDelta] = useState<DeltaSession>();
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const selectedProject = projects.find((project) => project.id === selectedProjectId);
   const editingProject = projects.find((project) => project.id === (editingProjectId ?? selectedProjectId));
@@ -708,6 +966,19 @@ export function App() {
     setDeltaActionMacros([]);
     setDeltaAllyCache([]);
   }, [selectedChatId]);
+  useEffect(() => {
+    let alive = true;
+    if (!selectedChatId) {
+      setSelectedChatActiveDelta(undefined);
+      return;
+    }
+    void db.deltaSessions.where("chatId").equals(selectedChatId).and((session) => session.active).first().then((session) => {
+      if (alive) setSelectedChatActiveDelta(session);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [selectedChatId, deltaOpen, deltaSession?.updatedAt, chats]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -826,9 +1097,14 @@ export function App() {
     const chat = await db.chats.get(id);
     if (!chat) return;
     if (!confirm(`Delete chat thread "${chat.title}"? This removes its messages and stars.`)) return;
-    await db.transaction("rw", [db.chats, db.branches, db.messages, db.stars, db.inventoryItems, db.inventoryLogs, db.deltaSessions, db.deltaMessages, db.deltaEntities, db.deltaAllyCache, db.deltaActionMacros], async () => {
+    await db.transaction("rw", [db.chats, db.branches, db.messages, db.stars, db.attachments, db.inventoryItems, db.inventoryLogs, db.deltaSessions, db.deltaMessages, db.deltaEntities, db.deltaAllyCache, db.deltaActionMacros], async () => {
       const deltaSessionIds = (await db.deltaSessions.where("chatId").equals(id).primaryKeys()) as string[];
+      const messageIds = (await db.messages.where("chatId").equals(id).primaryKeys()) as string[];
+      const attachmentIds = messageIds.length
+        ? (await db.attachments.filter((attachment) => attachment.ownerType === "message" && messageIds.includes(attachment.ownerId)).primaryKeys()) as string[]
+        : [];
       await db.stars.where("chatId").equals(id).delete();
+      if (attachmentIds.length) await db.attachments.bulkDelete(attachmentIds);
       await db.messages.where("chatId").equals(id).delete();
       await db.branches.where("chatId").equals(id).delete();
       await db.inventoryItems.where("chatId").equals(id).delete();
@@ -853,7 +1129,11 @@ export function App() {
     const activeChat = chatOverride ?? selectedChat;
     const activeProject = activeChat ? projects.find((project) => project.id === activeChat.projectId) : selectedProject;
     if (!activeProject || !activeChat) return;
-    const session = await getOrCreateDeltaSession(activeChat);
+    const session = startContext
+      ? await getOrCreateDeltaSession(activeChat)
+      : await db.deltaSessions.where("chatId").equals(activeChat.id).and((item) => item.active).first()
+        ?? await db.deltaSessions.where("chatId").equals(activeChat.id).and((item) => !item.active).reverse().sortBy("updatedAt").then((items) => items[0]);
+    if (!session) return;
     const [nextMessages, nextEntities, archivedSessions, actionMacros, allyCache] = await Promise.all([
       db.deltaMessages.where("sessionId").equals(session.id).toArray(),
       db.deltaEntities.where("sessionId").equals(session.id).toArray(),
@@ -921,7 +1201,7 @@ export function App() {
               </button>
             )}
             {selectedChat && (
-              <button className="inventory-trigger" type="button" onClick={() => openDeltaMode()} aria-label="Open Delta Mode" title="Delta Mode">
+              <button className={`inventory-trigger ${selectedChatActiveDelta ? "active" : ""}`} type="button" onClick={() => openDeltaMode()} aria-label="Open Delta Mode" title="Delta Mode">
                 <Swords size={19} />
               </button>
             )}
@@ -985,6 +1265,7 @@ export function App() {
             onRoute={setRoute}
             selectedModelId={selectedModelId}
             models={models}
+            deltaLocked={Boolean(selectedChatActiveDelta)}
             onOpenDelta={(chatOverride, startContext) => openDeltaMode(chatOverride, startContext)}
             onSettingsSaved={async (modelId) => {
               setSelectedModelId(modelId);
@@ -1174,7 +1455,6 @@ function DeltaModeWorkspace({
 }) {
   const [body, setBody] = useState("");
   const [activeTool, setActiveTool] = useState<"entities" | "inventory" | "settings" | "history" | "actions">();
-  const [diceOpen, setDiceOpen] = useState(false);
   const [actionsEditMode, setActionsEditMode] = useState(false);
   const [entitySettingsOpen, setEntitySettingsOpen] = useState(false);
   const [entitySettingsTab, setEntitySettingsTab] = useState<"entities" | "ally-cache">("entities");
@@ -1203,18 +1483,70 @@ function DeltaModeWorkspace({
     requestEntitySelection: boolean;
   }>();
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  const turnQueueRef = useRef<HTMLDivElement>(null);
+  const finishRequestedRef = useRef(false);
+  const stagedStartContextRef = useRef("");
+  const [turnQueueEdges, setTurnQueueEdges] = useState({ left: false, right: false });
   const [saved, showSaved] = useSavedNotice();
   const archiveLimitOptions = [0, 1, 3, 5, 8, 12, 16, 20, 30, 40, 50, Infinity];
+  function updateTurnQueueEdges() {
+    const element = turnQueueRef.current;
+    if (!element) {
+      setTurnQueueEdges({ left: false, right: false });
+      return;
+    }
+    const maxScroll = element.scrollWidth - element.clientWidth;
+    setTurnQueueEdges({
+      left: element.scrollLeft > 2,
+      right: maxScroll > 2 && element.scrollLeft < maxScroll - 2
+    });
+  }
+  useEffect(() => {
+    updateTurnQueueEdges();
+    window.addEventListener("resize", updateTurnQueueEdges);
+    return () => window.removeEventListener("resize", updateTurnQueueEdges);
+  }, [session.id, session.turnIndex, entities.length]);
+  useEffect(() => {
+    const composer = composerRef.current;
+    fitComposerTextarea(composer);
+    keepComposerVisible(composer);
+  }, [body]);
+  useEffect(() => {
+    const handleViewportChange = () => {
+      fitComposerTextarea(composerRef.current);
+      keepComposerVisible(composerRef.current);
+    };
+    window.visualViewport?.addEventListener("resize", handleViewportChange);
+    window.visualViewport?.addEventListener("scroll", handleViewportChange);
+    return () => {
+      window.visualViewport?.removeEventListener("resize", handleViewportChange);
+      window.visualViewport?.removeEventListener("scroll", handleViewportChange);
+    };
+  }, []);
   useEffect(() => setSettingsDraft(session.settings), [session.id, session.settings]);
   useEffect(() => setPlayerCharacterId(chat.deltaPlayerCharacterId ?? ""), [chat.id, chat.deltaPlayerCharacterId]);
   useEffect(() => {
     if (!startContext || messages.length > 0) return;
+    const startKey = `${session.id}:${startContext}`;
+    if (stagedStartContextRef.current === startKey) return;
+    stagedStartContextRef.current = startKey;
     const handoff = startContext;
     onStartContextConsumed();
-    void submitDeltaTurn(handoff, {
+    void addDeltaMessage(session.id, "system", handoff).then(() => submitDeltaTurn(handoff, {
       hideUser: true,
       stageEngagement: true,
-      instruction: "Start this Delta engagement from the main-chat handoff. Do not place the handoff text in the user's composer. First stage the engagement, then write a concise roleplay-facing opening that establishes who is involved, what is happening, where it is happening, and why it matters. Wait for the next turn."
+      instruction: "Start this Delta engagement from the main-chat handoff. Do not place the handoff text in the user's composer. First stage the engagement, then write turn 1 as a concise roleplay-facing opening that establishes who is involved, what is happening, where it is happening, and why it matters. End by calling for initiative and stop there."
+    })).then(async (started) => {
+      if (!started) return;
+      const playerName = handoff.match(/PLAYER CHARACTER:\s*([^\n]+)/i)?.[1]?.trim().toLocaleLowerCase();
+      const nextSettings = { ...session.settings };
+      if (playerName && !nextSettings.playerEntityId) {
+        const stagedEntities = await db.deltaEntities.where("sessionId").equals(session.id).toArray();
+        const matched = stagedEntities.find((entity) => entity.name.trim().toLocaleLowerCase() === playerName || entity.name.trim().toLocaleLowerCase().includes(playerName));
+        if (matched) nextSettings.playerEntityId = matched.id;
+      }
+      await db.deltaSessions.update(session.id, { settings: nextSettings, initiativeStarted: false, awaitingPlayerRoll: true, awaitingPlayerAction: false, requiredRollDie: 20, requiredRollCount: 1, requiredRollResults: [], requiredRollKind: "initiative", requiredRollLabel: "initiative", actionPrompt: undefined, turnIndex: 0, updatedAt: now() });
+      await onRefresh();
     });
   }, [startContext, messages.length]);
   useEffect(() => {
@@ -1230,11 +1562,15 @@ function DeltaModeWorkspace({
       .toArray()
       .then((rows) => setProjectCharacters(rows.sort((a, b) => (a.orderIndex ?? Number.MAX_SAFE_INTEGER) - (b.orderIndex ?? Number.MAX_SAFE_INTEGER) || a.normalisedName.localeCompare(b.normalisedName))));
   }, [activeTool, project.id]);
+  useEffect(() => {
+    if (!session.awaitingPlayerRoll || activeTool !== "actions") return;
+    setActiveTool(undefined);
+  }, [session.awaitingPlayerRoll, activeTool]);
   async function deltaOpenRouterRequest(payload: Record<string, unknown>) {
     const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${settings.apiKey}`,
+        Authorization: `Bearer ${(settings.apiKey ?? "").trim()}`,
         "Content-Type": "application/json",
         "HTTP-Referer": location.origin,
         "X-Title": "Mirror 2.0"
@@ -1266,6 +1602,12 @@ function DeltaModeWorkspace({
         return stringArg("characterId") ? getCharacterBio(project.id, stringArg("characterId")) : { error: "characterId is required." };
       case "get_character_stats":
         return stringArg("characterId") ? getCharacterStats(project.id, stringArg("characterId")) : { error: "characterId is required." };
+      case "set_delta_engagement_name": {
+        const title = stringArg("title").slice(0, 96);
+        if (!title) return { error: "An engagement title is required." };
+        await db.deltaSessions.update(session.id, { title, updatedAt: now() });
+        return { title };
+      }
       case "list_delta_job_categories": {
         const counts = jobCategories(project.deltaJobs ?? []);
         return counts.map(([category, count]) => ({ category, count }));
@@ -1279,6 +1621,23 @@ function DeltaModeWorkspace({
       case "create_delta_entity": {
         const characterId = stringArg("characterId");
         const character = characterId ? await db.characters.get(characterId) : undefined;
+        const entityName = character && character.projectId === project.id ? character.name : stringArg("name") || "Unnamed entity";
+        const existingEntity = await db.deltaEntities
+          .where("sessionId")
+          .equals(session.id)
+          .and((entity) => characterId
+            ? entity.characterId === characterId
+            : !entity.characterId && entity.name.trim().toLocaleLowerCase() === entityName.trim().toLocaleLowerCase())
+          .first();
+        if (existingEntity) {
+          return {
+            existing: existingEntity.name,
+            entityId: existingEntity.id,
+            templateTag: existingEntity.templateTag ?? "",
+            stats: { STR: existingEntity.str, DEX: existingEntity.dex, CON: existingEntity.con, INT: existingEntity.int, WIS: existingEntity.wis, CHA: existingEntity.cha },
+            hp: { current: existingEntity.currentHp, max: existingEntity.maxHp }
+          };
+        }
         const timestamp = now();
         const basePatch = character && character.projectId === project.id
           ? await deltaCharacterPatch(character)
@@ -1287,7 +1646,7 @@ function DeltaModeWorkspace({
           id: uid(),
           sessionId: session.id,
           ...basePatch,
-          name: character && character.projectId === project.id ? character.name : stringArg("name") || "Unnamed entity",
+          name: entityName,
           side: normaliseDeltaRelationship(stringArg("side")) as DeltaRelationship,
           statusText: stringArg("statusText"),
           distanceFromPlayer: stringArg("distanceFromPlayer"),
@@ -1298,7 +1657,58 @@ function DeltaModeWorkspace({
         };
         await db.deltaEntities.add(entity);
         await upsertDeltaAllyCache(chat.id, entity);
-        return { created: entity.name, entityId: entity.id, templateTag: entity.templateTag ?? "" };
+        return {
+          created: entity.name,
+          entityId: entity.id,
+          templateTag: entity.templateTag ?? "",
+          stats: { STR: entity.str, DEX: entity.dex, CON: entity.con, INT: entity.int, WIS: entity.wis, CHA: entity.cha },
+          hp: { current: entity.currentHp, max: entity.maxHp }
+        };
+      }
+      case "finish_delta_engagement":
+        finishRequestedRef.current = true;
+        return { finishing: true, message: "The client will prepare the engagement finish flow. Do not write a closing response." };
+      case "set_delta_player_entity": {
+        const entityId = stringArg("entityId");
+        const entity = entityId ? await db.deltaEntities.get(entityId) : undefined;
+        if (!entity || entity.sessionId !== session.id) return { error: "Entity not found in this active Delta engagement." };
+        await db.deltaSessions.update(session.id, { settings: { ...session.settings, playerEntityId: entity.id }, updatedAt: now() });
+        if (entity.characterId) await db.chats.update(chat.id, { deltaPlayerCharacterId: entity.characterId, updatedAt: now() });
+        return { playerEntityId: entity.id, playerName: entity.name };
+      }
+      case "request_delta_roll": {
+        const die = Number(args.die);
+        const allowedDice = [4, 6, 8, 9, 12, 20, 100];
+        if (!allowedDice.includes(die)) return { error: "Unsupported die. Use d4, d6, d8, d9, d12, d20, or d100." };
+        const count = Math.max(1, Math.min(12, Math.floor(typeof args.count === "number" && Number.isFinite(args.count) ? args.count : 1)));
+        const label = stringArg("label").slice(0, 80) || `d${die} roll`;
+        await db.deltaSessions.update(session.id, {
+          awaitingPlayerRoll: true,
+          awaitingPlayerAction: false,
+          requiredRollDie: die,
+          requiredRollCount: count,
+          requiredRollResults: [],
+          requiredRollKind: "check",
+          requiredRollLabel: label,
+          actionPrompt: undefined,
+          updatedAt: now()
+        });
+        return { waitingForRoll: `${count}d${die}`, label };
+      }
+      case "request_delta_action": {
+        const prompt = stringArg("prompt").slice(0, 180) || "What does the player do?";
+        await db.deltaSessions.update(session.id, {
+          awaitingPlayerAction: true,
+          awaitingPlayerRoll: false,
+          actionPrompt: prompt,
+          requiredRollDie: undefined,
+          requiredRollCount: undefined,
+          requiredRollResults: undefined,
+          requiredRollKind: undefined,
+          requiredRollLabel: undefined,
+          updatedAt: now()
+        });
+        return { waitingForAction: true, prompt };
       }
       case "update_delta_entity": {
         const entity = await db.deltaEntities.get(stringArg("entityId"));
@@ -1312,6 +1722,9 @@ function DeltaModeWorkspace({
           name: stringArg("name") || entity.name,
           side: stringArg("side") ? normaliseDeltaRelationship(stringArg("side")) : entity.side,
           statusText: stringArg("statusText") || entity.statusText,
+          currentHp: typeof args.currentHp === "number" && Number.isFinite(args.currentHp) ? Math.max(0, args.currentHp) : entity.currentHp,
+          maxHp: typeof args.maxHp === "number" && Number.isFinite(args.maxHp) ? Math.max(1, args.maxHp) : entity.maxHp,
+          initiative: typeof args.initiative === "number" && Number.isFinite(args.initiative) ? args.initiative : entity.initiative,
           distanceFromPlayer: stringArg("distanceFromPlayer") || entity.distanceFromPlayer,
           elevation: stringArg("elevation") || entity.elevation,
           updatedAt: now()
@@ -1340,6 +1753,7 @@ function DeltaModeWorkspace({
       const assistantMessage = json.choices?.[0]?.message;
       const toolCalls = assistantMessage?.tool_calls ?? [];
       if (!toolCalls.length) return assistantMessage?.content ?? "";
+      const pauseRequested = toolCalls.some((toolCall) => toolCall.function.name === "request_delta_roll" || toolCall.function.name === "request_delta_action");
       messagesToSend = [
         ...messagesToSend,
         { role: "assistant", content: assistantMessage?.content ?? "", tool_calls: toolCalls }
@@ -1349,6 +1763,7 @@ function DeltaModeWorkspace({
         toolLog.push(toolCall.function.name);
         messagesToSend.push({ role: "tool", tool_call_id: toolCall.id, content: JSON.stringify(result) });
       }
+      if (pauseRequested) return assistantMessage?.content ?? "";
     }
     return "Delta tools reached their turn limit. Continue from the current engagement state.";
   }
@@ -1366,25 +1781,31 @@ function DeltaModeWorkspace({
     if (!options.hideUser) await addDeltaMessage(session.id, "user", clean);
     const timestamp = now();
     const replyId = uid();
-    await db.deltaMessages.add({ id: replyId, sessionId: session.id, sequence: messages.length + (options.hideUser ? 0 : 1), role: "assistant", body: "...", status: "pending", modelId: model, createdAt: timestamp, updatedAt: timestamp });
+    const replySequence = ((await db.deltaMessages.where("[sessionId+sequence]").between([session.id, Dexie.minKey], [session.id, Dexie.maxKey]).last())?.sequence ?? -1) + 1;
+    await db.deltaMessages.add({ id: replyId, sessionId: session.id, sequence: replySequence, role: "assistant", body: "...", status: "pending", modelId: model, createdAt: timestamp, updatedAt: timestamp });
     await onRefresh();
     const allCharacters = await db.characters.where("projectId").equals(project.id).toArray();
+    const deltaPrompt = project.deltaSystemPrompt?.trim() || defaultDeltaSystemPrompt;
+    const linkedCharacters = await linkedCharacterContext();
     const context = [
-      `You are in Delta Mode, a separate active messaging workspace attached to this chat. Do not include archived engagements in reasoning.`,
-      "Delta Mode replies should be compact, turn-like, and operational. Use minimal text rows, not long story prose.",
-      "When starting an engagement from a handoff, begin with a brief summary of how the current engagement was reached, then continue as Delta Mode.",
+      deltaPrompt,
       `Project: ${project.name}`,
-      project.instructions ? `Project instructions:\n${project.instructions}` : "",
       project.worldSetting ? `World setting:\n${project.worldSetting}` : "",
       `Saved project character names:\n${allCharacters.map((character) => `- ${character.name} (${character.id})`).join("\n") || "(none)"}`,
+      linkedCharacters ? `Linked involved character data:\n${linkedCharacters}` : "",
       `Current entity list:\n${entities.map((entity) => `- ${entity.id}: ${entity.name}, ${entity.side}${entity.templateTag ? `, ${entity.templateTag}` : ""}${entity.statusText ? `, ${entity.statusText}` : ""}${entityPositionLabel(entity) ? `, ${entityPositionLabel(entity)}` : ""}`).join("\n") || "(none)"}`,
       `Chat-scoped ally cache:\n${allyCache.map((entry) => `- ${entry.name}${entry.templateTag ? `, ${entry.templateTag}` : ""}`).join("\n") || "(none)"}`,
-      `Available PREFIX labels: ${(project.deltaPrefixes ?? []).map((item) => item.label).join(", ") || "(none)"}`,
-      `Available BASE labels: ${(project.deltaBases ?? []).map((item) => item.label).join(", ") || "(none)"}`,
+      `Available PREFIX labels: ${effectiveDeltaPrefixes(project.deltaPrefixes).map((item) => item.label).join(", ") || "(none)"}`,
+      `Available BASE labels: ${effectiveDeltaBases(project.deltaBases).map((item) => item.label).join(", ") || "(none)"}`,
       `Available JOB categories: ${jobCategories(project.deltaJobs ?? []).map(([category, count]) => `${category} (${count})`).join(", ") || "(none)"}`,
-      "When an engagement introduces participants, keep the entity list current. Use saved character IDs for known saved characters so their saved stats are authoritative. For generated/unlinked entities, use readable PREFIX-BASE JOB labels only when suitable. Do not add A/B/C/D suffixes to actual names.",
+      "Generated entity rule: for every unlinked entity, choose a suitable PREFIX and BASE from the available labels when they exist. If JOB categories exist, call list_delta_job_categories, then get_delta_jobs_for_category for the best category, and choose a JOB from that category. Pass prefix, base, job, and jobCategory to create_delta_entity so the entity receives generated stats. For saved linked characters, use characterId and do not use generated tags.",
+      "Player roll rule: when the player declares an action with uncertain success, do not resolve success or failure yet. Call request_delta_roll with the required die/count/label and stop. Only resolve the action after the client provides the actual roll result.",
+      "NPC roll visibility rule: when you roll for NPCs, hostiles, allies, hazards, detection, resistance, damage, or contests, write the roll visibly in the turn text. Use compact lines like: Name: Rolling 1d20 + DEX... *12 + 2 =* **14**. Never silently decide rolled outcomes.",
+      "Turn text format: never write labels such as 'Turn resolved:', 'Result:', or 'Outcome:'. Write the action and consequence directly. A turn may use multiple short lines when useful.",
+      "Delta prose style: compact but not sterile. Add one or two precise sensory, emotional, or character-flavor details when they make the turn feel alive. Keep it lean; do not expand into main-chat story prose.",
+      "Cinematic injection: occasionally, when stakes or relationships make it feel right, you may start with a compact cut-in beginning with 🎞️ before the actual turn text. Keep it brief but vivid: one to three compact sentences, maximum three short lines, never a full paragraph or story scene. Use it sparingly for reaction beats such as comms, fear, pain, taunts, vows, hesitation, or intimate pressure. Do not use it every turn.",
       options.stageEngagement
-        ? "This is the opening of an engagement. Before writing any response, use create_delta_entity to make the entity list match the scene: retain the player entity, add every named saved character who is currently involved with the correct relationship, and add only immediate NPCs, neutrals, or hostiles that the handoff actually establishes. Do not use placeholders. Then write an opening that clearly states who, what, where, and why in concise roleplay text."
+        ? "Current phase: opening a new engagement."
         : ""
     ].filter(Boolean).join("\n\n");
     const requestMessages: OpenRouterMessage[] = [
@@ -1393,9 +1814,16 @@ function DeltaModeWorkspace({
       { role: "user", content: [options.instruction, clean].filter(Boolean).join("\n\n") }
     ];
     const toolLog: string[] = [];
+    finishRequestedRef.current = false;
     try {
       const reply = await completeDeltaTurn(requestMessages, toolLog, options.stageEngagement);
-      await db.deltaMessages.update(replyId, { body: reply || "", status: "complete", updatedAt: now() });
+      if (finishRequestedRef.current) {
+        await db.deltaMessages.delete(replyId);
+        await startFinishFlow();
+        return true;
+      }
+      if (reply.trim()) await db.deltaMessages.update(replyId, { body: reply, status: "complete", updatedAt: now() });
+      else await db.deltaMessages.delete(replyId);
     } catch (error) {
       await db.deltaMessages.update(replyId, { body: error instanceof Error ? error.message : "OpenRouter request failed.", status: "failed", updatedAt: now() });
     }
@@ -1405,8 +1833,21 @@ function DeltaModeWorkspace({
   async function send() {
     const clean = body.trim();
     if (!clean || !session.active) return;
-    const sent = await submitDeltaTurn(clean);
-    if (sent) setBody("");
+    if (session.awaitingPlayerRoll || (session.initiativeStarted && !session.awaitingPlayerAction)) return;
+    if (isDeltaFinishRequest(clean)) {
+      setBody("");
+      await startFinishFlow();
+      return;
+    }
+    const wasAwaitingPlayerAction = Boolean(session.awaitingPlayerAction);
+    if (wasAwaitingPlayerAction) await db.deltaSessions.update(session.id, { awaitingPlayerAction: false, actionPrompt: undefined, updatedAt: now() });
+    const sent = await submitDeltaTurn(clean, wasAwaitingPlayerAction ? {
+      instruction: "The player just declared their action. If the action has uncertain success, risk, opposition, contested movement, attack, defense, stealth, persuasion, hacking, resistance, damage, or hazard interaction, do not resolve success/failure yet. Call request_delta_roll with the required die/count/label and stop. If no roll is needed, resolve exactly one compact outcome, persist entity changes, and stop without calling request_delta_action again for this same turn."
+    } : {});
+    if (sent) {
+      setBody("");
+      if (session.initiativeStarted && session.awaitingPlayerAction) await advanceTurn();
+    }
   }
   function rollDie(sides: number) {
     const values = new Uint32Array(1);
@@ -1418,11 +1859,104 @@ function DeltaModeWorkspace({
     return (values[0] % sides) + 1;
   }
   async function rollDeltaDie(sides: number) {
+    if (session.awaitingPlayerRoll && session.requiredRollDie && sides !== session.requiredRollDie) return;
     const result = rollDie(sides);
+    if (session.awaitingPlayerRoll) {
+      const results = [...(session.requiredRollResults ?? []), result];
+      const requiredCount = Math.max(1, session.requiredRollCount ?? 1);
+      if (results.length < requiredCount) {
+        await db.deltaSessions.update(session.id, { requiredRollResults: results, updatedAt: now() });
+        await onRefresh();
+        return;
+      }
+      if ((session.requiredRollKind ?? "initiative") === "initiative") await resolveInitiative(results[0] ?? result);
+      else {
+        const resultText = requiredCount > 1 ? `${requiredCount}d${sides} = ${results.join(", ")}` : `d${sides} = ${result}`;
+        await addDeltaMessage(session.id, "system", `🎲 ${session.requiredRollLabel || `${requiredCount}d${sides} roll`}: ${resultText}`);
+        await db.deltaSessions.update(session.id, {
+          awaitingPlayerRoll: false,
+          requiredRollDie: undefined,
+          requiredRollCount: undefined,
+          requiredRollResults: undefined,
+          requiredRollKind: undefined,
+          requiredRollLabel: undefined,
+          updatedAt: now()
+        });
+        await submitDeltaTurn(`Dice roll: ${resultText}`, {
+          hideUser: true,
+          instruction: `This is the actual client-generated ${session.requiredRollLabel || `${requiredCount}d${sides} roll`}. The result is authoritative and has already been visibly logged. Resolve exactly one compact Delta outcome from this roll bundle. Include the aftermath and any HP/status/entity changes. If another roll is required to finish this same action, call request_delta_roll with the next required die/count and stop. Otherwise stop without calling request_delta_action again for this same turn; the client will advance to the next entity.`
+        });
+        const latest = await db.deltaSessions.get(session.id);
+        if (latest?.initiativeStarted && !latest.awaitingPlayerAction && !latest.awaitingPlayerRoll) await advanceTurn();
+      }
+      return;
+    }
     await submitDeltaTurn(`Dice roll: d${sides} = ${result}`, {
       instruction: "This is an actual client-generated dice roll. The result is authoritative. Do not reroll, reinterpret the number, or replace it with an AI-chosen value. Respond with the concise Delta outcome."
     });
-    setDiceOpen(false);
+  }
+  async function resolveInitiative(playerRoll: number) {
+    const playerId = session.settings.playerEntityId ?? entities[0]?.id;
+    if (!playerId) return;
+    const ranked = entities
+      .map((entity, index) => {
+        const dexModifier = Math.floor(((entity.dex ?? 10) - 10) / 2);
+        const rawRoll = entity.id === playerId ? playerRoll : rollDie(20);
+        return {
+          entity,
+          rawRoll,
+          dexModifier,
+          initiative: rawRoll + dexModifier,
+          index
+        };
+      })
+      .sort((a, b) => b.initiative - a.initiative || a.index - b.index);
+    const first = ranked[0];
+    await db.transaction("rw", db.deltaEntities, db.deltaSessions, async () => {
+      await Promise.all(ranked.map(({ entity, initiative }, orderIndex) => db.deltaEntities.update(entity.id, { initiative, orderIndex, updatedAt: now() })));
+      await db.deltaSessions.update(session.id, {
+        initiativeStarted: true,
+        awaitingPlayerRoll: false,
+        requiredRollDie: undefined,
+        requiredRollCount: undefined,
+        requiredRollResults: undefined,
+        requiredRollKind: undefined,
+        requiredRollLabel: undefined,
+        actionPrompt: undefined,
+        awaitingPlayerAction: first?.entity.id === playerId,
+        turnIndex: 0,
+        updatedAt: now()
+      });
+    });
+    await addDeltaMessage(session.id, "system", `Initiative order:\n${ranked.map(({ entity, rawRoll, dexModifier, initiative }, index) => `${index + 1}. ${entity.name}: ${rawRoll}${dexModifier === 0 ? "" : dexModifier > 0 ? ` + ${dexModifier}` : ` - ${Math.abs(dexModifier)}`} = ${initiative}`).join("\n")}`);
+    await onRefresh();
+  }
+  async function advanceTurn() {
+    const current = await db.deltaSessions.get(session.id);
+    const ordered = (await db.deltaEntities.where("sessionId").equals(session.id).toArray()).sort((a, b) => a.orderIndex - b.orderIndex);
+    if (!current || !ordered.length || !current.initiativeStarted) return;
+    if (current.awaitingPlayerRoll || current.awaitingPlayerAction) return;
+    const nextIndex = ((current.turnIndex ?? 0) + 1) % ordered.length;
+    const playerId = current.settings.playerEntityId ?? ordered[0]?.id;
+    const next = ordered[nextIndex];
+    await db.deltaSessions.update(session.id, {
+      turnIndex: nextIndex,
+      awaitingPlayerAction: next?.id === playerId,
+      awaitingPlayerRoll: false,
+      updatedAt: now()
+    });
+    await onRefresh();
+  }
+  async function nextTurn() {
+    if (!session.initiativeStarted || session.awaitingPlayerAction || session.awaitingPlayerRoll) return;
+    const ordered = [...entities].sort((a, b) => a.orderIndex - b.orderIndex);
+    const actor = ordered[session.turnIndex ?? 0];
+    if (!actor) return;
+    const sent = await submitDeltaTurn(`${actor.name}'s turn.`, {
+      hideUser: true,
+      instruction: `Play exactly one turn for ${actor.name}. If this turn involves attack, defense, hazard, detection, resistance, damage, contested movement, or another uncertain NPC/ally/non-player action, roll visibly in the turn text using a compact line like "${actor.name}: Rolling 1d20 + STAT... *raw + mod =* **total**." Do not silently decide rolled outcomes. If a cinematic reaction beat is warranted before this turn, put a compact cut-in beginning with 🎞️ first, limited to one to three compact sentences and no more than three short lines, then write the actual turn. Write the action and consequence directly, without prefixes like 'Turn resolved:'. Use multiple short lines if needed. Add one or two small sensory or character-flavor details when they sharpen the moment, but do not expand into full story prose. Persist any HP, status, relationship, distance, or elevation changes with update_delta_entity. Do not resolve any later turns and do not tell the player to let you know what happens next.`
+    });
+    if (sent) await advanceTurn();
   }
   async function cacheCurrentGeneratedAllies() {
     await Promise.all(entities.map((entity) => upsertDeltaAllyCache(chat.id, entity)));
@@ -1516,7 +2050,8 @@ function DeltaModeWorkspace({
     setFinishPacket(undefined);
     setForfeitConfirmOpen(false);
     await onRefresh();
-    window.history.back();
+    onClose();
+    if (window.history.state?.mirrorDeltaMode) window.history.back();
   }
   async function pruneArchivedDeltaSessions() {
     const limit = settingsDraft.maxHistoryMessages;
@@ -1606,23 +2141,38 @@ function DeltaModeWorkspace({
     await onRefresh();
   }
   async function characterStatsPatch(character: Character) {
-    const bonuses = await db.characterBonuses.where("characterId").equals(character.id).toArray();
-    const total = (base: number, stat: Ability) => base + bonuses.filter((bonus) => bonus.stat === stat).reduce((sum, bonus) => sum + bonus.value, 0);
+    const stats = await characterTemplateStats(project, character);
     return {
       characterId: character.id,
       name: character.name,
-      str: total(character.str, "STR"),
-      dex: total(character.dex, "DEX"),
-      con: total(character.con, "CON"),
-      int: total(character.int, "INT"),
-      wis: total(character.wis, "WIS"),
-      cha: total(character.cha, "CHA"),
+      str: stats.STR,
+      dex: stats.DEX,
+      con: stats.CON,
+      int: stats.INT,
+      wis: stats.WIS,
+      cha: stats.CHA,
+      maxHp: stats.maxHp,
+      currentHp: stats.maxHp,
       templateTag: undefined,
       prefix: undefined,
       base: undefined,
       job: undefined,
       generatedStatsSource: undefined
     };
+  }
+  async function linkedCharacterContext() {
+    const linkedIds = Array.from(new Set(entities.map((entity) => entity.characterId).filter(Boolean) as string[]));
+    if (!linkedIds.length) return "";
+    const rows = (await db.characters.bulkGet(linkedIds)).filter((character): character is Character => Boolean(character && character.projectId === project.id));
+    const sections = await Promise.all(rows.map(async (character) => {
+      const stats = await characterStatsPatch(character);
+      return [
+        `${character.name} (${character.id})`,
+        `Identity: age=${character.age || ""}; gender=${character.gender || ""}; personality=${character.personality || ""}; misc=${character.misc || ""}`,
+        `Stats: STR ${stats.str}, DEX ${stats.dex}, CON ${stats.con}, INT ${stats.int}, WIS ${stats.wis}, CHA ${stats.cha}`
+      ].join("\n");
+    }));
+    return sections.join("\n\n");
   }
   async function addCharacterEntity(characterId: string) {
     const character = await db.characters.get(characterId);
@@ -1634,8 +2184,6 @@ function DeltaModeWorkspace({
       sessionId: session.id,
       ...stats,
       side: "neutral",
-      currentHp: 10,
-      maxHp: 10,
       statusText: "Awaiting engagement status.",
       distanceFromPlayer: "",
       elevation: "",
@@ -1649,7 +2197,10 @@ function DeltaModeWorkspace({
     if (!entity.characterId) return;
     const character = await db.characters.get(entity.characterId);
     if (!character || character.projectId !== project.id) return;
-    await db.deltaEntities.update(entity.id, { ...(await characterStatsPatch(character)), updatedAt: now() });
+    const patch = await characterStatsPatch(character);
+    const previousMax = entity.maxHp ?? patch.maxHp;
+    const hpDelta = patch.maxHp - previousMax;
+    await db.deltaEntities.update(entity.id, { ...patch, currentHp: Math.max(0, (entity.currentHp ?? patch.maxHp) + hpDelta), updatedAt: now() });
     await onRefresh();
   }
   async function linkCharacterToEntity(entity: DeltaEntity, characterId: string) {
@@ -1788,6 +2339,31 @@ function DeltaModeWorkspace({
   }
   const playerEntityId = settingsDraft.playerEntityId ?? entities[0]?.id;
   const namesByEntityId = entityDisplayNames(entities);
+  const orderedEntities = [...entities].sort((a, b) => a.orderIndex - b.orderIndex);
+  const turnIndex = Math.max(0, Math.min(session.turnIndex ?? 0, Math.max(0, orderedEntities.length - 1)));
+  const turnQueue = session.initiativeStarted ? [...orderedEntities.slice(turnIndex), ...orderedEntities.slice(0, turnIndex)] : [];
+  const currentTurn = turnQueue[0];
+  const requiredRollCount = Math.max(1, session.requiredRollCount ?? 1);
+  const completedRollCount = session.requiredRollResults?.length ?? 0;
+  const remainingRollCount = Math.max(1, requiredRollCount - completedRollCount);
+  const requiredRollText = `${remainingRollCount} ${remainingRollCount === 1 ? "dice roll" : "dice rolls"} (d${session.requiredRollDie ?? 20}) left`;
+  const currentTurnLabel = session.awaitingPlayerRoll
+    ? `Roll ${requiredRollCount}d${session.requiredRollDie ?? 20} for ${session.requiredRollLabel || "initiative"}`
+    : currentTurn
+      ? (namesByEntityId.get(currentTurn.id) ?? currentTurn.name)
+      : "Engagement";
+  const currentTurnNumber = messages.filter((message) => message.role !== "system").length + 1;
+  const inputDisabled = Boolean(session.awaitingPlayerRoll || (session.initiativeStarted && !session.awaitingPlayerAction));
+  const relationshipForEntity = (entity?: DeltaEntity) => normaliseDeltaRelationship(entity?.side ?? "neutral");
+  const entityByDisplayName = new Map(orderedEntities.flatMap((entity) => {
+    const displayName = namesByEntityId.get(entity.id) ?? entity.name;
+    return [[displayName.trim().toLowerCase(), entity], [entity.name.trim().toLowerCase(), entity]] as const;
+  }));
+  const relationshipForInitiativeLine = (line: string) => {
+    const name = line.replace(/^\s*\d+\.\s*/, "").split(":")[0]?.trim().toLowerCase();
+    return relationshipForEntity(name ? entityByDisplayName.get(name) : undefined);
+  };
+  let displayedTurnNumber = 0;
   return (
     <div className="delta-layer">
       <div className="delta-dim" aria-hidden="true" />
@@ -1795,6 +2371,7 @@ function DeltaModeWorkspace({
         <div className="delta-top">
           <div className="delta-title-block">
             <h2><Swords size={18} /> Delta Mode</h2>
+            <strong className="delta-engagement-name" title={session.title}>{session.title || "Untitled Engagement"}</strong>
             <small title={`${project.name} / ${chat.title}`}>{project.name} / {chat.title}</small>
           </div>
           <button className="icon-button" onClick={renameActiveEngagement} aria-label="Rename Delta engagement" title={session.title || "Name engagement"}><Edit3 size={16} /></button>
@@ -1804,7 +2381,17 @@ function DeltaModeWorkspace({
           <button onClick={onOpenInventory} aria-label="Inventory"><ShoppingBag size={18} /></button>
           <button className={activeTool === "settings" ? "picked" : ""} onClick={() => setActiveTool(activeTool === "settings" ? undefined : "settings")} aria-label="Delta settings"><Settings size={18} /></button>
           <button className={activeTool === "history" ? "picked" : ""} onClick={() => setActiveTool(activeTool === "history" ? undefined : "history")} aria-label="Delta history"><History size={18} /></button>
+          <button className="delta-end-engagement" onClick={startFinishFlow} disabled={finishLoading}>{finishLoading ? "Finishing..." : "End Engagement"}</button>
         </nav>
+        <div className={`delta-turn-queue-wrap ${turnQueueEdges.left ? "show-left" : ""} ${turnQueueEdges.right ? "show-right" : ""}`}>
+          <div className="delta-turn-queue" aria-label="Turn order" ref={turnQueueRef} onScroll={updateTurnQueueEdges}>
+            {turnQueue.map((entity, index) => (
+              <span className={`${relationshipForEntity(entity)} ${index === 0 ? "active" : ""}`} key={entity.id}>
+                {entity.orderIndex + 1}. {namesByEntityId.get(entity.id) ?? entity.name}
+              </span>
+            ))}
+          </div>
+        </div>
         {activeTool && activeTool !== "actions" && (
           <section className="delta-tool-panel">
             {activeTool === "entities" && (
@@ -1871,7 +2458,7 @@ function DeltaModeWorkspace({
                   </section>
                 )}
                 <div className="delta-entity-list">
-                  {entities.map((entity) => {
+                  {orderedEntities.map((entity) => {
                     const hp = entity.currentHp ?? 0;
                     const maxHp = entity.maxHp || 1;
                     const displayName = namesByEntityId.get(entity.id) ?? entity.name;
@@ -1882,22 +2469,22 @@ function DeltaModeWorkspace({
                           className={`delta-entity ${relationship} ${entity.id === playerEntityId ? "player" : ""} ${selectedEntityIds.has(entity.id) ? "selected" : ""}`}
                           onClick={() => pendingEntityMacro ? toggleSelectedEntity(entity.id) : setExpandedEntityId(expandedEntityId === entity.id ? undefined : entity.id)}
                         >
+                          <small className="delta-initiative">{entity.initiative ?? "-"}</small>
                           <span>{displayName}{entity.templateTag && <small className="delta-template-tag">{entity.templateTag}</small>}</span>
                           <div className="delta-hp"><i style={{ width: `${Math.max(0, Math.min(100, (hp / maxHp) * 100))}%` }} /></div>
                           <small>{hp}/{maxHp} HP</small>
-                          <select
-                            value={relationship}
-                            onClick={(event) => event.stopPropagation()}
-                            onChange={(event) => void updateEntityRelationship(entity, event.target.value as DeltaRelationship)}
-                          >
-                            {deltaRelationships.map((value) => <option key={value} value={value}>{deltaRelationshipLabel(value)}</option>)}
-                          </select>
+                          <small className="delta-relationship-label">{deltaRelationshipLabel(relationship)}</small>
                         {entityPositionLabel(entity) && <small className="delta-position">{entityPositionLabel(entity)}</small>}
                         <small className="delta-status">{entity.statusText || "No status"}</small>
                       </div>
                       {expandedEntityId === entity.id && (
                         <div className="delta-entity-detail">
                           <p>{entity.statusText || "No current Delta status."}</p>
+                          <label>Relationship
+                            <select value={relationship} onChange={(event) => void updateEntityRelationship(entity, event.target.value as DeltaRelationship)}>
+                              {deltaRelationships.map((value) => <option key={value} value={value}>{deltaRelationshipLabel(value)}</option>)}
+                            </select>
+                          </label>
                           <label>Character data
                             <select value={entity.characterId ?? ""} onChange={(event) => { if (event.target.value) void linkCharacterToEntity(entity, event.target.value); }}>
                               <option value="">Not linked</option>
@@ -1949,7 +2536,6 @@ function DeltaModeWorkspace({
             {activeTool === "history" && (
               <div className="stack">
                 <div className="section-title"><h2>Delta History</h2><span>{archivedSessions.length}</span></div>
-                <button onClick={startFinishFlow} disabled={finishLoading}>{finishLoading ? "Finishing..." : "Finish Engagement"}</button>
                 {finishError && <p className="import-errors">{finishError}</p>}
                 <div className="delta-history-list">
                   {archivedSessions.length === 0 && <p className="notice">No archived Delta engagements for this chat yet.</p>}
@@ -1966,33 +2552,64 @@ function DeltaModeWorkspace({
         )}
         <div className="delta-body">
           <div className="delta-messages">
-            {messages.map((message) => (
-              <article className={`message ${message.role === "user" ? "user" : "assistant"}`} key={message.id}>
-                <div className="message-body"><MarkdownText text={message.body} /></div>
-              </article>
-            ))}
+            {messages.map((message) => {
+              if (message.role === "system") {
+                const initiativeLines = message.body.startsWith("Initiative order:")
+                  ? message.body.split("\n").slice(1).filter((line) => line.trim())
+                  : [];
+                return (
+                  <article className="delta-log-brief" key={message.id}>
+                    {initiativeLines.length > 0 ? (
+                      <div className="delta-initiative-list">
+                        <strong>Initiative order</strong>
+                        {initiativeLines.map((line) => (
+                          <span className={relationshipForInitiativeLine(line)} key={line}>{line}</span>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="message-body"><MarkdownText text={message.body} /></div>
+                    )}
+                  </article>
+                );
+              }
+              const cinematicSplit = splitDeltaCinematic(message.body);
+              const bodyText = cinematicSplit.turn || message.body;
+              const rowEntity = session.initiativeStarted && orderedEntities.length > 0
+                ? orderedEntities[displayedTurnNumber % orderedEntities.length]
+                : undefined;
+              displayedTurnNumber += 1;
+              return (
+                <Fragment key={message.id}>
+                  {cinematicSplit.cinematic && (
+                    <article className="delta-cinematic-beat">
+                      <span className="delta-log-number delta-cinematic-icon">{cinematicMarker()}</span>
+                      <div className="message-body"><DeltaTurnText text={cinematicSplit.cinematic} /></div>
+                    </article>
+                  )}
+                  <article className={`delta-log-row ${message.role === "user" ? "user" : "assistant"} ${relationshipForEntity(rowEntity)}`}>
+                    <span className="delta-log-number">{String(displayedTurnNumber).padStart(2, "0")}</span>
+                    <div className="message-body"><DeltaTurnText text={bodyText} /></div>
+                  </article>
+                </Fragment>
+              );
+            })}
           </div>
         </div>
-        <section className="composer delta-composer">
-          <button type="button" onClick={() => { setDiceOpen(false); setActiveTool(activeTool === "actions" ? undefined : "actions"); }}><Zap size={18} /> Actions</button>
-          <button type="button" onClick={() => { setActiveTool(undefined); setDiceOpen(!diceOpen); }} aria-label="Open dice roller" title="Dice"><Dices size={18} /></button>
-          <textarea ref={composerRef} value={body} onChange={(event) => setBody(event.target.value)} placeholder="Write Delta message" rows={2} />
-          <button className="send-button" onClick={send}>Send</button>
-        </section>
-        {diceOpen && (
-          <section className="delta-dice-panel">
-            <div className="section-title">
-              <h2>Dice</h2>
-              <button className="icon-button" onClick={() => setDiceOpen(false)} aria-label="Close dice roller"><X size={16} /></button>
-            </div>
-            <div className="dice-grid">
-              {[4, 6, 8, 10, 12, 20, 100].map((sides) => (
-                <button key={sides} type="button" onClick={() => rollDeltaDie(sides)}>d{sides}</button>
-              ))}
-            </div>
-          </section>
+        <div className="delta-current-turn">Turn {currentTurnNumber}: {currentTurnLabel}</div>
+        {session.awaitingPlayerRoll && <div className="delta-floating-prompt roll">{requiredRollText}</div>}
+        {session.awaitingPlayerAction && !session.awaitingPlayerRoll && <div className="delta-floating-prompt">{session.actionPrompt || "What does the player do?"}</div>}
+        {session.awaitingPlayerRoll && deltaDiceImages[session.requiredRollDie ?? 20] && (
+          <button className="delta-roll-image" type="button" onClick={() => rollDeltaDie(session.requiredRollDie ?? 20)} aria-label={`Roll d${session.requiredRollDie ?? 20}`}>
+            <img src={deltaDiceImages[session.requiredRollDie ?? 20]} alt={`d${session.requiredRollDie ?? 20}`} />
+          </button>
         )}
-        {activeTool === "actions" && (
+        <section className="composer delta-composer">
+          <button type="button" onClick={() => { if (session.awaitingPlayerRoll) return; setActiveTool(activeTool === "actions" ? undefined : "actions"); }} disabled={session.awaitingPlayerRoll} aria-label="Actions" title="Actions"><Zap size={18} /></button>
+          <textarea ref={composerRef} value={body} onChange={(event) => setBody(event.target.value)} onFocus={() => keepComposerVisible(composerRef.current)} onClick={() => keepComposerVisible(composerRef.current)} disabled={inputDisabled} placeholder={session.awaitingPlayerRoll ? "Waiting on your roll..." : session.awaitingPlayerAction ? "Write your move" : currentTurn ? `Next: ${currentTurn.name}` : "Write Delta message"} rows={2} />
+          <button className="send-button" onClick={send} disabled={inputDisabled}>Send</button>
+          <button className="delta-next-button" type="button" onClick={nextTurn} disabled={!session.initiativeStarted || session.awaitingPlayerAction || session.awaitingPlayerRoll}>Next</button>
+        </section>
+        {activeTool === "actions" && !session.awaitingPlayerRoll && (
           <section className="delta-actions-panel">
             <div className="section-title">
               <h2>Actions</h2>
@@ -2044,11 +2661,11 @@ function DeltaModeWorkspace({
         </div>
       )}
       {finishPacket && (
-        <div className="modal-backdrop" onClick={() => undefined}>
+        <div className="modal-backdrop delta-finish-backdrop" onClick={() => undefined}>
           <section className="modal delta-finish-modal" onClick={(event) => event.stopPropagation()}>
             <div className="section-title">
               <h2>Finish Engagement</h2>
-              <button className="icon-button" onClick={() => setFinishPacket(undefined)} aria-label="Close finish review"><X size={18} /></button>
+              <button className="icon-button" type="button" onClick={() => setFinishPacket(undefined)} aria-label="Close finish review"><X size={18} /></button>
             </div>
             <section className="stack">
               <h3>Outcome</h3>
@@ -2056,7 +2673,7 @@ function DeltaModeWorkspace({
             </section>
             {finishPacket.lootItems.length > 0 && (
               <section className="stack">
-                <div className="section-title"><h3>Loot</h3><button onClick={pickUpAllLoot}>Pick Up All</button></div>
+                <div className="section-title"><h3>Loot</h3><button type="button" onClick={pickUpAllLoot}>Pick Up All</button></div>
                 <div className="loot-review-list">
                   {finishPacket.lootItems.map((item) => (
                     <div className="loot-review-row" key={item.id}>
@@ -2069,31 +2686,31 @@ function DeltaModeWorkspace({
                         value={item.pickedQuantity}
                         onChange={(event) => updateLootItem(item.id, { pickedQuantity: Number(event.target.value) })}
                       />
-                      <button onClick={() => updateLootItem(item.id, { pickedQuantity: item.quantity })}>Pick Up</button>
-                      <button onClick={() => updateLootItem(item.id, { pickedQuantity: 0 })}>Drop All</button>
+                      <button type="button" onClick={() => updateLootItem(item.id, { pickedQuantity: item.quantity })}>Pick Up</button>
+                      <button type="button" onClick={() => updateLootItem(item.id, { pickedQuantity: 0 })}>Drop All</button>
                     </div>
                   ))}
                 </div>
               </section>
             )}
             <div className="split-actions">
-              <button className="send-button" onClick={() => continueFromFinish(false)}>Continue</button>
-              <button onClick={() => setFinishPacket(undefined)}>Cancel</button>
+              <button className="send-button" type="button" onClick={() => continueFromFinish(false)}>Continue</button>
+              <button type="button" onClick={() => setFinishPacket(undefined)}>Cancel</button>
             </div>
           </section>
         </div>
       )}
       {forfeitConfirmOpen && (
-        <div className="modal-backdrop" onClick={() => setForfeitConfirmOpen(false)}>
+        <div className="modal-backdrop delta-finish-backdrop" onClick={() => setForfeitConfirmOpen(false)}>
           <section className="modal macro-editor" onClick={(event) => event.stopPropagation()}>
             <div className="section-title">
               <h2>Continue in main chat?</h2>
-              <button className="icon-button" onClick={() => setForfeitConfirmOpen(false)} aria-label="Close loot warning"><X size={18} /></button>
+              <button className="icon-button" type="button" onClick={() => setForfeitConfirmOpen(false)} aria-label="Close loot warning"><X size={18} /></button>
             </div>
             <p className="notice">You will forfeit any untouched loot.</p>
             <div className="split-actions">
-              <button className="danger" onClick={() => continueFromFinish(true)}>Continue</button>
-              <button onClick={() => setForfeitConfirmOpen(false)}>Review loot</button>
+              <button className="danger" type="button" onClick={() => continueFromFinish(true)}>Continue</button>
+              <button type="button" onClick={() => setForfeitConfirmOpen(false)}>Review loot</button>
             </div>
           </section>
         </div>
@@ -2370,6 +2987,7 @@ function ChatScreen({
   onRoute,
   selectedModelId,
   models,
+  deltaLocked,
   onOpenDelta,
   onSettingsSaved
 }: {
@@ -2382,6 +3000,7 @@ function ChatScreen({
   onRoute: (route: RouteName) => void;
   selectedModelId: string;
   models: { modelId: string; cosmeticName: string }[];
+  deltaLocked: boolean;
   onOpenDelta: (chat: Chat, startContext: string) => Promise<void>;
   onSettingsSaved: (modelId: string) => Promise<void>;
 }) {
@@ -2408,9 +3027,16 @@ function ChatScreen({
   const [inventoryEnabled, setInventoryEnabled] = useState(project?.inventoryEnabled ?? false);
   const [gearEnabled, setGearEnabled] = useState(project?.gearEnabled ?? false);
   const [attachedImages, setAttachedImages] = useState<File[]>([]);
+  const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
+  const [attachmentError, setAttachmentError] = useState("");
+  const [previewImageIndex, setPreviewImageIndex] = useState<number>();
   const [expandedMessageId, setExpandedMessageId] = useState<string>();
   const [saved, showSaved] = useSavedNotice();
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  const imagePickerRef = useRef<HTMLInputElement>(null);
+  const filePickerRef = useRef<HTMLInputElement>(null);
+  const imagePreviewUrls = useMemo(() => attachedImages.map((file) => ({ file, url: URL.createObjectURL(file) })), [attachedImages]);
+  useEffect(() => () => imagePreviewUrls.forEach((item) => URL.revokeObjectURL(item.url)), [imagePreviewUrls]);
   useEffect(() => {
     setDraftModelId(selectedModelId);
     setIncludeWorld(settings.includeWorld ?? true);
@@ -2435,10 +3061,21 @@ function ChatScreen({
   }, [project?.id, project?.inventoryEnabled, project?.gearEnabled]);
   useEffect(() => {
     const composer = composerRef.current;
-    if (!composer) return;
-    composer.style.height = "auto";
-    composer.style.height = `${Math.min(composer.scrollHeight, 240)}px`;
+    fitComposerTextarea(composer);
+    keepComposerVisible(composer);
   }, [body]);
+  useEffect(() => {
+    const handleViewportChange = () => {
+      fitComposerTextarea(composerRef.current);
+      keepComposerVisible(composerRef.current);
+    };
+    window.visualViewport?.addEventListener("resize", handleViewportChange);
+    window.visualViewport?.addEventListener("scroll", handleViewportChange);
+    return () => {
+      window.visualViewport?.removeEventListener("resize", handleViewportChange);
+      window.visualViewport?.removeEventListener("scroll", handleViewportChange);
+    };
+  }, []);
   async function saveChatSettings() {
     const timestamp = now();
     await db.settings.update("settings", {
@@ -2464,7 +3101,7 @@ function ChatScreen({
     await onSettingsSaved(draftModelId);
   }
 
-  function openRouterPayload(messagesToSend: OpenRouterMessage[], stream: boolean) {
+  function openRouterPayload(messagesToSend: OpenRouterMessage[], stream: boolean, imageContextMessageId?: string, forceImageContextTool = false) {
     const payload: Record<string, unknown> = {
       model: draftModelId,
       messages: messagesToSend,
@@ -2477,11 +3114,14 @@ function ChatScreen({
     if (topPValue !== undefined) payload.top_p = topPValue;
     if (maxTokensValue !== undefined) payload.max_tokens = maxTokensValue;
     const activeTools = [
+      ...deltaImminentTools,
       ...(includeCharacters ? [...characterTools] : []),
       ...(project && project.memoryMode !== "manual" ? [...memoryTools] : []),
-      ...(((project?.inventoryEnabled && autoManageInventory) || (project?.gearEnabled && autoManageGear)) ? [...inventoryTools] : [])
+      ...(((project?.inventoryEnabled && autoManageInventory) || (project?.gearEnabled && autoManageGear)) ? [...inventoryTools] : []),
+      ...(imageContextMessageId ? [...imageContextTools] : [])
     ];
     if (activeTools.length) payload.tools = activeTools;
+    if (forceImageContextTool) payload.tool_choice = { type: "function", function: { name: "save_image_context" } };
     if (stream) payload.stream_options = { include_usage: true };
     return payload;
   }
@@ -2556,8 +3196,8 @@ function ChatScreen({
     return project.inventoryEnabled && autoManageInventory;
   }
 
-  function toolsEnabled() {
-    return includeCharacters || (project?.memoryMode !== "manual") || inventoryToolEnabled("inventory") || inventoryToolEnabled("gear");
+  function toolsEnabled(imageContextMessageId?: string) {
+    return true;
   }
 
 
@@ -2565,7 +3205,7 @@ function ChatScreen({
     const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${settings.apiKey}`,
+        Authorization: `Bearer ${(settings.apiKey ?? "").trim()}`,
         "Content-Type": "application/json",
         "HTTP-Referer": location.origin,
         "X-Title": "Mirror 2.0"
@@ -2683,7 +3323,46 @@ function ChatScreen({
     return { error: `Unknown tool ${toolCall.function.name}.` };
   }
 
-  async function runToolCall(toolCall: OpenRouterToolCall, chatId: string, inventoryUpdates: InventoryUpdateRequest[], sourceMessageIds: string[]) {
+  async function runImageContextTool(toolCall: OpenRouterToolCall, messageId?: string) {
+    if (!messageId) return { error: "No attached image message is available." };
+    let args: Record<string, unknown> = {};
+    try {
+      args = JSON.parse(toolCall.function.arguments || "{}") as Record<string, unknown>;
+    } catch {
+      return { error: "Invalid image context arguments." };
+    }
+    const context = typeof args.context === "string" ? args.context.trim() : "";
+    if (!context) return { error: "Image context is required." };
+    await db.messages.update(messageId, { attachmentContext: context, updatedAt: now() });
+    return { saved: true, context };
+  }
+
+  function runDeltaImminentTool(toolCall: OpenRouterToolCall, proposals: DeltaImminentProposal[]) {
+    let args: Record<string, unknown> = {};
+    try {
+      args = JSON.parse(toolCall.function.arguments || "{}") as Record<string, unknown>;
+    } catch {
+      return { error: "Invalid Delta imminent arguments." };
+    }
+    const brief = typeof args.brief === "string" ? args.brief.trim() : "";
+    if (!brief) return { error: "brief is required." };
+    const proposal: DeltaImminentProposal = {
+      brief,
+      playerCharacterName: typeof args.playerCharacterName === "string" ? args.playerCharacterName.trim() : "",
+      avoidLabel: typeof args.avoidLabel === "string" ? args.avoidLabel.trim() : "",
+      avoidPrompt: typeof args.avoidPrompt === "string" ? args.avoidPrompt.trim() : ""
+    };
+    proposals.push(proposal);
+    return { prepared: true, message: "Delta Mode imminent card queued. Do not continue the engagement in ordinary chat." };
+  }
+
+  async function runToolCall(toolCall: OpenRouterToolCall, chatId: string, inventoryUpdates: InventoryUpdateRequest[], sourceMessageIds: string[], deltaImminentProposals: DeltaImminentProposal[], imageContextMessageId?: string) {
+    if (toolCall.function.name === "prepare_delta_engagement") {
+      return runDeltaImminentTool(toolCall, deltaImminentProposals);
+    }
+    if (toolCall.function.name === "save_image_context") {
+      return runImageContextTool(toolCall, imageContextMessageId);
+    }
     if (toolCall.function.name === "update_inventory_item") {
       return runInventoryTool(toolCall, chatId, inventoryUpdates);
     }
@@ -2693,17 +3372,18 @@ function ChatScreen({
     return runCharacterTool(toolCall);
   }
 
-  async function resolveToolCalls(messagesToSend: OpenRouterMessage[], toolLog: string[], inventoryUpdates: InventoryUpdateRequest[], chatId: string, sourceMessageIds: string[]) {
-    if (!toolsEnabled()) return { messages: messagesToSend, usage: undefined as OpenRouterUsage | undefined };
+  async function resolveToolCalls(messagesToSend: OpenRouterMessage[], toolLog: string[], inventoryUpdates: InventoryUpdateRequest[], chatId: string, sourceMessageIds: string[], imageContextMessageId?: string) {
+    if (!toolsEnabled(imageContextMessageId)) return { messages: messagesToSend, usage: undefined as OpenRouterUsage | undefined };
     let nextMessages = [...messagesToSend];
     let usage: OpenRouterUsage | undefined;
+    const deltaImminentProposals: DeltaImminentProposal[] = [];
     for (let index = 0; index < 4; index += 1) {
-      const response = await openRouterRequest(openRouterPayload(nextMessages, false));
+      const response = await openRouterRequest(openRouterPayload(nextMessages, false, imageContextMessageId, index === 0 && Boolean(imageContextMessageId)));
       const json = await response.json() as OpenRouterResponse;
       usage = json.usage ?? usage;
       const assistantMessage = json.choices?.[0]?.message;
       const toolCalls = assistantMessage?.tool_calls ?? [];
-      if (!toolCalls.length) return { messages: nextMessages, assistantMessage, usage };
+      if (!toolCalls.length) return { messages: nextMessages, assistantMessage, usage, deltaImminentProposal: deltaImminentProposals[deltaImminentProposals.length - 1] };
       nextMessages = [
         ...nextMessages,
         {
@@ -2713,7 +3393,7 @@ function ChatScreen({
         }
       ];
       for (const toolCall of toolCalls) {
-        const result = await runToolCall(toolCall, chatId, inventoryUpdates, sourceMessageIds);
+        const result = await runToolCall(toolCall, chatId, inventoryUpdates, sourceMessageIds, deltaImminentProposals, imageContextMessageId);
         toolLog.push(toolCall.function.name);
         nextMessages.push({
           role: "tool",
@@ -2721,20 +3401,74 @@ function ChatScreen({
           content: JSON.stringify(result)
         });
       }
+      if (imageContextMessageId && toolCalls.some((toolCall) => toolCall.function.name === "save_image_context")) {
+        nextMessages = nextMessages.map((message) => {
+          if (!Array.isArray(message.content)) return message;
+          const text = message.content.find((part) => typeof part === "object" && part !== null && "type" in part && (part as { type?: string }).type === "text") as { text?: string } | undefined;
+          return { ...message, content: text?.text ?? "" };
+        });
+      }
     }
-    return { messages: nextMessages, usage };
+    return { messages: nextMessages, usage, deltaImminentProposal: deltaImminentProposals[deltaImminentProposals.length - 1] };
   }
 
-  async function completeWithTools(messagesToSend: OpenRouterMessage[], toolLog: string[], inventoryUpdates: InventoryUpdateRequest[], chatId: string, sourceMessageIds: string[]) {
-    const resolved = await resolveToolCalls(messagesToSend, toolLog, inventoryUpdates, chatId, sourceMessageIds);
+  async function completeWithTools(messagesToSend: OpenRouterMessage[], toolLog: string[], inventoryUpdates: InventoryUpdateRequest[], chatId: string, sourceMessageIds: string[], imageContextMessageId?: string) {
+    const resolved = await resolveToolCalls(messagesToSend, toolLog, inventoryUpdates, chatId, sourceMessageIds, imageContextMessageId);
     const replyText = typeof resolved.assistantMessage?.content === "string" ? resolved.assistantMessage.content : "";
     return {
       replyText,
       inputTokens: resolved.usage?.prompt_tokens,
-      outputTokens: resolved.usage?.completion_tokens
+      outputTokens: resolved.usage?.completion_tokens,
+      deltaImminentProposal: resolved.deltaImminentProposal
     };
   }
+  async function createDeltaBrief(command: string, activeChat: Chat) {
+    const activeProject = project;
+    if (!activeProject) return { brief: command, playerCharacterName: "" };
+    const history = await db.messages
+      .where("[chatId+branchId+sequence]")
+      .between([activeChat.id, activeChat.activeBranchId, Dexie.minKey], [activeChat.id, activeChat.activeBranchId, Dexie.maxKey])
+      .toArray();
+    const recent = history.sort((a, b) => a.sequence - b.sequence).slice(-8);
+    const fallbackSource = [...recent].reverse().find((message) => message.role === "assistant")?.body || command;
+    const fallbackBrief = fallbackSource.length > 1400 ? `${fallbackSource.slice(0, 1400).trim()}...` : fallbackSource;
+    if (!settings.apiKey?.trim() || !draftModelId) return { brief: fallbackBrief, playerCharacterName: "" };
+    try {
+      const response = await openRouterRequest({
+        model: draftModelId,
+        messages: [
+          {
+            role: "system",
+            content: [
+              "Create a concise immersive Delta Brief from the recent chat context. Return only valid JSON.",
+              "Shape: {\"brief\":\"\",\"playerCharacterName\":\"\",\"avoidLabel\":\"\",\"avoidPrompt\":\"\"}",
+              "brief: short in-world setup with who, what, where, why, objective, named allies, and named hostiles. Do not speak as an assistant. Do not ask a question.",
+              "playerCharacterName: the likely player-controlled character name if the context implies one; otherwise use the lead/protagonist character name; otherwise empty.",
+              "avoidLabel: use Cancel for a proposed mission/commitment, Escape for immediate danger, or empty if avoidance does not make sense.",
+              "avoidPrompt: short question for what the player does to avoid or cancel the engagement."
+            ].join("\n")
+          },
+          {
+            role: "user",
+            content: [
+              activeProject.worldSetting ? `World setting:\n${activeProject.worldSetting}` : "",
+              `Recent chat:\n${recent.map((message) => `${message.role}: ${message.body}`).join("\n\n")}`,
+              `User command:\n${command}`
+            ].filter(Boolean).join("\n\n")
+          }
+        ],
+        temperature: 0,
+        top_p: 0
+      });
+      const json = await response.json() as OpenRouterResponse;
+      const packet = parseDeltaBriefPacket(json.choices?.[0]?.message?.content ?? "");
+      return { brief: packet.brief || fallbackBrief, playerCharacterName: packet.playerCharacterName, avoidLabel: packet.avoidLabel, avoidPrompt: packet.avoidPrompt };
+    } catch {
+      return { brief: fallbackBrief, playerCharacterName: "" };
+    }
+  }
   async function send() {
+    if (deltaLocked) return;
     if (!project || !body.trim()) return;
     const text = body.trim();
     if (isDeltaModeRequest(text)) {
@@ -2745,8 +3479,21 @@ function ChatScreen({
         deltaChat = await db.chats.get(deltaChatId);
         if (!deltaChat) return;
         await onChatCreated(deltaChatId);
+      } else {
+        await addMessage(deltaChat.id, deltaChat.activeBranchId, "user", text);
       }
-      await onOpenDelta(deltaChat, text);
+      const brief = await createDeltaBrief(text, deltaChat);
+      await addMessage(deltaChat.id, deltaChat.activeBranchId, "assistant", `### Δ Delta mode imminent...\n\n${brief.brief}`).then((message) => db.messages.update(message.id, {
+        deltaBrief: {
+          status: "pending",
+          brief: brief.brief,
+          playerCharacterName: brief.playerCharacterName,
+          avoidLabel: brief.avoidLabel,
+          avoidPrompt: brief.avoidPrompt
+        },
+        updatedAt: now()
+      }));
+      await onRefresh();
       return;
     }
     if (!settings.apiKey) {
@@ -2757,20 +3504,50 @@ function ChatScreen({
       alert("Choose a model before sending.");
       return;
     }
+    let images: { dataUrl: string; mimeType: string }[] = [];
+    let attachedFileDetails = "";
+    try {
+      images = await Promise.all(attachedImages.map(imageForOpenRouter));
+      attachedFileDetails = await chatFileContext(attachedFiles);
+    } catch (error) {
+      setAttachmentError(error instanceof Error ? error.message : "Could not prepare the attachment.");
+      return;
+    }
+    setAttachmentError("");
     setBody("");
     let chatId = chat?.id;
     let branchId = chat?.activeBranchId;
+    let userMessageId: string | undefined;
     let createdChatId: string | undefined;
+    let requestFailed = false;
     if (!chatId || !branchId) {
       chatId = await createChat(project.id, text);
       createdChatId = chatId;
       const created = await db.chats.get(chatId);
       branchId = created?.activeBranchId;
+      userMessageId = (await db.messages
+        .where("[chatId+branchId+sequence]")
+        .between([chatId, branchId!, Dexie.minKey], [chatId, branchId!, Dexie.maxKey])
+        .last())?.id;
       await onChatCreated(chatId);
     } else {
-      await addMessage(chatId, branchId, "user", text);
+      userMessageId = (await addMessage(chatId, branchId, "user", text)).id;
     }
     if (chatId && branchId) {
+      if (userMessageId && (attachedImages.length || attachedFiles.length)) {
+        const timestamp = now();
+        await db.attachments.bulkAdd([...attachedImages, ...attachedFiles].map((file) => ({
+          id: uid(),
+          ownerType: "message" as const,
+          ownerId: userMessageId!,
+          name: file.name,
+          mimeType: file.type || "application/octet-stream",
+          size: file.size,
+          blob: file,
+          createdAt: timestamp,
+          updatedAt: timestamp
+        })));
+      }
       const sourceFiles = includeSourceFiles
         ? await db.sourceFiles.where("projectId").equals(project.id).and((file) => Boolean(file.textContent)).toArray()
         : [];
@@ -2785,20 +3562,20 @@ function ChatScreen({
       const memoryDetails = await memoryContext(text, selectedHistory);
       const systemParts = [
         `Project: ${project.name}`,
+        "Delta Mode boundary: the main chat must not run structured fights, hostile standoffs, tactical engagements, mission commitments, or combat-like confrontations as ordinary roleplay once they become imminent. When the current reply would initiate or clearly commit to that kind of engagement, call prepare_delta_engagement with a short immersive setup instead of continuing the scene as normal chat. Use this only when the engagement is imminent, not for ordinary tension.",
         includeInstructions && project.instructions ? `Project instructions:\n${project.instructions}` : "",
         includeWorld && project.worldSetting ? `World setting:\n${project.worldSetting}` : "",
         compactionEnabled && activeChat?.compactionMemory ? `Compaction memory:\n${activeChat.compactionMemory}` : "",
         sourceFiles.length ? `Source files:\n${sourceFiles.map((file) => `# ${file.name}\n${file.textContent}`).join("\n\n")}` : "",
+        attachedFileDetails,
+        images.length ? "An image is attached to the latest user message. First call save_image_context exactly once with a detailed concise visual extraction. It is hidden from the user. Then answer the user normally from the image." : "",
         memoryDetails,
         inventoryDetails
       ].filter(Boolean);
-      const images = await Promise.all(attachedImages.map(fileToDataUrl));
+      const historyContent = chatHistoryContent(selectedHistory, userMessageId, images);
       const requestMessages: OpenRouterMessage[] = [
         ...(systemParts.length ? [{ role: "system" as const, content: systemParts.join("\n\n") }] : []),
-        ...selectedHistory.map((message) => ({
-          role: (message.role === "system" ? "system" : message.role === "assistant" ? "assistant" : "user") as OpenRouterMessage["role"],
-          content: message.id === allHistory[allHistory.length - 1]?.id ? openRouterContent(message.body, images) : message.body
-        }))
+        ...historyContent
       ];
       const toolLog: string[] = [];
       const inventoryUpdates: InventoryUpdateRequest[] = [];
@@ -2822,28 +3599,38 @@ function ChatScreen({
           `Confirm inventory: ${confirmInventoryUpdates ? "on" : "off"}`,
           `Auto gear: ${inventoryToolEnabled("gear") ? "on" : "off"}`,
           `Confirm gear: ${confirmGearUpdates ? "on" : "off"}`,
-          `Images: ${attachedImages.length}`
+          `Images: ${attachedImages.length}`,
+          `Files: ${attachedFiles.length}`
         ],
         toolCalls: toolLog,
         inventoryUpdates
       };
-      const canStreamDirectly = streamingEnabled && !toolsEnabled();
+      const canStreamDirectly = streamingEnabled && !toolsEnabled(images.length ? userMessageId : undefined);
       const reply = await addMessage(chatId, branchId, "assistant", canStreamDirectly ? "" : "...");
       await db.messages.update(reply.id, { modelId: draftModelId, status: canStreamDirectly ? "streaming" : "pending", requestInfo });
       await onRefresh();
       try {
-        if (toolsEnabled()) {
-          const completed = await completeWithTools(requestMessages, toolLog, inventoryUpdates, chatId, selectedHistory.map((message) => message.id));
+        if (toolsEnabled(images.length ? userMessageId : undefined)) {
+          const completed = await completeWithTools(requestMessages, toolLog, inventoryUpdates, chatId, selectedHistory.map((message) => message.id), images.length ? userMessageId : undefined);
+          const deltaProposal = completed.deltaImminentProposal;
           await db.messages.update(reply.id, {
-            body: completed.replyText || "(No response text returned.)",
+            body: deltaProposal ? `### Δ Delta mode imminent...\n\n${deltaProposal.brief}` : completed.replyText || "(No response text returned.)",
+            deltaBrief: deltaProposal ? {
+              status: "pending",
+              brief: deltaProposal.brief,
+              playerCharacterName: deltaProposal.playerCharacterName,
+              avoidLabel: deltaProposal.avoidLabel || "Escape",
+              avoidPrompt: deltaProposal.avoidPrompt || "What do you do to avoid the engagement?"
+            } : undefined,
             inputTokens: completed.inputTokens,
-            outputTokens: completed.outputTokens ?? estimateTokens(completed.replyText),
+            outputTokens: completed.outputTokens ?? estimateTokens(deltaProposal?.brief ?? completed.replyText),
             estimatedTokens: !completed.outputTokens,
             status: "complete",
             requestInfo: { ...requestInfo, toolCalls: toolLog.length ? toolLog : ["None"], inventoryUpdates },
             updatedAt: now()
           });
           setAttachedImages([]);
+          setAttachedFiles([]);
           if (createdChatId) await onChatCreated(createdChatId);
           else await onRefresh();
           return;
@@ -2890,15 +3677,21 @@ function ChatScreen({
           });
         }
       } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown error";
+        requestFailed = true;
+        setAttachmentError(message.includes("\"code\":401") ? "OpenRouter rejected the saved API key for this request. Re-save your OpenRouter key in API Settings, then resend the attached message." : message);
         await db.messages.update(reply.id, {
-          body: "OpenRouter request failed.",
-          error: error instanceof Error ? error.message : "Unknown error",
+          body: `OpenRouter request failed: ${message}`,
+          error: message,
           status: "failed",
           updatedAt: now()
         });
       }
     }
-    setAttachedImages([]);
+    if (!requestFailed) {
+      setAttachedImages([]);
+      setAttachedFiles([]);
+    }
     if (createdChatId) await onChatCreated(createdChatId);
     else await onRefresh();
   }
@@ -2963,21 +3756,22 @@ function ChatScreen({
     const limitedHistory = historyLimit ? orderedHistory.slice(-historyLimit) : orderedHistory;
     const selectedHistory = limitedHistory.some((row) => row.id === promptMessage.id) ? limitedHistory : [...limitedHistory, promptMessage].sort((a, b) => a.sequence - b.sequence);
     const memoryDetails = await memoryContext(promptMessage.body, selectedHistory);
+    const resendImages = promptMessage.attachmentContext ? [] : await storedMessageImages(promptMessage.id);
     const systemParts = [
       `Project: ${project.name}`,
+      "Delta Mode boundary: the main chat must not run structured fights, hostile standoffs, tactical engagements, mission commitments, or combat-like confrontations as ordinary roleplay once they become imminent. When the current reply would initiate or clearly commit to that kind of engagement, call prepare_delta_engagement with a short immersive setup instead of continuing the scene as normal chat. Use this only when the engagement is imminent, not for ordinary tension.",
       includeInstructions && project.instructions ? `Project instructions:\n${project.instructions}` : "",
       includeWorld && project.worldSetting ? `World setting:\n${project.worldSetting}` : "",
       compactionEnabled && activeChat?.compactionMemory ? `Compaction memory:\n${activeChat.compactionMemory}` : "",
       sourceFiles.length ? `Source files:\n${sourceFiles.map((file) => `# ${file.name}\n${file.textContent}`).join("\n\n")}` : "",
+      resendImages.length ? "An image is attached to the latest user message. First call save_image_context exactly once with a detailed concise visual extraction. It is hidden from the user. Then answer the user normally from the image." : "",
       memoryDetails,
       inventoryDetails
     ].filter(Boolean);
+    const historyContent = chatHistoryContent(selectedHistory, promptMessage.id, resendImages);
     const requestMessages: OpenRouterMessage[] = [
       ...(systemParts.length ? [{ role: "system" as const, content: systemParts.join("\n\n") }] : []),
-      ...selectedHistory.map((historyMessage) => ({
-        role: (historyMessage.role === "system" ? "system" : historyMessage.role === "assistant" ? "assistant" : "user") as OpenRouterMessage["role"],
-        content: historyMessage.body
-      }))
+      ...historyContent
     ];
     const toolLog: string[] = [];
     const inventoryUpdates: InventoryUpdateRequest[] = [];
@@ -3017,7 +3811,7 @@ function ChatScreen({
         await db.stars.where("messageId").anyOf(messageIds).delete();
         await db.messages.bulkDelete(messageIds);
       }
-      const canStreamDirectly = streamingEnabled && !toolsEnabled();
+      const canStreamDirectly = streamingEnabled && !toolsEnabled(resendImages.length ? promptMessage.id : undefined);
       reply = await addMessage(chatId, branchId, "assistant", canStreamDirectly ? "" : "...");
       await db.messages.update(reply.id, { modelId: draftModelId, status: canStreamDirectly ? "streaming" : "pending", requestInfo });
       await db.chats.update(chatId, { updatedAt: timestamp });
@@ -3025,12 +3819,20 @@ function ChatScreen({
     if (!reply) return;
     await onRefresh();
     try {
-      if (toolsEnabled()) {
-        const completed = await completeWithTools(requestMessages, toolLog, inventoryUpdates, chatId, selectedHistory.map((message) => message.id));
+      if (toolsEnabled(resendImages.length ? promptMessage.id : undefined)) {
+        const completed = await completeWithTools(requestMessages, toolLog, inventoryUpdates, chatId, selectedHistory.map((message) => message.id), resendImages.length ? promptMessage.id : undefined);
+        const deltaProposal = completed.deltaImminentProposal;
         await db.messages.update(reply.id, {
-          body: completed.replyText || "(No response text returned.)",
+          body: deltaProposal ? `### Δ Delta mode imminent...\n\n${deltaProposal.brief}` : completed.replyText || "(No response text returned.)",
+          deltaBrief: deltaProposal ? {
+            status: "pending",
+            brief: deltaProposal.brief,
+            playerCharacterName: deltaProposal.playerCharacterName,
+            avoidLabel: deltaProposal.avoidLabel || "Escape",
+            avoidPrompt: deltaProposal.avoidPrompt || "What do you do to avoid the engagement?"
+          } : undefined,
           inputTokens: completed.inputTokens,
-          outputTokens: completed.outputTokens ?? estimateTokens(completed.replyText),
+          outputTokens: completed.outputTokens ?? estimateTokens(deltaProposal?.brief ?? completed.replyText),
           estimatedTokens: !completed.outputTokens,
           status: "complete",
           requestInfo: { ...requestInfo, toolCalls: toolLog.length ? toolLog : ["None"], inventoryUpdates },
@@ -3121,8 +3923,116 @@ function ChatScreen({
     await onRefresh();
   }
 
+  async function avoidDeltaBrief(message: Message, attempt: string) {
+    const clean = attempt.trim();
+    const brief = message.deltaBrief;
+    if (!project || !chat || !clean || !brief) return;
+    if (!settings.apiKey) {
+      alert("Add your OpenRouter API key before resolving this.");
+      return;
+    }
+    if (!draftModelId) {
+      alert("Choose a model before resolving this.");
+      return;
+    }
+    const userAttempt = await addMessage(message.chatId, message.branchId, "user", clean);
+    await db.messages.update(message.id, { deltaBrief: undefined, updatedAt: now() });
+    const pending = await addMessage(message.chatId, message.branchId, "assistant", "...");
+    await db.messages.update(pending.id, { modelId: draftModelId, status: "pending", updatedAt: now() });
+    await onRefresh();
+    try {
+      const history = await db.messages
+        .where("[chatId+branchId+sequence]")
+        .between([message.chatId, message.branchId, Dexie.minKey], [message.chatId, message.branchId, userAttempt.sequence])
+        .toArray();
+      const recent = history.sort((a, b) => a.sequence - b.sequence).slice(-10);
+      const response = await openRouterRequest({
+        model: draftModelId,
+        messages: [
+          {
+            role: "system",
+            content: [
+              "Resolve the player's attempt to avoid an imminent Delta Mode engagement. Return only valid JSON.",
+              "Shape: {\"escaped\":false,\"responseText\":\"\"}",
+              "Always include an automatic in-world dice roll in responseText, such as Rolling 1d20 + CHA... *6 + 1 =* **7**. Success/failure should fit the attempt and scene.",
+              "If escaped is true, the imminent engagement is cancelled or avoided for now and responseText should hand back to normal roleplay.",
+              "If escaped is false, the engagement remains imminent and responseText should end with pressure that makes Begin Engagement the remaining path.",
+              "Do not speak as an assistant. Keep it immersive and concise."
+            ].join("\n")
+          },
+          {
+            role: "user",
+            content: [
+              `Project: ${project.name}`,
+              includeWorld && project.worldSetting ? `World setting:\n${project.worldSetting}` : "",
+              `Imminent engagement setup:\n${brief.brief}`,
+              `Recent chat:\n${recent.map((row) => `${row.role}: ${row.body}`).join("\n\n")}`,
+              `Player attempt:\n${clean}`
+            ].filter(Boolean).join("\n\n")
+          }
+        ],
+        temperature: 0,
+        top_p: 0
+      });
+      const json = await response.json() as OpenRouterResponse;
+      const packet = parseDeltaAvoidPacket(json.choices?.[0]?.message?.content ?? "");
+      await db.messages.update(pending.id, {
+        body: packet.responseText || "(No response text returned.)",
+        deltaBrief: packet.escaped ? undefined : {
+          status: "pending",
+          brief: brief.brief,
+          playerCharacterName: brief.playerCharacterName,
+          avoidLabel: undefined,
+          avoidPrompt: undefined
+        },
+        status: "complete",
+        updatedAt: now()
+      });
+    } catch (error) {
+      await db.messages.update(pending.id, {
+        body: "OpenRouter request failed.",
+        error: error instanceof Error ? error.message : "Unknown error",
+        status: "failed",
+        updatedAt: now()
+      });
+    }
+    await onRefresh();
+  }
+
+  async function beginDeltaBrief(message: Message) {
+    const brief = message.deltaBrief;
+    if (!brief || brief.status !== "pending") return;
+    const deltaChat = await db.chats.get(message.chatId);
+    if (!deltaChat) return;
+    const timestamp = now();
+    await db.messages.update(message.id, {
+      deltaBrief: { ...brief, status: "started", startedAt: timestamp },
+      updatedAt: timestamp
+    });
+    await onRefresh();
+    await onOpenDelta(deltaChat, [
+      `DELTA BRIEF:\n${brief.brief}`,
+      brief.playerCharacterName ? `PLAYER CHARACTER:\n${brief.playerCharacterName}` : ""
+    ].filter(Boolean).join("\n\n"));
+  }
+
   if (!project) {
     return <EmptyState title="Choose a project" body="Open the sidebar and select a project before starting a chat." />;
+  }
+
+  function chooseImages(files: FileList | null) {
+    const next = Array.from(files ?? []).filter((file) => file.type.startsWith("image/"));
+    if (!next.length) return;
+    setAttachedImages((current) => [...current, ...next]);
+    setAttachmentError("");
+    setContextOpen(false);
+  }
+  function chooseFiles(files: FileList | null) {
+    const next = Array.from(files ?? []);
+    if (!next.length) return;
+    setAttachedFiles((current) => [...current, ...next]);
+    setAttachmentError("");
+    setContextOpen(false);
   }
 
   return (
@@ -3139,14 +4049,18 @@ function ChatScreen({
             onEdit={editMessage}
             onResend={resendFromMessage}
             onInventoryUpdateAction={handleInventoryUpdateAction}
+            onBeginDeltaBrief={beginDeltaBrief}
+            onAvoidDeltaBrief={avoidDeltaBrief}
+            deltaLocked={deltaLocked}
+            onOpenChatSettings={() => { setContextOpen(true); setChatSettingsOpen(true); }}
             onRefresh={onRefresh}
           />
         ))}
       </div>
-      <section className="composer">
+      <section className={`composer ${deltaLocked ? "locked" : ""}`}>
+        {deltaLocked && <div className="composer-lock">Resolve engagement to unlock chat.</div>}
         {contextOpen && (
           <div className="context-popover">
-            <label className="file-pick"><ImageIcon size={18} /> Attach image<input type="file" accept="image/*" multiple onChange={(event) => setAttachedImages(Array.from(event.target.files ?? []))} /></label>
             <button className="drawer-action-row" type="button" onClick={() => setChatSettingsOpen(!chatSettingsOpen)}>
               <Settings size={18} /> Chat settings
             </button>
@@ -3207,15 +4121,35 @@ function ChatScreen({
                 </div>
               </div>
             )}
-            {attachedImages.length > 0 && <small>{attachedImages.length} image(s) ready</small>}
+            <button className="drawer-action-row" type="button" onClick={() => imagePickerRef.current?.click()}><ImageIcon size={18} /> Attach Image</button>
+            <button className="drawer-action-row" type="button" onClick={() => filePickerRef.current?.click()}><Paperclip size={18} /> Attach File</button>
+            <input ref={filePickerRef} className="visually-hidden" type="file" multiple onChange={(event) => { chooseFiles(event.target.files); event.currentTarget.value = ""; }} />
+            <input ref={imagePickerRef} className="visually-hidden" type="file" accept="image/*" multiple onChange={(event) => { chooseImages(event.target.files); event.currentTarget.value = ""; }} />
           </div>
         )}
-        <button className="composer-plus" onClick={() => setContextOpen(!contextOpen)} aria-label="Chat settings and attachments">
+        {(imagePreviewUrls.length > 0 || attachedFiles.length > 0 || attachmentError) && (
+          <div className="composer-attachments">
+            {imagePreviewUrls.map((item, index) => (
+              <div className="composer-image-thumb" key={`${item.file.name}-${index}`}>
+                <button type="button" onClick={() => setPreviewImageIndex(previewImageIndex === index ? undefined : index)} aria-label={`Preview ${item.file.name}`}><img src={item.url} alt="" /></button>
+                <button type="button" className="attachment-remove" onClick={() => setAttachedImages((current) => current.filter((_, itemIndex) => itemIndex !== index))} aria-label={`Remove ${item.file.name}`}><X size={13} /></button>
+              </div>
+            ))}
+            {attachedFiles.map((file, index) => (
+              <div className="composer-file-chip" key={`${file.name}-${index}`}><Paperclip size={14} /><span>{file.name}</span><button type="button" className="attachment-remove" onClick={() => setAttachedFiles((current) => current.filter((_, itemIndex) => itemIndex !== index))} aria-label={`Remove ${file.name}`}><X size={13} /></button></div>
+            ))}
+            {attachmentError && <small className="error">{attachmentError}</small>}
+          </div>
+        )}
+        <button className="composer-plus" onClick={() => setContextOpen(!contextOpen)} disabled={deltaLocked} aria-label="Chat settings and attachments">
           <Plus size={20} />
         </button>
-        <textarea ref={composerRef} className="composer-input" value={body} onChange={(event) => setBody(event.target.value)} placeholder="Message this project" rows={1} />
-        <button className="send-button" onClick={send}>Send</button>
+        <textarea ref={composerRef} className="composer-input" value={body} onChange={(event) => setBody(event.target.value)} onFocus={() => keepComposerVisible(composerRef.current)} onClick={() => keepComposerVisible(composerRef.current)} disabled={deltaLocked} placeholder={deltaLocked ? "Resolve engagement to unlock chat." : "Message this project"} rows={1} />
+        <button className="send-button" onClick={send} disabled={deltaLocked}>Send</button>
       </section>
+      {previewImageIndex !== undefined && imagePreviewUrls[previewImageIndex] && (
+        <button className="composer-image-viewer" type="button" onClick={() => setPreviewImageIndex(undefined)} aria-label="Close image preview"><img src={imagePreviewUrls[previewImageIndex].url} alt="Attached preview" /></button>
+      )}
     </div>
   );
 }
@@ -3228,6 +4162,10 @@ function MessageRow({
   onEdit,
   onResend,
   onInventoryUpdateAction,
+  onBeginDeltaBrief,
+  onAvoidDeltaBrief,
+  deltaLocked,
+  onOpenChatSettings,
   onRefresh
 }: {
   projectId: string;
@@ -3237,12 +4175,52 @@ function MessageRow({
   onEdit: (message: Message, nextBody: string) => Promise<Message>;
   onResend: (message: Message) => Promise<void>;
   onInventoryUpdateAction: (message: Message, action: "confirm" | "edit" | "reject") => Promise<void>;
+  onBeginDeltaBrief: (message: Message) => Promise<void>;
+  onAvoidDeltaBrief: (message: Message, attempt: string) => Promise<void>;
+  deltaLocked: boolean;
+  onOpenChatSettings: () => void;
   onRefresh: () => Promise<void>;
 }) {
   const [infoOpen, setInfoOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
   const [draftBody, setDraftBody] = useState(message.body);
+  const [editAttachmentMenuOpen, setEditAttachmentMenuOpen] = useState(false);
+  const [editAttachments, setEditAttachments] = useState<{ id: string; name?: string; mimeType: string; url: string }[]>([]);
+  const [editImageIndex, setEditImageIndex] = useState<number>();
+  const [deleteAttachmentId, setDeleteAttachmentId] = useState<string>();
+  const [avoidOpen, setAvoidOpen] = useState(false);
+  const [avoidText, setAvoidText] = useState("");
+  const [avoidSaving, setAvoidSaving] = useState(false);
+  const [deltaCharacters, setDeltaCharacters] = useState<Character[]>([]);
+  const editImagePickerRef = useRef<HTMLInputElement>(null);
+  const editFilePickerRef = useRef<HTMLInputElement>(null);
+  const attachmentPressTimer = useRef<number>();
   useEffect(() => setDraftBody(message.body), [message.id, message.body]);
+  async function loadDeltaCharacters() {
+    const rows = await db.characters.where("projectId").equals(projectId).toArray();
+    setDeltaCharacters(rows.sort((a, b) => (a.orderIndex ?? Number.MAX_SAFE_INTEGER) - (b.orderIndex ?? Number.MAX_SAFE_INTEGER) || a.normalisedName.localeCompare(b.normalisedName)));
+  }
+  useEffect(() => {
+    if (message.deltaBrief?.status !== "pending") return;
+    void loadDeltaCharacters();
+  }, [message.id, message.deltaBrief?.status, projectId]);
+  useEffect(() => {
+    if (!editOpen) return;
+    let alive = true;
+    let urls: { url: string }[] = [];
+    void db.attachments.where("[ownerType+ownerId]").equals(["message", message.id]).toArray().then((rows) => {
+      const next = rows.map((attachment) => ({ id: attachment.id, name: attachment.name, mimeType: attachment.mimeType, url: URL.createObjectURL(attachment.blob) }));
+      urls = next;
+      if (alive) setEditAttachments(next);
+      else next.forEach((attachment) => URL.revokeObjectURL(attachment.url));
+    });
+    return () => {
+      alive = false;
+      urls.forEach((attachment) => URL.revokeObjectURL(attachment.url));
+      setEditAttachmentMenuOpen(false);
+      setDeleteAttachmentId(undefined);
+    };
+  }, [editOpen, message.id]);
   async function star() {
     await toggleStar(projectId, message);
     await onRefresh();
@@ -3251,22 +4229,95 @@ function MessageRow({
     await navigator.clipboard.writeText(message.body);
   }
   async function resend() {
+    if (deltaLocked) return;
     await onResend(message);
   }
   async function saveEdit() {
+    if (deltaLocked) return;
     await onEdit(message, draftBody);
     setEditOpen(false);
   }
   async function saveEditAndResend() {
+    if (deltaLocked) return;
     const updatedMessage = await onEdit(message, draftBody);
     setEditOpen(false);
     await onResend(updatedMessage);
+  }
+  async function addEditAttachments(files: FileList | null) {
+    const next = Array.from(files ?? []);
+    if (!next.length) return;
+    const timestamp = now();
+    await db.attachments.bulkAdd(next.map((file) => ({ id: uid(), ownerType: "message" as const, ownerId: message.id, name: file.name, mimeType: file.type || "application/octet-stream", size: file.size, blob: file, createdAt: timestamp, updatedAt: timestamp })));
+    if (next.some((file) => file.type.startsWith("image/"))) await db.messages.update(message.id, { attachmentContext: undefined, updatedAt: timestamp });
+    const rows = await db.attachments.where("[ownerType+ownerId]").equals(["message", message.id]).toArray();
+    editAttachments.forEach((attachment) => URL.revokeObjectURL(attachment.url));
+    setEditAttachments(rows.map((attachment) => ({ id: attachment.id, name: attachment.name, mimeType: attachment.mimeType, url: URL.createObjectURL(attachment.blob) })));
+    setEditAttachmentMenuOpen(false);
+  }
+  function beginAttachmentPress(id: string) {
+    window.clearTimeout(attachmentPressTimer.current);
+    attachmentPressTimer.current = window.setTimeout(() => setDeleteAttachmentId(id), 520);
+  }
+  function cancelAttachmentPress() {
+    window.clearTimeout(attachmentPressTimer.current);
+  }
+  async function removeEditAttachment() {
+    if (!deleteAttachmentId) return;
+    const deleting = editAttachments.find((attachment) => attachment.id === deleteAttachmentId);
+    await db.attachments.delete(deleteAttachmentId);
+    if (deleting?.mimeType.startsWith("image/")) await db.messages.update(message.id, { attachmentContext: undefined, updatedAt: now() });
+    const removed = deleting;
+    if (removed) URL.revokeObjectURL(removed.url);
+    setEditAttachments((current) => current.filter((attachment) => attachment.id !== deleteAttachmentId));
+    setDeleteAttachmentId(undefined);
+  }
+  async function submitAvoidDelta() {
+    if (!avoidText.trim()) return;
+    setAvoidSaving(true);
+    try {
+      await onAvoidDeltaBrief(message, avoidText);
+      setAvoidText("");
+      setAvoidOpen(false);
+    } finally {
+      setAvoidSaving(false);
+    }
+  }
+  async function updateDeltaPlayerCharacter(playerCharacterName: string) {
+    const brief = message.deltaBrief;
+    if (!brief) return;
+    await db.messages.update(message.id, {
+      deltaBrief: { ...brief, playerCharacterName },
+      updatedAt: now()
+    });
+    await onRefresh();
   }
   return (
     <>
       <article className={`message ${message.role}`} onClick={onExpand}>
         {expanded && message.role === "assistant" && message.modelId && <div className="message-model">{message.modelId}</div>}
+        {message.role === "user" && <MessageImageAttachments messageId={message.id} />}
         <div className="message-body"><MarkdownText text={message.body} /></div>
+        {message.deltaBrief?.status === "pending" && (
+          <div className="delta-brief-panel" onClick={(event) => event.stopPropagation()}>
+            <div className="delta-brief-player">
+              <select
+                value={message.deltaBrief.playerCharacterName || ""}
+                onChange={(event) => void updateDeltaPlayerCharacter(event.target.value)}
+                aria-label="Player character for Delta engagement"
+              >
+                <option value="">Player character</option>
+                {deltaCharacters.map((character) => <option key={character.id} value={character.name}>{character.name}</option>)}
+              </select>
+              <button className="icon-button" type="button" onClick={() => void loadDeltaCharacters()} aria-label="Refresh character list" title="Refresh characters"><RefreshCw size={14} /></button>
+            </div>
+            <div className="delta-brief-actions">
+              {message.deltaBrief.avoidLabel && (
+                <button type="button" onClick={() => setAvoidOpen(true)}>{message.deltaBrief.avoidLabel}</button>
+              )}
+              <button type="button" onClick={() => void onBeginDeltaBrief(message)}>Begin Engagement</button>
+            </div>
+          </div>
+        )}
         {message.role === "assistant" && (
           <InventoryUpdateCard
             updates={(message.requestInfo?.inventoryUpdates ?? []).filter((update) => update.status === "pending")}
@@ -3274,13 +4325,13 @@ function MessageRow({
           />
         )}
         <div className={`message-meta ${expanded ? "show" : ""}`}>
-          <button aria-label="Edit message" title="Edit" onClick={(event) => { event.stopPropagation(); setEditOpen(true); }}><Edit3 size={16} /></button>
+          <button aria-label="Edit message" title={deltaLocked ? "Resolve engagement to unlock editing" : "Edit"} disabled={deltaLocked} onClick={(event) => { event.stopPropagation(); if (!deltaLocked) setEditOpen(true); }}><Edit3 size={16} /></button>
           <button aria-label={message.starred ? "Unstar message" : "Star message"} title={message.starred ? "Unstar" : "Star"} onClick={(event) => { event.stopPropagation(); star(); }}><Star size={16} fill={message.starred ? "currentColor" : "none"} /></button>
           <button aria-label="Copy message" title="Copy" onClick={(event) => { event.stopPropagation(); copyMessage(); }}><Clipboard size={16} /></button>
           <button aria-label="Message info" title="Info" onClick={(event) => { event.stopPropagation(); setInfoOpen(true); }}><FileText size={16} /></button>
           <span>{formatMessageDate(message.createdAt)}</span>
           <span>{message.inputTokens ?? message.outputTokens ?? estimateTokens(message.body)}t</span>
-          <button className="resend" aria-label="Resend message" title="Resend" onClick={(event) => { event.stopPropagation(); resend(); }}><RefreshCw size={16} /></button>
+          <button className="resend" aria-label="Resend message" title={deltaLocked ? "Resolve engagement to unlock resend" : "Resend"} disabled={deltaLocked} onClick={(event) => { event.stopPropagation(); resend(); }}><RefreshCw size={16} /></button>
         </div>
       </article>
       {infoOpen && <MessageInfoModal message={message} onClose={() => setInfoOpen(false)} />}
@@ -3289,19 +4340,75 @@ function MessageRow({
           <section className="star-modal message-info-modal" onClick={(event) => event.stopPropagation()}>
             <div className="section-title">
               <h2>Edit Message</h2>
-              <button className="icon-button" onClick={() => setEditOpen(false)} aria-label="Close edit message"><X size={18} /></button>
+              <div className="split-actions">
+                <button className="icon-button" onClick={() => setEditAttachmentMenuOpen(!editAttachmentMenuOpen)} aria-label="Message attachments" title="Attachments"><Plus size={18} /></button>
+                <button className="icon-button" onClick={() => setEditOpen(false)} aria-label="Close edit message"><X size={18} /></button>
+              </div>
             </div>
+            {editAttachmentMenuOpen && <div className="edit-attachment-menu">
+              <button type="button" onClick={() => { setEditOpen(false); onOpenChatSettings(); }}><Settings size={17} /> Chat settings</button>
+              <button type="button" onClick={() => editImagePickerRef.current?.click()}><ImageIcon size={17} /> Attach Image</button>
+              <button type="button" onClick={() => editFilePickerRef.current?.click()}><Paperclip size={17} /> Attach File</button>
+              <input ref={editImagePickerRef} className="visually-hidden" type="file" accept="image/*" multiple onChange={(event) => { void addEditAttachments(event.target.files); event.currentTarget.value = ""; }} />
+              <input ref={editFilePickerRef} className="visually-hidden" type="file" multiple onChange={(event) => { void addEditAttachments(event.target.files); event.currentTarget.value = ""; }} />
+            </div>}
+            {editAttachments.filter((attachment) => attachment.mimeType.startsWith("image/")).length > 0 && <div className="edit-message-image-strip">
+              {editAttachments.filter((attachment) => attachment.mimeType.startsWith("image/")).map((attachment, index) => <button key={attachment.id} type="button" onPointerDown={() => beginAttachmentPress(attachment.id)} onPointerUp={cancelAttachmentPress} onPointerLeave={cancelAttachmentPress} onClick={() => setEditImageIndex(index)}><img src={attachment.url} alt="" /></button>)}
+            </div>}
+            {editAttachments.some((attachment) => !attachment.mimeType.startsWith("image/")) && <div className="edit-message-file-list">{editAttachments.filter((attachment) => !attachment.mimeType.startsWith("image/")).map((attachment) => <span key={attachment.id}><Paperclip size={14} /> {attachment.name || "Attached file"}</span>)}</div>}
+            {deleteAttachmentId && <div className="inline-confirm"><span>Delete this attachment?</span><button onClick={removeEditAttachment}>Delete</button><button onClick={() => setDeleteAttachmentId(undefined)}>Cancel</button></div>}
             <textarea className="large-entry" value={draftBody} onChange={(event) => setDraftBody(event.target.value)} />
             <div className="split-actions">
-              <button onClick={saveEdit}><Save size={18} /> Save</button>
-              {message.role === "user" && <button onClick={saveEditAndResend}><RefreshCw size={18} /> Save & resend</button>}
+              <button onClick={saveEdit} disabled={deltaLocked}><Save size={18} /> Save</button>
+              {message.role === "user" && <button onClick={saveEditAndResend} disabled={deltaLocked}><RefreshCw size={18} /> Save & resend</button>}
               <button onClick={() => setEditOpen(false)}>Cancel</button>
+            </div>
+          </section>
+        </div>
+      )}
+      {editImageIndex !== undefined && <ImageViewer attachments={editAttachments.filter((attachment) => attachment.mimeType.startsWith("image/"))} index={editImageIndex} onChange={setEditImageIndex} onClose={() => setEditImageIndex(undefined)} />}
+      {avoidOpen && (
+        <div className="modal-backdrop" onClick={() => setAvoidOpen(false)}>
+          <section className="star-modal message-info-modal" onClick={(event) => event.stopPropagation()}>
+            <div className="section-title">
+              <h2>{message.deltaBrief?.avoidPrompt || "What do you do?"}</h2>
+              <button className="icon-button" onClick={() => setAvoidOpen(false)} aria-label="Cancel"><X size={18} /></button>
+            </div>
+            <textarea className="large-entry" value={avoidText} onChange={(event) => setAvoidText(event.target.value)} rows={5} autoFocus />
+            <div className="split-actions">
+              <button onClick={submitAvoidDelta} disabled={!avoidText.trim() || avoidSaving}>{avoidSaving ? "Sending..." : "Send"}</button>
+              <button onClick={() => setAvoidOpen(false)} disabled={avoidSaving}>Cancel</button>
             </div>
           </section>
         </div>
       )}
     </>
   );
+}
+
+function MessageImageAttachments({ messageId }: { messageId: string }) {
+  const [attachments, setAttachments] = useState<{ id: string; url: string; mimeType: string }[]>([]);
+  const [viewerIndex, setViewerIndex] = useState<number>();
+  useEffect(() => {
+    let alive = true;
+    let urls: { id: string; url: string; mimeType: string }[] = [];
+    setAttachments([]);
+    void db.attachments.where("[ownerType+ownerId]").equals(["message", messageId]).toArray().then((rows) => {
+      const images = rows.filter((attachment) => attachment.mimeType.startsWith("image/")).map((attachment) => ({ id: attachment.id, mimeType: attachment.mimeType, url: URL.createObjectURL(attachment.blob) }));
+      urls = images;
+      if (!alive) {
+        images.forEach((attachment) => URL.revokeObjectURL(attachment.url));
+        return;
+      }
+      setAttachments(images);
+    });
+    return () => {
+      alive = false;
+      urls.forEach((attachment) => URL.revokeObjectURL(attachment.url));
+    };
+  }, [messageId]);
+  if (!attachments.length) return null;
+  return <><div className="message-image-strip"><ImageStrip attachments={attachments} onOpen={setViewerIndex} /></div>{viewerIndex !== undefined && <ImageViewer attachments={attachments} index={viewerIndex} onChange={setViewerIndex} onClose={() => setViewerIndex(undefined)} />}</>;
 }
 
 function InventoryUpdateCard({ updates, onAction }: { updates: InventoryUpdateRequest[]; onAction: (action: "confirm" | "edit" | "reject") => Promise<void> }) {
@@ -3393,11 +4500,16 @@ function ProjectCard({ project, active, index, total, onSelect, onEdit, projects
     const count = await db.messages.where("chatId").anyOf((await db.chats.where("projectId").equals(project.id).primaryKeys()) as string[]).count();
     const ok = count > 0 ? prompt(`Deleting this project removes chats, messages, stars, archives, characters, and memories. Type DELETE ${project.name} to continue.`) === `DELETE ${project.name}` : confirm("Delete this project and its associated records?");
     if (!ok) return;
-    await db.transaction("rw", [db.projects, db.chats, db.branches, db.messages, db.stars, db.archives, db.archiveEntries, db.characters, db.characterBonuses, db.memories, db.inventoryItems, db.inventoryLogs, db.deltaSessions, db.deltaMessages, db.deltaEntities, db.deltaAllyCache, db.deltaActionMacros], async () => {
+    await db.transaction("rw", [db.projects, db.chats, db.branches, db.messages, db.stars, db.attachments, db.archives, db.archiveEntries, db.characters, db.characterBonuses, db.memories, db.inventoryItems, db.inventoryLogs, db.deltaSessions, db.deltaMessages, db.deltaEntities, db.deltaAllyCache, db.deltaActionMacros], async () => {
       const chatIds = (await db.chats.where("projectId").equals(project.id).primaryKeys()) as string[];
       const archiveIds = (await db.archives.where("projectId").equals(project.id).primaryKeys()) as string[];
       const characterIds = (await db.characters.where("projectId").equals(project.id).primaryKeys()) as string[];
+      const messageIds = chatIds.length ? (await db.messages.where("chatId").anyOf(chatIds).primaryKeys()) as string[] : [];
+      const attachmentIds = messageIds.length
+        ? (await db.attachments.filter((attachment) => attachment.ownerType === "message" && messageIds.includes(attachment.ownerId)).primaryKeys()) as string[]
+        : [];
       const deltaSessionIds = chatIds.length ? (await db.deltaSessions.where("chatId").anyOf(chatIds).primaryKeys()) as string[] : [];
+      if (attachmentIds.length) await db.attachments.bulkDelete(attachmentIds);
       await db.messages.where("chatId").anyOf(chatIds).delete();
       await db.branches.where("chatId").anyOf(chatIds).delete();
       if (chatIds.length) {
@@ -3442,28 +4554,34 @@ function ProjectEditPage({ project, onRefresh, onDone }: { project: Project; onR
   const [draft, setDraft] = useState(project);
   const [tab, setTab] = useState<"general" | "delta">("general");
   const [deltaStats, setDeltaStats] = useState<AbilityScores>(cleanAbilityScores(project.deltaDefaultNpcStats));
-  const [deltaPrefixes, setDeltaPrefixes] = useState<DeltaPrefixTemplate[]>(project.deltaPrefixes?.length ? project.deltaPrefixes : defaultDeltaPrefixes());
+  const [deltaPrefixes, setDeltaPrefixes] = useState<DeltaPrefixTemplate[]>(effectiveDeltaPrefixes(project.deltaPrefixes));
   const [deltaBases, setDeltaBases] = useState<DeltaBaseTemplate[]>(deltaBaseDraft(project.deltaBases));
   const [deltaJobs, setDeltaJobs] = useState<DeltaJobTemplate[]>(project.deltaJobs ?? defaultDeltaJobs());
+  const [deltaSystemPrompt, setDeltaSystemPrompt] = useState(project.deltaSystemPrompt ?? defaultDeltaSystemPrompt);
   const [showIconPicker, setShowIconPicker] = useState(false);
   const [saved, showSaved] = useSavedNotice();
   const [deltaSaved, showDeltaSaved] = useSavedNotice();
   useEffect(() => {
     setDraft(project);
     setDeltaStats(cleanAbilityScores(project.deltaDefaultNpcStats));
-    setDeltaPrefixes(project.deltaPrefixes?.length ? project.deltaPrefixes : defaultDeltaPrefixes());
+    setDeltaPrefixes(effectiveDeltaPrefixes(project.deltaPrefixes));
     setDeltaBases(deltaBaseDraft(project.deltaBases));
     setDeltaJobs(project.deltaJobs ?? defaultDeltaJobs());
+    setDeltaSystemPrompt(project.deltaSystemPrompt ?? defaultDeltaSystemPrompt);
   }, [project.id]);
   async function save() {
     await db.projects.put({ ...draft, updatedAt: now() });
     showSaved();
     await onRefresh();
   }
-  async function saveDeltaPatch(patch: Pick<Project, "deltaDefaultNpcStats"> | Pick<Project, "deltaPrefixes"> | Pick<Project, "deltaBases"> | Pick<Project, "deltaJobs">) {
+  async function saveDeltaPatch(patch: Pick<Project, "deltaDefaultNpcStats"> | Pick<Project, "deltaPrefixes"> | Pick<Project, "deltaBases"> | Pick<Project, "deltaJobs"> | Pick<Project, "deltaSystemPrompt">) {
     await db.projects.update(project.id, { ...patch, updatedAt: now() });
     showDeltaSaved();
     await onRefresh();
+  }
+  async function revertDeltaSystemPrompt() {
+    setDeltaSystemPrompt(defaultDeltaSystemPrompt);
+    await saveDeltaPatch({ deltaSystemPrompt: defaultDeltaSystemPrompt });
   }
   return (
     <Page>
@@ -3507,6 +4625,17 @@ function ProjectEditPage({ project, onRefresh, onDone }: { project: Project; onR
       )}
       {tab === "delta" && (
         <section className="item-card stack delta-settings-editor">
+          <section className="panel stack">
+            <div className="section-title"><h2>System Prompt</h2></div>
+            <p className="notice">This is the full Delta Mode system prompt for this project. Revert restores Mirror's default Delta behavior.</p>
+            <textarea className="large-entry" value={deltaSystemPrompt} onChange={(event) => setDeltaSystemPrompt(event.target.value)} />
+            <div className="split-actions">
+              <button onClick={() => saveDeltaPatch({ deltaSystemPrompt: deltaSystemPrompt.trim() || defaultDeltaSystemPrompt })}><Save size={18} /> Save System Prompt</button>
+              <button onClick={revertDeltaSystemPrompt}>Revert to default</button>
+              {deltaSaved && <span className="save-status">Saved</span>}
+            </div>
+          </section>
+
           <section className="panel stack">
             <div className="section-title"><h2>Default NPC Values</h2></div>
             <p className="notice">Starting stats for generated Delta characters that do not have saved character stats.</p>
@@ -4013,10 +5142,10 @@ function CharacterProfilePage({ project, characterId, onBack, onDeleted }: { pro
   }
   useEffect(() => { load(); }, [characterId, project.id]);
   if (!character) return <EmptyState title="Character not found" body="This character could not be opened in the selected project." />;
-  return <Page><CharacterEditor character={character} onRefresh={load} onBack={onBack} onDeleted={onDeleted} /></Page>;
+  return <Page><CharacterEditor project={project} character={character} onRefresh={load} onBack={onBack} onDeleted={onDeleted} /></Page>;
 }
 
-function CharacterEditor({ character, onRefresh, onBack, onDeleted }: { character: Character; onRefresh: () => Promise<void>; onBack: () => void; onDeleted: () => void }) {
+function CharacterEditor({ project, character, onRefresh, onBack, onDeleted }: { project: Project; character: Character; onRefresh: () => Promise<void>; onBack: () => void; onDeleted: () => void }) {
   const [draft, setDraft] = useState(character);
   const [editing, setEditing] = useState(false);
   const [attachments, setAttachments] = useState<{ id: string; url: string; mimeType: string }[]>([]);
@@ -4094,7 +5223,7 @@ function CharacterEditor({ character, onRefresh, onBack, onDeleted }: { characte
         <div className="character-display">
           <div className="character-summary-row">
             {attachments[0] && <img className="profile-side-image" src={attachments[0].url} alt="" />}
-            {character.statsEnabled && <StatsDisplay character={character} bonuses={bonuses} />}
+            {character.statsEnabled && <StatsDisplay project={project} character={character} bonuses={bonuses} />}
           </div>
           <p className="bio-full"><strong>Bio:</strong> {character.bio || "No bio saved yet."}</p>
           <div className="split-actions">
@@ -4115,7 +5244,7 @@ function CharacterEditor({ character, onRefresh, onBack, onDeleted }: { characte
           <label className="file-pick"><ImageIcon size={18} /> Add images<input type="file" accept="image/*" multiple onChange={(event) => addImages(event.target.files)} /></label>
           <ImageStrip attachments={attachments} onOpen={setViewerIndex} />
           <label className="compact-check"><input type="checkbox" checked={draft.statsEnabled} onChange={(event) => setDraft({ ...draft, statsEnabled: event.target.checked })} /> Enable ability scores</label>
-          {draft.statsEnabled && <PointBuyEditor draft={draft} bonuses={bonuses} onDraft={setDraft} onAddBonus={addBonus} onBonus={updateBonus} />}
+          {draft.statsEnabled && <PointBuyEditor project={project} draft={draft} bonuses={bonuses} onDraft={setDraft} />}
           {!valid && <p className="error">Point buy must stay within 27 points, with base scores from 8 to 15.</p>}
           <div className="split-actions"><button disabled={!valid} onClick={save}><Save size={18} /> Save</button><button onClick={() => setEditing(false)}>Cancel</button>{saved && <span className="save-status">Saved</span>}</div>
         </div>
@@ -4131,47 +5260,143 @@ function CharacterEditor({ character, onRefresh, onBack, onDeleted }: { characte
   );
 }
 
-function StatsDisplay({ character, bonuses }: { character: Character; bonuses: CharacterBonus[] }) {
-  return <div className="stat-display">{abilities.map((ability) => {
-    const key = ability.toLowerCase() as "str" | "dex" | "con" | "int" | "wis" | "cha";
-    const bonus = bonuses.filter((item) => item.stat === ability).reduce((sum, item) => sum + item.value, 0);
-    return <span key={ability}>{ability} {character[key] + bonus}</span>;
-  })}</div>;
+function characterTemplateBonus(project: Project, character: Character) {
+  const defaultStats = project.deltaDefaultNpcStats ?? defaultDeltaNpcStats();
+  const generated = generatedDeltaStats(project, {
+    prefix: character.prefix,
+    base: character.base,
+    job: character.job,
+    jobCategory: character.jobCategory
+  });
+  return {
+    generated,
+    bonus: abilities.reduce((scores, ability) => ({ ...scores, [ability]: generated.scores[ability] - defaultStats[ability] }), {} as AbilityScores)
+  };
 }
 
-function PointBuyEditor({ draft, bonuses, onDraft, onAddBonus, onBonus }: { draft: Character; bonuses: CharacterBonus[]; onDraft: (character: Character) => void; onAddBonus: () => void; onBonus: (bonus: CharacterBonus) => void }) {
+function signedBonus(value: number) {
+  return value > 0 ? `+${value}` : String(value);
+}
+
+function scoreModifier(score: number) {
+  return Math.floor((score - 10) / 2);
+}
+
+function modifierLabel(score: number) {
+  return `(${signedBonus(scoreModifier(score))})`;
+}
+
+const abilityHints: Record<Ability, string> = {
+  STR: "force, carrying, melee",
+  DEX: "aim, reflex, stealth",
+  CON: "stamina, injury, HP",
+  INT: "logic, tech, recall",
+  WIS: "sense, focus, instinct",
+  CHA: "presence, charm, nerve"
+};
+
+function templateOptionLabel(label: string, statModifiers: AbilityModifiers = {}, hpBonus = 0) {
+  const bonuses = abilities
+    .map((ability) => {
+      const value = statModifiers[ability] ?? 0;
+      return value === 0 ? "" : `${signedBonus(value)} ${ability}`;
+    })
+    .filter(Boolean);
+  if (hpBonus !== 0) bonuses.push(`${signedBonus(hpBonus)} HP`);
+  return bonuses.length > 0 ? `${label} (${bonuses.join(", ")})` : label;
+}
+
+function StatsDisplay({ project, character, bonuses }: { project: Project; character: Character; bonuses: CharacterBonus[] }) {
+  const template = characterTemplateBonus(project, character);
+  return <div className="stat-display">{abilities.map((ability) => {
+    const key = ability.toLowerCase() as "str" | "dex" | "con" | "int" | "wis" | "cha";
+    const legacyBonus = bonuses.filter((item) => item.stat === ability).reduce((sum, item) => sum + item.value, 0);
+    const total = character[key] + template.bonus[ability] + legacyBonus;
+    return <span key={ability}>{ability} {total} <small>{modifierLabel(total)}</small></span>;
+  })}{template.generated.templateTag && <small className="delta-template-tag">{template.generated.templateTag}</small>}</div>;
+}
+
+function PointBuyEditor({ project, draft, bonuses, onDraft }: { project: Project; draft: Character; bonuses: CharacterBonus[]; onDraft: (character: Character) => void }) {
   const pointCost = abilities.reduce((sum, ability) => {
     const key = ability.toLowerCase() as "str" | "dex" | "con" | "int" | "wis" | "cha";
     const costs: Record<number, number> = { 8: 0, 9: 1, 10: 2, 11: 3, 12: 4, 13: 5, 14: 7, 15: 9 };
     return sum + costs[draft[key]];
   }, 0);
+  const template = characterTemplateBonus(project, draft);
+  const categories = jobCategories(project.deltaJobs ?? []);
+  const jobsForCategory = (project.deltaJobs ?? []).filter((job) => job.category === draft.jobCategory);
+  const legacyConBonus = bonuses.filter((item) => item.stat === "CON").reduce((sum, item) => sum + item.value, 0);
+  const totalCon = draft.con + template.bonus.CON + legacyConBonus;
+  const baseHp = Math.max(1, 10 + scoreModifier(totalCon));
+  const tagHpBonus = template.generated.hpBonus;
+  const totalHp = Math.max(1, baseHp + tagHpBonus);
+  const hpScale = Math.max(baseHp, totalHp, baseHp + Math.max(0, tagHpBonus), 1);
+  const statRows = abilities.map((ability) => {
+    const key = ability.toLowerCase() as "str" | "dex" | "con" | "int" | "wis" | "cha";
+    const base = draft[key];
+    const legacyBonus = bonuses.filter((item) => item.stat === ability).reduce((sum, item) => sum + item.value, 0);
+    const bonus = template.bonus[ability] + legacyBonus;
+    const total = base + bonus;
+    return { ability, key, base, bonus, total };
+  });
+  const statScale = Math.max(20, ...statRows.map((row) => Math.max(row.base, row.total)));
   return (
     <div className="point-buy">
-      <div className="mini-row"><strong>{pointCost} / 27 spent</strong><button onClick={onAddBonus}><Plus size={16} /> Bonus</button></div>
-      {abilities.map((ability) => {
-        const key = ability.toLowerCase() as "str" | "dex" | "con" | "int" | "wis" | "cha";
-        const base = draft[key];
-        const bonus = bonuses.filter((item) => item.stat === ability).reduce((sum, item) => sum + item.value, 0);
-            const bonusWidth = Math.min(100 - ((base - 8) / 7) * 100, Math.max(0, bonus) * 9);
-            return (
+      <div className="mini-row"><strong>{pointCost} / 27 spent</strong>{template.generated.templateTag && <small className="delta-template-tag">{template.generated.templateTag}</small>}</div>
+      <div className="template-select-grid">
+        <label>PREFIX
+          <select value={draft.prefix ?? ""} onChange={(event) => onDraft({ ...draft, prefix: event.target.value || undefined })}>
+            <option value="">None</option>
+            {effectiveDeltaPrefixes(project.deltaPrefixes).map((prefix) => <option key={prefix.id} value={prefix.label}>{templateOptionLabel(prefix.label, prefix.statModifiers)}</option>)}
+          </select>
+        </label>
+        <label>BASE
+          <select value={draft.base ?? ""} onChange={(event) => onDraft({ ...draft, base: event.target.value || undefined })}>
+            <option value="">None</option>
+            {effectiveDeltaBases(project.deltaBases).map((base) => <option key={base.id} value={base.label}>{templateOptionLabel(base.label, base.statModifiers, base.hpBonus ?? 0)}</option>)}
+          </select>
+        </label>
+        <label>JOB category
+          <select value={draft.jobCategory ?? ""} onChange={(event) => onDraft({ ...draft, jobCategory: event.target.value || undefined, job: undefined })}>
+            <option value="">None</option>
+            {categories.map(([category]) => <option key={category} value={category}>{category}</option>)}
+          </select>
+        </label>
+        <label>JOB
+          <select value={draft.job ?? ""} onChange={(event) => onDraft({ ...draft, job: event.target.value || undefined })} disabled={!draft.jobCategory}>
+            <option value="">None</option>
+            {jobsForCategory.map((job) => <option key={job.id} value={job.label}>{templateOptionLabel(job.label, job.statModifiers)}</option>)}
+          </select>
+        </label>
+      </div>
+      <div className={`hp-summary ${tagHpBonus < 0 ? "negative" : ""}`}>
+        <div className="hp-summary-head">
+          <span>HP</span>
+          <strong>{totalHp} <small>({signedBonus(tagHpBonus)})</small></strong>
+        </div>
+        <div className="hp-total-bar" aria-label={`HP base ${baseHp} plus tag ${signedBonus(tagHpBonus)} equals ${totalHp}`}>
+          <i style={{ width: `${(totalHp / hpScale) * 100}%` }} />
+          <em style={{ left: `${(baseHp / hpScale) * 100}%` }} />
+        </div>
+        <div className="hp-summary-foot"><span>{baseHp} {signedBonus(tagHpBonus)} = {totalHp}</span></div>
+      </div>
+      {statRows.map(({ ability, key, base, bonus, total }) => {
+        const baseWidth = (Math.max(0, bonus < 0 ? total : base) / statScale) * 100;
+        const bonusWidth = (Math.abs(bonus) / statScale) * 100;
+        return (
           <div className="stat-bar-row" key={ability}>
-            <span>{ability}</span>
+            <span className="stat-label"><strong>{ability}</strong></span>
             <button disabled={base <= 8} onClick={() => onDraft({ ...draft, [key]: base - 1 })}>-</button>
-            <div className="stat-bar"><i style={{ width: `${((base - 8) / 7) * 100}%` }} /><b style={{ width: `${bonusWidth}%` }} /></div>
+            <div className="stat-bar-cell">
+              <div className={`stat-bar ${bonus < 0 ? "negative" : ""}`}><i style={{ width: `${baseWidth}%` }} />{bonus !== 0 && <b style={{ width: `${bonusWidth}%` }} />}</div>
+              <small>{abilityHints[ability]}</small>
+            </div>
             <button disabled={base >= 15} onClick={() => onDraft({ ...draft, [key]: base + 1 })}>+</button>
-            <strong>{base + bonus}</strong>
+            <strong>{total} <small>{modifierLabel(total)}</small></strong>
           </div>
         );
       })}
-      {bonuses.map((bonus) => (
-        <div className="bonus-row" key={bonus.id}>
-          <input value={bonus.name} onChange={(event) => onBonus({ ...bonus, name: event.target.value })} />
-          <select value={bonus.stat} onChange={(event) => onBonus({ ...bonus, stat: event.target.value as Ability })}>{abilities.map((ability) => <option key={ability}>{ability}</option>)}</select>
-          <button onClick={() => onBonus({ ...bonus, value: bonus.value - 1 })}>-</button>
-          <span>{bonus.value}</span>
-          <button onClick={() => onBonus({ ...bonus, value: bonus.value + 1 })}>+</button>
-        </div>
-      ))}
+      {bonuses.length > 0 && <p className="notice">Legacy custom bonuses are still included in totals, but new stat bonuses come from PREFIX / BASE / JOB tags.</p>}
     </div>
   );
 }

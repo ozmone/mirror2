@@ -106,6 +106,7 @@ export interface Project extends Timestamped {
   deltaPrefixes?: DeltaPrefixTemplate[];
   deltaBases?: DeltaBaseTemplate[];
   deltaJobs?: DeltaJobTemplate[];
+  deltaSystemPrompt?: string;
 }
 
 export interface Chat extends Timestamped {
@@ -133,6 +134,7 @@ export interface Message extends Timestamped {
   sequence: number;
   role: "user" | "assistant" | "system";
   body: string;
+  attachmentContext?: string;
   modelId?: string;
   inputTokens?: number;
   outputTokens?: number;
@@ -145,6 +147,14 @@ export interface Message extends Timestamped {
     toggles: string[];
     toolCalls: string[];
     inventoryUpdates?: InventoryUpdateRequest[];
+  };
+  deltaBrief?: {
+    status: "pending" | "started";
+    brief: string;
+    playerCharacterName?: string;
+    avoidLabel?: string;
+    avoidPrompt?: string;
+    startedAt?: number;
   };
 }
 
@@ -163,6 +173,16 @@ export interface DeltaSession extends Timestamped {
   title: string;
   active: boolean;
   archivedAt?: number;
+  initiativeStarted?: boolean;
+  turnIndex?: number;
+  awaitingPlayerAction?: boolean;
+  awaitingPlayerRoll?: boolean;
+  requiredRollDie?: number;
+  requiredRollCount?: number;
+  requiredRollResults?: number[];
+  requiredRollKind?: "initiative" | "check";
+  requiredRollLabel?: string;
+  actionPrompt?: string;
   settings: DeltaModeSettings;
 }
 
@@ -196,6 +216,7 @@ export interface DeltaEntity extends Timestamped {
   side: "ally" | "neutral" | "hostile";
   currentHp?: number;
   maxHp?: number;
+  initiative?: number;
   statusText?: string;
   distanceFromPlayer?: string;
   elevation?: string;
@@ -266,8 +287,9 @@ export interface ArchiveEntry extends Timestamped {
 }
 
 export interface Attachment extends Timestamped {
-  ownerType: "archiveEntry" | "character" | "sourceFile";
+  ownerType: "archiveEntry" | "character" | "sourceFile" | "message";
   ownerId: string;
+  name?: string;
   mimeType: string;
   size: number;
   blob: Blob;
@@ -318,6 +340,10 @@ export interface Character extends Timestamped {
   int: number;
   wis: number;
   cha: number;
+  prefix?: string;
+  base?: string;
+  job?: string;
+  jobCategory?: string;
 }
 
 export interface CharacterBonus extends Timestamped {

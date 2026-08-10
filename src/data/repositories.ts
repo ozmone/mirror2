@@ -1,7 +1,7 @@
 import Dexie from "dexie";
 import { db } from "./db";
-import { defaultDeltaBases, defaultDeltaJobs, defaultDeltaNpcStats, defaultDeltaPrefixes, defaultMemoryInstruction } from "./defaults";
-import { Ability, AbilityModifiers, AbilityScores, Character, CharacterBonus, Chat, DeltaAllyCacheEntry, DeltaEntity, DeltaSession, InventoryKind, Memory, Message, Project } from "../types";
+import { defaultDeltaBases, defaultDeltaJobs, defaultDeltaNpcStats, defaultDeltaPrefixes, defaultDeltaSystemPrompt, defaultMemoryInstruction } from "./defaults";
+import { Ability, AbilityModifiers, AbilityScores, Character, CharacterBonus, Chat, DeltaAllyCacheEntry, DeltaBaseTemplate, DeltaEntity, DeltaPrefixTemplate, DeltaSession, InventoryKind, Memory, Message, Project } from "../types";
 import { estimateTokens, fallbackChatTitle, normaliseTag, now, uid } from "../utils";
 
 export const abilities: Ability[] = ["STR", "DEX", "CON", "INT", "WIS", "CHA"];
@@ -22,6 +22,10 @@ function abilityModifier(score: number) {
   return Math.floor((score - 10) / 2);
 }
 
+function derivedHp(con: number, hpBonus = 0) {
+  return Math.max(1, 10 + abilityModifier(con) + hpBonus);
+}
+
 function applyModifiers(scores: AbilityScores, modifiers?: AbilityModifiers) {
   const next = { ...scores };
   for (const ability of abilities) next[ability] += modifiers?.[ability] ?? 0;
@@ -30,6 +34,42 @@ function applyModifiers(scores: AbilityScores, modifiers?: AbilityModifiers) {
 
 function normaliseTemplateValue(value?: string) {
   return value?.trim().toUpperCase() || undefined;
+}
+
+function sameModifiers(a: AbilityModifiers | undefined, b: AbilityModifiers | undefined) {
+  return abilities.every((ability) => (a?.[ability] ?? 0) === (b?.[ability] ?? 0));
+}
+
+function isLegacyDefaultBase(item: DeltaBaseTemplate) {
+  const label = item.label.trim().toUpperCase();
+  const hpBonus = item.hpBonus ?? 0;
+  if (item.notes?.trim()) return false;
+  if (label === "LIGHT") return (sameModifiers(item.statModifiers, { STR: -2, DEX: 4 }) || sameModifiers(item.statModifiers, { STR: -2, DEX: 4, CON: -2 })) && hpBonus === -5;
+  if (label === "MEDIUM") return (sameModifiers(item.statModifiers, { DEX: 2, CON: 2 }) || sameModifiers(item.statModifiers, { STR: 2, DEX: 2, CON: 2 })) && hpBonus === 0;
+  if (label === "HEAVY") return (sameModifiers(item.statModifiers, { STR: 4, DEX: -1, CON: 4 }) || sameModifiers(item.statModifiers, { STR: 3, DEX: -3, CON: 3 })) && hpBonus === 8;
+  return false;
+}
+
+function isLegacyDefaultPrefix(item: DeltaPrefixTemplate) {
+  const label = item.label.trim().toUpperCase();
+  if (!abilities.includes(label as Ability) || item.notes?.trim()) return false;
+  return sameModifiers(item.statModifiers, { [label]: 3 });
+}
+
+export function effectiveDeltaPrefixes(value?: DeltaPrefixTemplate[]) {
+  const defaults = defaultDeltaPrefixes();
+  return (value?.length ? value : defaults).map((item) => {
+    if (!isLegacyDefaultPrefix(item)) return item;
+    return defaults.find((prefix) => prefix.label === item.label) ?? item;
+  });
+}
+
+export function effectiveDeltaBases(value?: DeltaBaseTemplate[]) {
+  const defaults = defaultDeltaBases();
+  return (value?.length ? value : defaults).map((item) => {
+    if (!isLegacyDefaultBase(item)) return item;
+    return defaults.find((base) => base.label === item.label) ?? item;
+  });
 }
 
 export function formatDeltaTemplateTag(prefix?: string, base?: string, job?: string) {
@@ -47,8 +87,8 @@ export function generatedDeltaStats(project: Project, template: { prefix?: strin
   const base = normaliseTemplateValue(template.base);
   const job = normaliseTemplateValue(template.job);
   const jobCategory = template.jobCategory?.trim().toLowerCase();
-  const prefixTemplate = (project.deltaPrefixes ?? []).find((item) => item.label.trim().toUpperCase() === prefix);
-  const baseTemplate = (project.deltaBases ?? []).find((item) => item.label.trim().toUpperCase() === base);
+  const prefixTemplate = effectiveDeltaPrefixes(project.deltaPrefixes).find((item) => item.label.trim().toUpperCase() === prefix);
+  const baseTemplate = effectiveDeltaBases(project.deltaBases).find((item) => item.label.trim().toUpperCase() === base);
   const jobTemplate = (project.deltaJobs ?? []).find((item) => {
     if (item.label.trim().toUpperCase() !== job) return false;
     if (!jobCategory) return true;
@@ -58,7 +98,7 @@ export function generatedDeltaStats(project: Project, template: { prefix?: strin
   scores = applyModifiers(scores, baseTemplate?.statModifiers);
   scores = applyModifiers(scores, jobTemplate?.statModifiers);
   const hpBonus = baseTemplate?.hpBonus ?? 0;
-  const maxHp = Math.max(1, 10 + abilityModifier(scores.CON) + hpBonus);
+  const maxHp = derivedHp(scores.CON, hpBonus);
   return {
     scores,
     hpBonus,
@@ -89,18 +129,46 @@ export function generatedStatsPatch(project: Project, template: { prefix?: strin
   };
 }
 
-async function characterEntityPatch(character: Character) {
+export async function characterTemplateStats(project: Project, character: Character) {
+  const generated = generatedDeltaStats(project, {
+    prefix: character.prefix,
+    base: character.base,
+    job: character.job,
+    jobCategory: character.jobCategory
+  });
   const bonuses = await db.characterBonuses.where("characterId").equals(character.id).toArray();
-  const total = (base: number, stat: Ability) => base + bonuses.filter((bonus) => bonus.stat === stat).reduce((sum, bonus) => sum + bonus.value, 0);
+  const total = (base: number, stat: Ability) => {
+    const legacyBonus = bonuses.filter((bonus) => bonus.stat === stat).reduce((sum, bonus) => sum + bonus.value, 0);
+    return base + (generated.scores[stat] - (project.deltaDefaultNpcStats ?? defaultDeltaNpcStats())[stat]) + legacyBonus;
+  };
+  return {
+    STR: total(character.str, "STR"),
+    DEX: total(character.dex, "DEX"),
+    CON: total(character.con, "CON"),
+    INT: total(character.int, "INT"),
+    WIS: total(character.wis, "WIS"),
+    CHA: total(character.cha, "CHA"),
+    maxHp: derivedHp(total(character.con, "CON"), generated.hpBonus),
+    templateTag: generated.templateTag,
+    prefix: generated.prefix,
+    base: generated.base,
+    job: generated.job
+  };
+}
+
+async function characterEntityPatch(project: Project, character: Character) {
+  const stats = await characterTemplateStats(project, character);
   return {
     characterId: character.id,
     name: character.name,
-    str: total(character.str, "STR"),
-    dex: total(character.dex, "DEX"),
-    con: total(character.con, "CON"),
-    int: total(character.int, "INT"),
-    wis: total(character.wis, "WIS"),
-    cha: total(character.cha, "CHA"),
+    str: stats.STR,
+    dex: stats.DEX,
+    con: stats.CON,
+    int: stats.INT,
+    wis: stats.WIS,
+    cha: stats.CHA,
+    maxHp: stats.maxHp,
+    currentHp: stats.maxHp,
     templateTag: undefined,
     prefix: undefined,
     base: undefined,
@@ -166,7 +234,8 @@ export async function createProject(name: string) {
     deltaDefaultNpcStats: defaultDeltaNpcStats(),
     deltaPrefixes: defaultDeltaPrefixes(),
     deltaBases: defaultDeltaBases(),
-    deltaJobs: defaultDeltaJobs()
+    deltaJobs: defaultDeltaJobs(),
+    deltaSystemPrompt: defaultDeltaSystemPrompt
   };
   await db.projects.add(project);
   return project;
@@ -229,6 +298,17 @@ export async function getOrCreateDeltaSession(chat: Chat) {
       .and((message) => message.role === "system" && message.body.startsWith("Engagement Summary\n\nDelta Mode workspace initialized."))
       .primaryKeys() as string[];
     if (legacyPlaceholderMessages.length) await db.deltaMessages.bulkDelete(legacyPlaceholderMessages);
+    const activeEntities = await db.deltaEntities.where("sessionId").equals(existing.id).sortBy("orderIndex");
+    const seenEntities = new Set<string>();
+    const duplicateEntityIds: string[] = [];
+    for (const entity of activeEntities) {
+      const identity = entity.characterId
+        ? `character:${entity.characterId}`
+        : `generated:${entity.name.trim().toLocaleLowerCase()}`;
+      if (seenEntities.has(identity)) duplicateEntityIds.push(entity.id);
+      else seenEntities.add(identity);
+    }
+    if (duplicateEntityIds.length) await db.deltaEntities.bulkDelete(duplicateEntityIds);
     const messageCount = await db.deltaMessages.where("sessionId").equals(existing.id).count();
     if (messageCount === 0) {
       const placeholder = await db.deltaEntities
@@ -245,7 +325,7 @@ export async function getOrCreateDeltaSession(chat: Chat) {
     id: uid(),
     chatId: chat.id,
     projectId: chat.projectId,
-    title: "New Engagement",
+    title: "Untitled Engagement",
     active: true,
     settings: {
       temperature: 0,
@@ -255,8 +335,9 @@ export async function getOrCreateDeltaSession(chat: Chat) {
     updatedAt: timestamp
   };
   const playerCharacter = chat.deltaPlayerCharacterId ? await db.characters.get(chat.deltaPlayerCharacterId) : undefined;
-  const playerPatch = playerCharacter && playerCharacter.projectId === chat.projectId
-    ? await characterEntityPatch(playerCharacter)
+  const project = await db.projects.get(chat.projectId);
+  const playerPatch = playerCharacter && project && playerCharacter.projectId === chat.projectId
+    ? await characterEntityPatch(project, playerCharacter)
     : {
         name: "Player character",
         currentHp: 10,
@@ -421,17 +502,18 @@ export async function getCharacterBio(projectId: string, characterId: string) {
 export async function getCharacterStats(projectId: string, characterId: string) {
   const character = await db.characters.get(characterId);
   if (!character || character.projectId !== projectId) return null;
-  const bonuses = await db.characterBonuses.where("characterId").equals(characterId).toArray();
-  const total = (base: number, stat: Ability) => base + bonuses.filter((bonus: CharacterBonus) => bonus.stat === stat).reduce((sum, bonus) => sum + bonus.value, 0);
+  const project = await db.projects.get(projectId);
+  if (!project) return null;
+  const stats = await characterTemplateStats(project, character);
   return {
     character: character.name,
     stats: {
-      STR: total(character.str, "STR"),
-      DEX: total(character.dex, "DEX"),
-      CON: total(character.con, "CON"),
-      INT: total(character.int, "INT"),
-      WIS: total(character.wis, "WIS"),
-      CHA: total(character.cha, "CHA")
+      STR: stats.STR,
+      DEX: stats.DEX,
+      CON: stats.CON,
+      INT: stats.INT,
+      WIS: stats.WIS,
+      CHA: stats.CHA
     }
   };
 }
