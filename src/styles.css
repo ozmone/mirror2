@@ -310,6 +310,44 @@ small {
   padding-top: env(safe-area-inset-top);
 }
 
+.loading-signal {
+  --pulse-size: 0.62em;
+  display: inline-block;
+  width: var(--pulse-size);
+  height: var(--pulse-size);
+  margin: 0.28em 0.42em;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 46%, transparent);
+  animation: loading-signal-pulse 1.8s infinite linear;
+  position: relative;
+  vertical-align: middle;
+}
+
+.loading-signal::before,
+.loading-signal::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 38%, transparent);
+  animation: inherit;
+}
+
+.loading-signal::before {
+  animation-delay: -0.6s;
+}
+
+.loading-signal::after {
+  animation-delay: -1.2s;
+}
+
+@keyframes loading-signal-pulse {
+  100% {
+    box-shadow: 0 0 0 calc(var(--pulse-size) + 2px) transparent;
+  }
+}
+
 .topbar {
   height: calc(62px + env(safe-area-inset-top));
   display: grid;

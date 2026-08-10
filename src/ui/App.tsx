@@ -506,15 +506,22 @@ async function imageForOpenRouter(file: File) {
 }
 
 function messageHistoryText(message: Message) {
+  const body = message.role === "user" ? clarifyLeadingOocForModel(message.body) : message.body;
   return message.attachmentContext
-    ? `${message.body}\n\n[Attachment context for this message:\n${message.attachmentContext}]`
-    : message.body;
+    ? `${body}\n\n[Attachment context for this message:\n${message.attachmentContext}]`
+    : body;
+}
+
+function clarifyLeadingOocForModel(text: string) {
+  return text.trimStart().startsWith("((")
+    ? `[Out-of-character user note. Treat this as real user-authored context/instruction, not as missing content.]\n${text}`
+    : text;
 }
 
 function chatHistoryContent(history: Message[], currentMessageId: string | undefined, currentImages: { dataUrl: string; mimeType: string }[]) {
   return history.map((message) => ({
     role: (message.role === "system" ? "system" : message.role === "assistant" ? "assistant" : "user") as OpenRouterMessage["role"],
-    content: message.id === currentMessageId && currentImages.length ? openRouterContent(message.body, currentImages) : messageHistoryText(message)
+    content: message.id === currentMessageId && currentImages.length ? openRouterContent(clarifyLeadingOocForModel(message.body), currentImages) : messageHistoryText(message)
   }));
 }
 
@@ -583,6 +590,10 @@ function MarkdownText({ text, emptyText }: { text: string; emptyText?: string })
       })}
     </div>
   );
+}
+
+function LoadingSignal() {
+  return <span className="loading-signal" aria-label="Loading" role="status" />;
 }
 
 function DeltaTurnText({ text }: { text: string }) {
@@ -2574,6 +2585,7 @@ function DeltaModeWorkspace({
               }
               const cinematicSplit = splitDeltaCinematic(message.body);
               const bodyText = cinematicSplit.turn || message.body;
+              const isLoading = message.status === "pending" && bodyText.trim() === "...";
               const rowEntity = session.initiativeStarted && orderedEntities.length > 0
                 ? orderedEntities[displayedTurnNumber % orderedEntities.length]
                 : undefined;
@@ -2588,7 +2600,7 @@ function DeltaModeWorkspace({
                   )}
                   <article className={`delta-log-row ${message.role === "user" ? "user" : "assistant"} ${relationshipForEntity(rowEntity)}`}>
                     <span className="delta-log-number">{String(displayedTurnNumber).padStart(2, "0")}</span>
-                    <div className="message-body"><DeltaTurnText text={bodyText} /></div>
+                    <div className="message-body">{isLoading ? <LoadingSignal /> : <DeltaTurnText text={bodyText} />}</div>
                   </article>
                 </Fragment>
               );
@@ -3557,8 +3569,9 @@ function ChatScreen({
         .where("[chatId+branchId+sequence]")
         .between([chatId, branchId, Dexie.minKey], [chatId, branchId, Dexie.maxKey])
         .toArray();
+      const orderedHistory = allHistory.sort((a, b) => a.sequence - b.sequence);
       const historyLimit = historyNoLimit ? undefined : optionalNumber(maxHistory);
-      const selectedHistory = historyLimit ? allHistory.slice(-historyLimit) : allHistory;
+      const selectedHistory = historyLimit ? orderedHistory.slice(-historyLimit) : orderedHistory;
       const memoryDetails = await memoryContext(text, selectedHistory);
       const systemParts = [
         `Project: ${project.name}`,
@@ -4296,7 +4309,7 @@ function MessageRow({
       <article className={`message ${message.role}`} onClick={onExpand}>
         {expanded && message.role === "assistant" && message.modelId && <div className="message-model">{message.modelId}</div>}
         {message.role === "user" && <MessageImageAttachments messageId={message.id} />}
-        <div className="message-body"><MarkdownText text={message.body} /></div>
+        <div className="message-body">{message.status === "pending" && message.body.trim() === "..." ? <LoadingSignal /> : <MarkdownText text={message.body} />}</div>
         {message.deltaBrief?.status === "pending" && (
           <div className="delta-brief-panel" onClick={(event) => event.stopPropagation()}>
             <div className="delta-brief-player">
