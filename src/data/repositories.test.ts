@@ -157,10 +157,60 @@ describe("local data rules", () => {
       character: "Legolas",
       stats: {
         STR: 9,
-        DEX: 18,
+        DEX: 14,
+        CON: 9,
+        INT: 11,
+        WIS: 11,
+        CHA: 10
+      }
+    });
+  });
+
+  it("does not apply imported JOB modifiers to custom character builds", async () => {
+    const project = {
+      ...sampleProject(),
+      deltaDefaultNpcStats: { STR: 10, DEX: 10, CON: 10, INT: 10, WIS: 10, CHA: 10 },
+      deltaPrefixes: [{ id: "prefix-int", label: "INT", statModifiers: { INT: 1 } }],
+      deltaBases: defaultDeltaBases(),
+      deltaJobs: [{ id: "job-sharpshooter", label: "SHARPSHOOTER", category: "ranged", statModifiers: { DEX: 2, WIS: 1 } }]
+    };
+    const character: Character = {
+      id: "custom-ranger",
+      projectId: project.id,
+      name: "Custom Ranger",
+      normalisedName: "custom-ranger",
+      age: "",
+      gender: "",
+      personality: "",
+      misc: "",
+      bio: "",
+      statsEnabled: true,
+      str: 10,
+      dex: 14,
+      con: 10,
+      int: 11,
+      wis: 12,
+      cha: 10,
+      prefix: "INT",
+      base: "LIGHT",
+      jobCategory: "ranged",
+      job: "SHARPSHOOTER",
+      buildMode: "custom",
+      customJobName: "Ranger",
+      createdAt: 1,
+      updatedAt: 1
+    };
+    await testDb.projects.add(project);
+    await testDb.characters.add(character);
+
+    expect(await getCharacterStats(project.id, character.id)).toEqual({
+      character: "Custom Ranger",
+      stats: {
+        STR: 9,
+        DEX: 16,
         CON: 9,
         INT: 12,
-        WIS: 13,
+        WIS: 12,
         CHA: 10
       }
     });

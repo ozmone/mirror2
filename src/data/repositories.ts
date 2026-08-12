@@ -130,16 +130,19 @@ export function generatedStatsPatch(project: Project, template: { prefix?: strin
 }
 
 export async function characterTemplateStats(project: Project, character: Character) {
+  const templateBuild = character.buildMode ? character.buildMode === "template" : Boolean(character.job);
+  const defaultStats = project.deltaDefaultNpcStats ?? defaultDeltaNpcStats();
   const generated = generatedDeltaStats(project, {
     prefix: character.prefix,
     base: character.base,
-    job: character.job,
-    jobCategory: character.jobCategory
+    job: templateBuild ? character.job : undefined,
+    jobCategory: templateBuild ? character.jobCategory : undefined
   });
   const bonuses = await db.characterBonuses.where("characterId").equals(character.id).toArray();
   const total = (base: number, stat: Ability) => {
     const legacyBonus = bonuses.filter((bonus) => bonus.stat === stat).reduce((sum, bonus) => sum + bonus.value, 0);
-    return base + (generated.scores[stat] - (project.deltaDefaultNpcStats ?? defaultDeltaNpcStats())[stat]) + legacyBonus;
+    const baseScore = templateBuild ? defaultStats[stat] : base;
+    return baseScore + (generated.scores[stat] - defaultStats[stat]) + legacyBonus;
   };
   return {
     STR: total(character.str, "STR"),
@@ -311,12 +314,12 @@ export async function getOrCreateDeltaSession(chat: Chat) {
     if (duplicateEntityIds.length) await db.deltaEntities.bulkDelete(duplicateEntityIds);
     const messageCount = await db.deltaMessages.where("sessionId").equals(existing.id).count();
     if (messageCount === 0) {
-      const placeholder = await db.deltaEntities
+      const placeholderIds = await db.deltaEntities
         .where("sessionId")
         .equals(existing.id)
-        .and((entity) => entity.name === "Opposition" && entity.statusText === "Placeholder")
-        .first();
-      if (placeholder) await db.deltaEntities.delete(placeholder.id);
+        .and((entity) => (entity.name === "Opposition" && entity.statusText === "Placeholder") || entity.name.trim().toLocaleLowerCase() === "player character")
+        .primaryKeys() as string[];
+      if (placeholderIds.length) await db.deltaEntities.bulkDelete(placeholderIds);
     }
     return existing;
   }
@@ -338,19 +341,12 @@ export async function getOrCreateDeltaSession(chat: Chat) {
   const project = await db.projects.get(chat.projectId);
   const playerPatch = playerCharacter && project && playerCharacter.projectId === chat.projectId
     ? await characterEntityPatch(project, playerCharacter)
-    : {
-        name: "Player character",
-        currentHp: 10,
-        maxHp: 10,
-        statusText: "Ready",
-        distanceFromPlayer: "0m",
-        elevation: "ground"
-      };
+    : undefined;
   await db.transaction("rw", db.deltaSessions, db.deltaEntities, async () => {
     await db.deltaSessions.add(session);
-    await db.deltaEntities.bulkAdd([
-      { id: uid(), sessionId: session.id, ...playerPatch, side: "ally", orderIndex: 0, createdAt: timestamp, updatedAt: timestamp }
-    ]);
+    if (playerPatch) {
+      await db.deltaEntities.add({ id: uid(), sessionId: session.id, ...playerPatch, side: "ally", orderIndex: 0, createdAt: timestamp, updatedAt: timestamp });
+    }
   });
   return session;
 }

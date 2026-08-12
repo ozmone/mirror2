@@ -101,6 +101,7 @@ export interface Project extends Timestamped {
   locked: boolean;
   inventoryEnabled: boolean;
   gearEnabled: boolean;
+  deltaEnabled?: boolean;
   currencyName?: string;
   deltaDefaultNpcStats?: AbilityScores;
   deltaPrefixes?: DeltaPrefixTemplate[];
@@ -151,11 +152,27 @@ export interface Message extends Timestamped {
   deltaBrief?: {
     status: "pending" | "started";
     brief: string;
+    handoffContext?: string;
+    playerCharacterId?: string;
     playerCharacterName?: string;
+    mapSize?: DeltaMapSize;
     avoidLabel?: string;
     avoidPrompt?: string;
     startedAt?: number;
   };
+}
+
+export type DeltaMapSize = "S" | "M" | "L" | "XL" | "XXL";
+
+export type DeltaMapTileKind = "solid" | "half" | "special" | "access";
+
+export interface DeltaMapTile {
+  row: number;
+  column: number;
+  kind: DeltaMapTileKind;
+  label?: string;
+  color?: string;
+  accessState?: "open" | "closed" | "locked";
 }
 
 export interface DeltaModeSettings {
@@ -171,6 +188,8 @@ export interface DeltaSession extends Timestamped {
   chatId: string;
   projectId: string;
   title: string;
+  mapSize?: DeltaMapSize;
+  mapTiles?: DeltaMapTile[];
   active: boolean;
   archivedAt?: number;
   initiativeStarted?: boolean;
@@ -220,6 +239,8 @@ export interface DeltaEntity extends Timestamped {
   statusText?: string;
   distanceFromPlayer?: string;
   elevation?: string;
+  mapRow?: number;
+  mapColumn?: number;
   str?: number;
   dex?: number;
   con?: number;
@@ -256,6 +277,21 @@ export interface DeltaAllyCacheEntry extends Timestamped {
 
 export interface DeltaActionMacro extends Timestamped {
   chatId: string;
+  parentId?: string;
+  label: string;
+  template?: string;
+  requestEntitySelection?: boolean;
+  orderIndex: number;
+}
+
+export interface CharacterActionSlot extends Timestamped {
+  characterId: string;
+  name?: string;
+  orderIndex: number;
+}
+
+export interface CharacterActionMacro extends Timestamped {
+  slotId: string;
   parentId?: string;
   label: string;
   template?: string;
@@ -306,6 +342,8 @@ export interface SourceFile extends Timestamped {
 }
 
 export type InventoryKind = "inventory" | "gear";
+export type GearBodyType = "type-a" | "type-b";
+export type GearSlotName = "head" | "torso" | "hands" | "legs" | "feet" | "ear" | "neck" | "wrist" | "ex1" | "ex2" | "belt" | "back";
 
 export interface InventoryItem extends Timestamped {
   projectId: string;
@@ -344,6 +382,9 @@ export interface Character extends Timestamped {
   base?: string;
   job?: string;
   jobCategory?: string;
+  buildMode?: "template" | "custom";
+  customJobName?: string;
+  gearBodyType?: GearBodyType;
 }
 
 export interface CharacterBonus extends Timestamped {
@@ -351,6 +392,20 @@ export interface CharacterBonus extends Timestamped {
   name: string;
   stat: Ability;
   value: number;
+}
+
+export interface CharacterGearSlot extends Timestamped {
+  characterId: string;
+  slot: GearSlotName;
+  itemName: string;
+  dpBonus?: number;
+  apBonus?: number;
+  hpBonus?: number;
+  carryWeightKg?: number;
+  combatLoadKg?: number;
+  carrySlots?: number;
+  carryReductionPercent?: number;
+  traits?: string;
 }
 
 export type Ability = "STR" | "DEX" | "CON" | "INT" | "WIS" | "CHA";
