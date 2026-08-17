@@ -161,7 +161,7 @@ function CharacterGearPanel({ project, chat, onOpenCharacter, onRefresh }: { pro
                     slot.hpBonus ? `HP ${slot.hpBonus > 0 ? "+" : ""}${slot.hpBonus}` : "",
                     slot.carryWeightKg ? `${formatKg(slot.carryWeightKg)}` : "",
                     slot.combatLoadKg ? `Combat ${formatKg(slot.combatLoadKg)}` : "",
-                    slot.carrySlots ? `Extra boxes ${slot.carrySlots}` : "",
+                    slot.carrySlots ? `inv slots ${slot.carrySlots}` : "",
                     slot.carryReductionPercent ? `Weight ${slot.carryReductionPercent}%` : ""
                   ].filter(Boolean).join(" · ") || "No structured effects."}</small>
                   {slot.traits && <p>{slot.traits}</p>}

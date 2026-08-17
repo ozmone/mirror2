@@ -233,6 +233,7 @@ export async function createProject(name: string) {
     memoryInstruction: defaultMemoryInstruction,
     locked: false,
     inventoryEnabled: false,
+    currencyName: "money",
     gearEnabled: false,
     deltaDefaultNpcStats: defaultDeltaNpcStats(),
     deltaPrefixes: defaultDeltaPrefixes(),
@@ -436,7 +437,7 @@ export async function searchMemories(projectId: string, tags: string[], query = 
     }));
 }
 
-export async function applyInventoryChange(projectId: string, chatId: string, kind: InventoryKind, rawName: string, delta: number, logSentence: string) {
+export async function applyInventoryChange(projectId: string, chatId: string, kind: InventoryKind, rawName: string, delta: number, logSentence: string, unitWeightKg?: number) {
   const name = normaliseInventoryName(rawName);
   if (!name || !Number.isFinite(delta) || delta === 0) return null;
   const timestamp = now();
@@ -448,13 +449,17 @@ export async function applyInventoryChange(projectId: string, chatId: string, ki
   const existing = existingItems[0];
   const currentQuantity = existingItems.reduce((sum, item) => sum + item.quantity, 0);
   const quantity = Math.max(0, currentQuantity + delta);
+  const nextUnitWeightKg = Number.isFinite(unitWeightKg) && (unitWeightKg ?? 0) > 0
+    ? Math.max(0.01, Math.round((unitWeightKg ?? 0) * 100) / 100)
+    : existing?.unitWeightKg;
   await db.transaction("rw", db.inventoryItems, db.inventoryLogs, async () => {
     if (existing) {
-      await db.inventoryItems.update(existing.id, { name, normalisedName: name, quantity, updatedAt: timestamp });
+      if (quantity === 0) await db.inventoryItems.delete(existing.id);
+      else await db.inventoryItems.update(existing.id, { name, normalisedName: name, quantity, unitWeightKg: nextUnitWeightKg, updatedAt: timestamp });
       const duplicateIds = existingItems.slice(1).map((item) => item.id);
       if (duplicateIds.length) await db.inventoryItems.bulkDelete(duplicateIds);
     } else if (delta > 0) {
-      await db.inventoryItems.add({ id: uid(), projectId, chatId, kind, name, normalisedName: name, quantity, createdAt: timestamp, updatedAt: timestamp });
+      await db.inventoryItems.add({ id: uid(), projectId, chatId, kind, name, normalisedName: name, quantity, unitWeightKg: nextUnitWeightKg, createdAt: timestamp, updatedAt: timestamp });
     } else {
       return;
     }

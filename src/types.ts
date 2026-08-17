@@ -81,6 +81,7 @@ export interface InventoryUpdateRequest {
   kind: InventoryKind | "currency";
   name: string;
   delta: number;
+  unitWeightKg?: number;
   logSentence: string;
   status: "pending" | "confirmed" | "edit" | "rejected" | "applied";
 }
@@ -196,11 +197,13 @@ export interface DeltaSession extends Timestamped {
   turnIndex?: number;
   awaitingPlayerAction?: boolean;
   awaitingPlayerRoll?: boolean;
+  finishReady?: boolean;
   requiredRollDie?: number;
   requiredRollCount?: number;
   requiredRollResults?: number[];
   requiredRollKind?: "initiative" | "check";
   requiredRollLabel?: string;
+  requiredRollerName?: string;
   actionPrompt?: string;
   settings: DeltaModeSettings;
 }
@@ -352,6 +355,7 @@ export interface InventoryItem extends Timestamped {
   name: string;
   normalisedName: string;
   quantity: number;
+  unitWeightKg?: number;
 }
 
 export interface InventoryLog extends Timestamped {
