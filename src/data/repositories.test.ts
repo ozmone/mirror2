@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { db } from "./db";
 import { defaultDeltaBases, defaultSettings, sampleProject } from "./defaults";
-import { applyInventoryChange, createChat, createMemory, formatDeltaTemplateTag, generatedDeltaStats, getCharacterBio, getCharacterIdentity, getCharacterStats, normaliseInventoryName, searchMemories, validatePointBuy } from "./repositories";
-import { Character } from "../types";
+import { addDeltaMessage, applyDeltaDamage, applyInventoryChange, createChat, createMemory, formatDeltaTemplateTag, generatedDeltaStats, getCharacterBio, getCharacterIdentity, getCharacterStats, messagesForIncrementalCompaction, normaliseInventoryName, searchMemories, validatePointBuy } from "./repositories";
+import { Character, DeltaRollReceipt, Message } from "../types";
 
 describe("local data rules", () => {
   afterEach(async () => {
@@ -21,6 +21,28 @@ describe("local data rules", () => {
     expect(found).toHaveLength(1);
     expect(found[0].text).toContain("Jaeger");
     expect(found[0].relevance).toBeGreaterThan(0);
+  });
+
+  it("selects only newly expired completed messages for incremental compaction", () => {
+    const message = (sequence: number, status: Message["status"] = "complete"): Message => ({
+      id: `message-${sequence}`,
+      chatId: "chat",
+      branchId: "branch",
+      sequence,
+      role: sequence % 2 ? "assistant" : "user",
+      body: status === "pending" ? "..." : `Message ${sequence}`,
+      status,
+      starred: false,
+      estimatedTokens: true,
+      createdAt: sequence,
+      updatedAt: sequence
+    });
+    const history = [message(0), message(1), message(2), message(3), message(4), message(5), message(6, "pending")];
+
+    expect(messagesForIncrementalCompaction(history, 4).map((row) => row.sequence)).toEqual([0, 1]);
+    expect(messagesForIncrementalCompaction(history, 4, 0).map((row) => row.sequence)).toEqual([1]);
+    expect(messagesForIncrementalCompaction(history, 2).map((row) => row.sequence)).toEqual([0, 1, 2, 3]);
+    expect(messagesForIncrementalCompaction(history, 10)).toEqual([]);
   });
 
   it("returns only the requested character division", async () => {
@@ -220,6 +242,156 @@ describe("local data rules", () => {
     await testDb.settings.put({ ...defaultSettings(), apiKey: "sk-or-secret" });
     const settings = { ...(await testDb.settings.get("settings")), apiKey: undefined };
     expect(settings.apiKey).toBeUndefined();
+  });
+
+  it("persists app-generated Delta roll receipts on their own turn event", async () => {
+    const receipt: DeltaRollReceipt = {
+      id: "roll-receipt-1",
+      source: "client-web-crypto",
+      generator: "crypto.getRandomValues",
+      algorithm: "uint32-rejection-sampling-v1",
+      toolName: "request_delta_roll",
+      rollerName: "Jaeger",
+      label: "disarm contest",
+      die: 20,
+      count: 1,
+      rawValues: [123456789],
+      results: [10],
+      generatedAt: 1
+    };
+
+    const message = await addDeltaMessage("delta-session-1", "system", "Jaeger: Roll disarm contest: d20 = 10", {
+      turnNumber: 7,
+      eventType: "roll",
+      rollReceipt: receipt
+    });
+
+    expect(await testDb.deltaMessages.get(message.id)).toMatchObject({
+      turnNumber: 7,
+      eventType: "roll",
+      rollReceipt: receipt
+    });
+  });
+
+  it("subtracts Delta damage once through its verified roll receipt", async () => {
+    const receipt: DeltaRollReceipt = {
+      id: "damage-receipt-1",
+      source: "client-web-crypto",
+      generator: "crypto.getRandomValues",
+      algorithm: "uint32-rejection-sampling-v1",
+      toolName: "request_delta_roll",
+      rollerName: "Jaeger",
+      label: "damage",
+      die: 8,
+      count: 1,
+      rawValues: [1],
+      results: [2],
+      generatedAt: 1
+    };
+    const rollMessage = await addDeltaMessage("delta-session-1", "system", "Jaeger: Roll damage: d8 = 2", {
+      turnNumber: 1,
+      eventType: "roll",
+      rollReceipt: receipt
+    });
+    await testDb.deltaEntities.add({
+      id: "unknown-figure-2",
+      sessionId: "delta-session-1",
+      name: "Unknown Figure 2",
+      side: "hostile",
+      currentHp: 4,
+      maxHp: 4,
+      orderIndex: 0,
+      createdAt: 1,
+      updatedAt: 1
+    });
+
+    expect(await applyDeltaDamage("delta-session-1", "unknown-figure-2", 2, receipt.id)).toMatchObject({ beforeHp: 4, damage: 2, afterHp: 2 });
+    expect(await applyDeltaDamage("delta-session-1", "unknown-figure-2", 2, receipt.id)).toMatchObject({ duplicate: true, currentHp: 2 });
+    expect((await testDb.deltaEntities.get("unknown-figure-2"))?.currentHp).toBe(2);
+    expect((await testDb.deltaMessages.get(rollMessage.id))?.rollReceipt?.hpApplications).toEqual([
+      expect.objectContaining({ entityName: "Unknown Figure 2", beforeHp: 4, amount: 2, afterHp: 2 })
+    ]);
+  });
+
+  it("marks a zero-HP Delta entity KO or DEAD through the damage operation", async () => {
+    const receipt: DeltaRollReceipt = {
+      id: "lethal-damage-receipt",
+      source: "client-web-crypto",
+      generator: "crypto.getRandomValues",
+      algorithm: "uint32-rejection-sampling-v1",
+      toolName: "request_delta_roll",
+      rollerName: "Halle",
+      label: "damage",
+      die: 8,
+      count: 1,
+      rawValues: [9],
+      results: [8],
+      generatedAt: 1
+    };
+    await addDeltaMessage("delta-session-2", "system", "Halle: Roll damage: d8 = 8", {
+      turnNumber: 1,
+      eventType: "roll",
+      rollReceipt: receipt
+    });
+    await testDb.deltaEntities.add({
+      id: "hostile-1",
+      sessionId: "delta-session-2",
+      name: "Enforcer",
+      side: "hostile",
+      currentHp: 3,
+      maxHp: 3,
+      orderIndex: 0,
+      createdAt: 1,
+      updatedAt: 1
+    });
+
+    expect(await applyDeltaDamage("delta-session-2", "hostile-1", 8, receipt.id, "dead")).toMatchObject({ afterHp: 0, engagementState: "dead" });
+    expect(await testDb.deltaEntities.get("hostile-1")).toMatchObject({ currentHp: 0, engagementState: "dead" });
+  });
+
+  it("persists project-scoped Delta effects and reusable icon assets", async () => {
+    await testDb.deltaIcons.add({
+      id: "icon-1",
+      projectId: "project-1",
+      name: "Bandaged",
+      dataUrl: "data:image/png;base64,AA==",
+      sourceModel: "image-model",
+      sourcePrompt: "bandage",
+      createdAt: 1,
+      updatedAt: 1
+    });
+    await testDb.deltaEffects.add({
+      id: "effect-1",
+      projectId: "project-1",
+      name: "Bleeding",
+      polarity: "negative",
+      iconId: "icon-1",
+      effectText: "Subtract 1 HP every turn.",
+      curable: true,
+      cureText: "Bandage and apply pressure.",
+      cureEndBehavior: "retain",
+      ko: false,
+      koText: "",
+      koEndBehavior: "remove",
+      targetSelf: true,
+      targetOthers: true,
+      targetAllies: true,
+      targetNeutral: true,
+      targetEnemies: true,
+      targetMode: "single",
+      savingThrowEnabled: true,
+      savingThrowStat: "CON",
+      savingThrowMinimum: 12,
+      savingThrowTiming: "every-turn",
+      cancelledByStatus: false,
+      cancellationPolarity: "positive",
+      cancelledByEffectIds: [],
+      createdAt: 1,
+      updatedAt: 1
+    });
+
+    expect(await testDb.deltaEffects.where("projectId").equals("project-1").first()).toMatchObject({ name: "Bleeding", iconId: "icon-1", savingThrowTiming: "every-turn" });
+    expect(await testDb.deltaIcons.where("projectId").equals("project-1").first()).toMatchObject({ name: "Bandaged", dataUrl: "data:image/png;base64,AA==" });
   });
 });
 

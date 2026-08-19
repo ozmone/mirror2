@@ -12,6 +12,8 @@ import {
   CharacterGearSlot,
   Chat,
   DeltaEntity,
+  DeltaEffectDefinition,
+  DeltaIconAsset,
   DeltaAllyCacheEntry,
   DeltaActionMacro,
   DeltaMessage,
@@ -52,6 +54,8 @@ export class MirrorDatabase extends Dexie {
   deltaSessions!: Table<DeltaSession, string>;
   deltaMessages!: Table<DeltaMessage, string>;
   deltaEntities!: Table<DeltaEntity, string>;
+  deltaEffects!: Table<DeltaEffectDefinition, string>;
+  deltaIcons!: Table<DeltaIconAsset, string>;
   deltaAllyCache!: Table<DeltaAllyCacheEntry, string>;
   deltaActionMacros!: Table<DeltaActionMacro, string>;
   characterActionSlots!: Table<CharacterActionSlot, string>;
@@ -344,6 +348,36 @@ export class MirrorDatabase extends Dexie {
       deltaActionMacros: "id, [chatId+parentId+orderIndex], chatId, parentId, orderIndex"
     }).upgrade(async (transaction) => {
       await transaction.table("inventoryItems").filter((item) => item.kind === "gear").delete();
+    });
+    this.version(13).stores({
+      settings: "id",
+      projects: "id, orderIndex, pinned, locked, updatedAt",
+      chats: "id, [projectId+updatedAt], projectId, activeBranchId, archived",
+      branches: "id, chatId, rootMessageId",
+      messages: "id, [chatId+branchId+sequence], chatId, branchId, parentMessageId, sequence, starred",
+      stars: "id, [projectId+updatedAt], messageId, chatId",
+      archives: "id, [projectId+updatedAt], projectId",
+      archiveEntries: "id, [archiveId+orderIndex], archiveId",
+      attachments: "id, [ownerType+ownerId]",
+      characters: "id, [projectId+normalisedName], [projectId+orderIndex], projectId",
+      characterBonuses: "id, characterId, stat",
+      characterGearSlots: "id, [characterId+slot], characterId, slot",
+      characterActionSlots: "id, [characterId+orderIndex], characterId, orderIndex",
+      characterActionMacros: "id, [slotId+parentId+orderIndex], slotId, parentId, orderIndex",
+      memories: "id, [projectId+updatedAt], projectId, *normalisedTags, archived",
+      pendingMemories: "id, projectId, updatedAt",
+      modelLibrary: "id, modelId, orderIndex",
+      migrationMetadata: "id, schemaVersion",
+      sourceFiles: "id, [projectId+updatedAt], projectId",
+      inventoryItems: "id, [chatId+kind+normalisedName], chatId, projectId, kind, updatedAt",
+      inventoryLogs: "id, [chatId+updatedAt], chatId, projectId",
+      deltaSessions: "id, [chatId+updatedAt], chatId, projectId, active",
+      deltaMessages: "id, [sessionId+sequence], sessionId, sequence",
+      deltaEntities: "id, [sessionId+orderIndex], sessionId, orderIndex",
+      deltaAllyCache: "id, [chatId+updatedAt], chatId, name",
+      deltaActionMacros: "id, [chatId+parentId+orderIndex], chatId, parentId, orderIndex",
+      deltaEffects: "id, [projectId+polarity], projectId, polarity, updatedAt",
+      deltaIcons: "id, [projectId+name], projectId, name, updatedAt"
     });
   }
 }

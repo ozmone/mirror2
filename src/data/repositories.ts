@@ -1,7 +1,7 @@
 import Dexie from "dexie";
 import { db } from "./db";
 import { defaultDeltaBases, defaultDeltaJobs, defaultDeltaNpcStats, defaultDeltaPrefixes, defaultDeltaSystemPrompt, defaultMemoryInstruction } from "./defaults";
-import { Ability, AbilityModifiers, AbilityScores, Character, CharacterBonus, Chat, DeltaAllyCacheEntry, DeltaBaseTemplate, DeltaEntity, DeltaPrefixTemplate, DeltaSession, InventoryKind, Memory, Message, Project } from "../types";
+import { Ability, AbilityModifiers, AbilityScores, Character, CharacterBonus, Chat, DeltaAllyCacheEntry, DeltaBaseTemplate, DeltaEntity, DeltaMessage, DeltaPrefixTemplate, DeltaSession, InventoryKind, Memory, Message, Project } from "../types";
 import { estimateTokens, fallbackChatTitle, normaliseTag, now, uid } from "../utils";
 
 export const abilities: Ability[] = ["STR", "DEX", "CON", "INT", "WIS", "CHA"];
@@ -16,6 +16,15 @@ export function validatePointBuy(scores: Pick<Character, "str" | "dex" | "con" |
     const value = scores[ability.toLowerCase() as Lowercase<Ability>];
     return value >= 8 && value <= 15;
   }) && totalPointCost(scores) <= 27;
+}
+
+export function messagesForIncrementalCompaction(messages: Message[], historyLimit: number, compactedThroughSequence = -1) {
+  if (!Number.isFinite(historyLimit) || historyLimit < 1) return [];
+  const stableHistory = [...messages]
+    .filter((message) => message.status !== "pending" && message.status !== "streaming" && message.status !== "failed" && message.body.trim() !== "...")
+    .sort((a, b) => a.sequence - b.sequence);
+  const expired = stableHistory.slice(0, Math.max(0, stableHistory.length - Math.floor(historyLimit)));
+  return expired.filter((message) => message.sequence > compactedThroughSequence);
 }
 
 function abilityModifier(score: number) {
@@ -239,7 +248,9 @@ export async function createProject(name: string) {
     deltaPrefixes: defaultDeltaPrefixes(),
     deltaBases: defaultDeltaBases(),
     deltaJobs: defaultDeltaJobs(),
-    deltaSystemPrompt: defaultDeltaSystemPrompt
+    deltaSystemPrompt: defaultDeltaSystemPrompt,
+    deltaRevealText: true,
+    deltaRevealSpeed: 5
   };
   await db.projects.add(project);
   return project;
@@ -325,6 +336,7 @@ export async function getOrCreateDeltaSession(chat: Chat) {
     return existing;
   }
   const timestamp = now();
+  const project = await db.projects.get(chat.projectId);
   const session: DeltaSession = {
     id: uid(),
     chatId: chat.id,
@@ -333,13 +345,14 @@ export async function getOrCreateDeltaSession(chat: Chat) {
     active: true,
     settings: {
       temperature: 0,
-      topP: 0
+      topP: 0,
+      revealText: project?.deltaRevealText ?? chat.deltaRevealText ?? true,
+      revealSpeed: project?.deltaRevealSpeed ?? chat.deltaRevealSpeed ?? 5
     },
     createdAt: timestamp,
     updatedAt: timestamp
   };
   const playerCharacter = chat.deltaPlayerCharacterId ? await db.characters.get(chat.deltaPlayerCharacterId) : undefined;
-  const project = await db.projects.get(chat.projectId);
   const playerPatch = playerCharacter && project && playerCharacter.projectId === chat.projectId
     ? await characterEntityPatch(project, playerCharacter)
     : undefined;
@@ -357,11 +370,79 @@ export async function archiveDeltaSession(sessionId: string, title: string) {
   await db.deltaSessions.update(sessionId, { title, active: false, archivedAt: timestamp, updatedAt: timestamp });
 }
 
-export async function addDeltaMessage(sessionId: string, role: "user" | "assistant" | "system", body: string) {
+export async function addDeltaMessage(
+  sessionId: string,
+  role: "user" | "assistant" | "system",
+  body: string,
+  metadata: Partial<Pick<DeltaMessage, "turnNumber" | "eventType" | "rollReceipt" | "modelId">> = {}
+) {
   const timestamp = now();
   const sequence = ((await db.deltaMessages.where("[sessionId+sequence]").between([sessionId, Dexie.minKey], [sessionId, Dexie.maxKey]).last())?.sequence ?? -1) + 1;
-  await db.deltaMessages.add({ id: uid(), sessionId, sequence, role, body, status: "complete", createdAt: timestamp, updatedAt: timestamp });
+  const message: DeltaMessage = { id: uid(), sessionId, sequence, role, body, status: "complete", ...metadata, createdAt: timestamp, updatedAt: timestamp };
+  await db.deltaMessages.add(message);
   await db.deltaSessions.update(sessionId, { updatedAt: timestamp });
+  return message;
+}
+
+export async function applyDeltaDamage(
+  sessionId: string,
+  entityId: string,
+  amount: number,
+  rollReceiptId: string,
+  zeroHpOutcome: "ko" | "dead" = "ko"
+) {
+  const damage = Math.max(0, Math.floor(amount));
+  if (damage <= 0) return { error: "Damage must be a positive whole number." } as const;
+  return db.transaction("rw", db.deltaEntities, db.deltaMessages, async () => {
+    const entity = await db.deltaEntities.get(entityId);
+    if (!entity || entity.sessionId !== sessionId) return { error: "Entity not found in this Delta engagement." } as const;
+    const receiptMessage = await db.deltaMessages
+      .where("sessionId")
+      .equals(sessionId)
+      .filter((message) => message.rollReceipt?.id === rollReceiptId)
+      .first();
+    if (!receiptMessage?.rollReceipt) return { error: "Verified roll receipt not found in this Delta engagement." } as const;
+    const appliedReceiptIds = entity.appliedDamageReceiptIds ?? [];
+    if (appliedReceiptIds.includes(rollReceiptId)) {
+      return {
+        duplicate: true,
+        entityId: entity.id,
+        entityName: entity.name,
+        currentHp: entity.currentHp ?? entity.maxHp ?? 1,
+        maxHp: entity.maxHp ?? 1,
+        rollReceiptId
+      } as const;
+    }
+    const maxHp = Math.max(1, Math.floor(entity.maxHp ?? 1));
+    const beforeHp = Math.max(0, Math.min(maxHp, Math.floor(entity.currentHp ?? maxHp)));
+    const afterHp = Math.max(0, beforeHp - damage);
+    const appliedAt = now();
+    const application = { entityId: entity.id, entityName: entity.name, kind: "damage" as const, amount: damage, beforeHp, afterHp, appliedAt };
+    await db.deltaEntities.update(entity.id, {
+      currentHp: afterHp,
+      ...(afterHp === 0 ? { engagementState: zeroHpOutcome } : {}),
+      appliedDamageReceiptIds: [...appliedReceiptIds, rollReceiptId],
+      updatedAt: appliedAt
+    });
+    await db.deltaMessages.update(receiptMessage.id, {
+      rollReceipt: {
+        ...receiptMessage.rollReceipt,
+        hpApplications: [...(receiptMessage.rollReceipt.hpApplications ?? []), application]
+      },
+      updatedAt: appliedAt
+    });
+    return {
+      applied: true,
+      entityId: entity.id,
+      entityName: entity.name,
+      damage,
+      beforeHp,
+      afterHp,
+      maxHp,
+      ...(afterHp === 0 ? { engagementState: zeroHpOutcome } : {}),
+      rollReceiptId
+    } as const;
+  });
 }
 
 export async function toggleStar(projectId: string, message: Message) {

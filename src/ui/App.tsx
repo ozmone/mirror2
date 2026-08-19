@@ -11,9 +11,9 @@ import {
   Edit3,
   Eye,
   Clipboard,
-  FileText,
   Folder,
   Image as ImageIcon,
+  Info,
   KeyRound,
   Map as MapIcon,
   Menu,
@@ -41,6 +41,7 @@ import {
   abilities,
   addMessage,
   addDeltaMessage,
+  applyDeltaDamage,
   applyInventoryChange,
   archiveDeltaSession,
   createChat,
@@ -52,6 +53,7 @@ import {
   getCharacterIdentity,
   getCharacterStats,
   normaliseInventoryName,
+  messagesForIncrementalCompaction,
   searchMemories,
   generatedDeltaStats,
   generatedStatsPatch,
@@ -64,7 +66,7 @@ import {
   validatePointBuy
 } from "../data/repositories";
 import { defaultDeltaBases, defaultDeltaJobs, defaultDeltaNpcStats, defaultDeltaPrefixes, defaultDeltaSystemPrompt, defaultMemoryInstruction, defaultSettings } from "../data/defaults";
-import { Ability, AbilityModifiers, AbilityScores, AppSettings, Character, CharacterActionMacro, CharacterActionSlot, CharacterBonus, CharacterGearSlot, Chat, DeltaAllyCacheEntry, DeltaBaseTemplate, DeltaEntity, DeltaFinishPacket, DeltaJobTemplate, DeltaLootItem, DeltaMapSize, DeltaMapTile, DeltaMapTileKind, DeltaMessage, DeltaPrefixTemplate, DeltaSession, GearBodyType, InventoryKind, InventoryItem, InventoryLog, InventoryUpdateRequest, Memory, Message, PendingMemory, Project, RouteName } from "../types";
+import { Ability, AbilityModifiers, AbilityScores, AppSettings, Character, CharacterActionMacro, CharacterActionSlot, CharacterBonus, CharacterGearSlot, Chat, DeltaAllyCacheEntry, DeltaBaseTemplate, DeltaBriefRoster, DeltaEffectDefinition, DeltaEffectPolarity, DeltaEntity, DeltaFinishPacket, DeltaIconAsset, DeltaJobTemplate, DeltaLootItem, DeltaMapSize, DeltaMapTile, DeltaMapTileKind, DeltaMessage, DeltaPrefixTemplate, DeltaRollReceipt, DeltaSavingThrowTiming, DeltaSession, GearBodyType, InventoryKind, InventoryItem, InventoryLog, InventoryUpdateRequest, MainChatAuditToolEvent, MainChatMemoryReviewAudit, MainChatRequestAudit, Memory, Message, PendingMemory, Project, RouteName } from "../types";
 import { estimateTokens, formatDate, normaliseTag, now, splitTags, uid } from "../utils";
 import { ProjectIcon, projectIcons } from "./icons";
 import { GearDrawer } from "./gear/GearDrawer";
@@ -127,6 +129,14 @@ function mixHex(a: string, b: string, amount: number) {
 function formatInventoryKg(value: number) {
   if (!Number.isFinite(value) || value <= 0) return "";
   return String(Math.max(0.01, Math.round(value * 100) / 100));
+}
+
+function formatByteSize(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  const index = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
+  const value = bytes / 1024 ** index;
+  return `${value >= 10 || index === 0 ? Math.round(value) : value.toFixed(1)} ${units[index]}`;
 }
 
 function readUnitWeightKg(totalWeightKg: string, quantity: number) {
@@ -320,17 +330,18 @@ function normaliseDeltaMapSize(value: unknown): DeltaMapSize {
 
 function parseDeltaBriefPacket(text: string) {
   try {
-    const parsed = JSON.parse(extractJsonObject(text)) as { brief?: unknown; handoffContext?: unknown; playerCharacterName?: unknown; mapSize?: unknown; avoidLabel?: unknown; avoidPrompt?: unknown };
+    const parsed = JSON.parse(extractJsonObject(text)) as { brief?: unknown; handoffContext?: unknown; playerCharacterName?: unknown; roster?: unknown; team?: unknown; neutral?: unknown; enemies?: unknown; mapSize?: unknown; avoidLabel?: unknown; avoidPrompt?: unknown };
     return {
       brief: typeof parsed.brief === "string" ? parsed.brief.trim() : "",
       handoffContext: typeof parsed.handoffContext === "string" ? parsed.handoffContext.trim() : "",
       playerCharacterName: typeof parsed.playerCharacterName === "string" ? parsed.playerCharacterName.trim() : "",
+      roster: normaliseDeltaBriefRoster(parsed.roster ?? { team: parsed.team, neutral: parsed.neutral, enemies: parsed.enemies }),
       mapSize: normaliseDeltaMapSize(parsed.mapSize),
       avoidLabel: typeof parsed.avoidLabel === "string" ? parsed.avoidLabel.trim() : "",
       avoidPrompt: typeof parsed.avoidPrompt === "string" ? parsed.avoidPrompt.trim() : ""
     };
   } catch {
-    return { brief: "", handoffContext: "", playerCharacterName: "", mapSize: "M" as DeltaMapSize, avoidLabel: "", avoidPrompt: "" };
+    return { brief: "", handoffContext: "", playerCharacterName: "", roster: normaliseDeltaBriefRoster(undefined), mapSize: "M" as DeltaMapSize, avoidLabel: "", avoidPrompt: "" };
   }
 }
 
@@ -448,15 +459,80 @@ function deltaRelationshipLabel(value: DeltaRelationship) {
 function cleanDeltaToolCallText(text: string) {
   return text
     .split("\n")
-    .filter((line) => !/^\s*(requesting|calling\s+for)\s+roll\b/i.test(line.trim()))
+    .filter((line) => {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.length > 140 || /["“”]/.test(trimmed)) return true;
+      if (/^(?:requesting|calling(?:\s+for)?)\b.*\broll\b/i.test(trimmed)) return false;
+      if (/^rolling\b.*(?:\broll\b|\bfor\b)/i.test(trimmed)) return false;
+      return true;
+    })
     .join("\n")
     .trim();
+}
+
+function deltaInlineRollResultDice(text: string) {
+  const dice = new Set<number>();
+  const normalized = text.replace(/[*_`]/g, "");
+  for (const match of normalized.matchAll(/\b(?:\d+\s*)?d(4|6|8|9|12|20|100)\b[^\n]{0,80}?(?:=|rolled?\s+)\s*-?\d+/gi)) {
+    dice.add(Number(match[1]));
+  }
+  if ((/\broll(?:ed|ing|s)?\b[^\n]{0,80}\b-?\d+\s*[+-]\s*-?\d+\s*=\s*-?\d+/i.test(normalized)
+    || /\broll(?:ed|s)\s+(?:a\s+)?-?\d+\b/i.test(normalized)
+    || /\b(?:attack|damage|initiative|reaction|check|save|contest)\s+roll\b[^\n:]{0,50}:\s*-?\d+\b/i.test(normalized)) && dice.size === 0) {
+    dice.add(0);
+  }
+  return [...dice];
+}
+
+function isDeltaRollNotice(text: string) {
+  return /^(Roll\b|[^:\n]{1,80}:\s*Roll\b)/.test(text.trim());
+}
+
+function deltaLogTurnCount(messages: DeltaMessage[]) {
+  let legacyTurns = 0;
+  let explicitTurnMax = 0;
+  let legacyRollPendingResolution = false;
+  for (const message of messages) {
+    explicitTurnMax = Math.max(explicitTurnMax, message.turnNumber ?? 0);
+    if (message.turnNumber !== undefined) continue;
+    if (message.role === "system" && isDeltaRollNotice(message.body)) {
+      legacyRollPendingResolution = legacyTurns > 0;
+      continue;
+    }
+    if (message.role === "system") continue;
+    if (message.role === "assistant" && legacyRollPendingResolution) {
+      legacyRollPendingResolution = false;
+      continue;
+    }
+    legacyRollPendingResolution = false;
+    legacyTurns += 1;
+  }
+  return Math.max(explicitTurnMax, legacyTurns);
 }
 
 function statModifier(value?: number) {
   if (typeof value !== "number") return "";
   const modifier = Math.floor((value - 10) / 2);
   return modifier >= 0 ? `+${modifier}` : `${modifier}`;
+}
+
+const deltaRollAbilities = ["STR", "DEX", "CON", "INT", "WIS", "CHA"] as const;
+type DeltaRollAbility = typeof deltaRollAbilities[number];
+
+function deltaRollModifier(entity: DeltaEntity | undefined, ability: DeltaRollAbility | undefined) {
+  if (!entity || !ability) return 0;
+  const score = entity[ability.toLowerCase() as "str" | "dex" | "con" | "int" | "wis" | "cha"] ?? 10;
+  return Math.floor((score - 10) / 2);
+}
+
+function deltaRollResultText(die: number, results: number[], modifier: number) {
+  const diceLabel = results.length > 1 ? `${results.length}d${die}` : `d${die}`;
+  const diceMath = results.join(" + ");
+  const rawTotal = results.reduce((total, result) => total + result, 0);
+  const total = rawTotal + modifier;
+  if (modifier === 0) return { text: results.length > 1 ? `${diceLabel} = ${diceMath} = ${total}` : `${diceLabel} = ${diceMath}`, total };
+  const modifierMath = modifier > 0 ? ` + ${modifier}` : ` - ${Math.abs(modifier)}`;
+  return { text: `${diceLabel} = ${diceMath}${modifierMath} = ${total}`, total };
 }
 
 function HpSquares({ current, max, relationship, character = false }: { current: number; max: number; relationship?: DeltaRelationship; character?: boolean }) {
@@ -626,7 +702,7 @@ function deltaRosterParticipants(text: string) {
   const actionWords = /\b(scanning|patrolling|flickering|setting|moving|watching|standing|crouching|aiming|speaking|waiting|emerging|approaching|entering|leaving|combat|engagement|situation|location|objective|terrain|map)\b/i;
   const sideForLabel = (label: string): DeltaRelationship => {
     const clean = label.toLowerCase();
-    if (clean.startsWith("hostile")) return "hostile";
+    if (clean.startsWith("hostile") || clean.startsWith("enem")) return "hostile";
     if (clean.startsWith("neutral")) return "neutral";
     return "ally";
   };
@@ -642,14 +718,14 @@ function deltaRosterParticipants(text: string) {
   const anchorsMatch = /DELTA CONTINUITY ANCHORS:\s*\n([\s\S]*?)(?=\n\n(?:PLAYER CHARACTER|MAP SIZE|PLAYER CHARACTER ID):|$)/i.exec(text);
   const anchors = anchorsMatch?.[1] ?? text;
   for (const line of anchors.split(/\r?\n/)) {
-    const match = /^\s*(player|allies?|ally|neutrals?|neutral|hostiles?|hostile)(?:\s+present)?\s*:\s*(.+)$/i.exec(line);
+    const match = /^\s*(player|your\s+team|team|allies?|ally|neutrals?|neutral|hostiles?|hostile|enemies|enemy)(?:\s+present)?\s*:\s*(.+)$/i.exec(line);
     if (!match) continue;
     const side = sideForLabel(match[1]);
     const chunks = match[2].split(/[|,]/);
     for (const chunk of chunks) {
       if (chunk.includes(":")) continue;
       const name = cleanName(chunk);
-      if (isInvalidDeltaEntityName(name)) continue;
+      if (isInvalidDeltaEntityName(name) || abstractDeltaRosterName(name)) continue;
       const first = name.split(/\s+/)[0]?.toLowerCase() ?? "";
       if (/^\d+/.test(first) || countWords.has(first) || actionWords.test(name) || /^(situation|location|objective|constraint|map|terrain|scene|status)$/i.test(name)) continue;
       participants.push({ name, side });
@@ -662,6 +738,57 @@ function deltaRosterParticipants(text: string) {
     seen.add(key);
     return true;
   });
+}
+
+function abstractDeltaRosterName(name: string) {
+  return /\b(?:unknown|mysterious|unidentified|indistinct|shadowy)\b/i.test(name);
+}
+
+function normaliseDeltaBriefRoster(value: unknown): DeltaBriefRoster {
+  const source = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const cleanList = (input: unknown) => {
+    if (!Array.isArray(input)) return [];
+    const seen = new Set<string>();
+    return input
+      .map((item) => typeof item === "string" ? item.replace(/\s+/g, " ").trim() : "")
+      .filter((item) => {
+        const key = item.toLowerCase();
+        if (!item || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+  };
+  const team = cleanList(source.team);
+  const teamNames = new Set(team.map((name) => name.toLowerCase()));
+  const neutral = cleanList(source.neutral).filter((name) => !teamNames.has(name.toLowerCase()));
+  const occupied = new Set([...team, ...neutral].map((name) => name.toLowerCase()));
+  const enemies = cleanList(source.enemies).filter((name) => !occupied.has(name.toLowerCase()));
+  return { team, neutral, enemies };
+}
+
+function deltaBriefRosterFromContext(handoffContext = ""): DeltaBriefRoster {
+  const roster = { team: [] as string[], neutral: [] as string[], enemies: [] as string[] };
+  for (const participant of deltaRosterParticipants(handoffContext)) {
+    const target = participant.side === "hostile" ? roster.enemies : participant.side === "neutral" ? roster.neutral : roster.team;
+    if (!target.some((name) => name.toLowerCase() === participant.name.toLowerCase())) target.push(participant.name);
+  }
+  return roster;
+}
+
+function deltaBriefRosterLines(roster: DeltaBriefRoster) {
+  return [
+    ...roster.team.map((name) => `Ally: ${name}`),
+    ...roster.neutral.map((name) => `Neutral: ${name}`),
+    ...roster.enemies.map((name) => `Hostile: ${name}`)
+  ];
+}
+
+function deltaContinuityWithoutRosterLines(handoffContext = "") {
+  return handoffContext
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*(?:player|your\s+team|team|allies?|ally|neutrals?|neutral|hostiles?|hostile|enemies|enemy)(?:\s+present)?\s*:/i.test(line))
+    .join("\n")
+    .trim();
 }
 
 function openRouterContent(text: string, images: { dataUrl: string; mimeType: string }[]) {
@@ -698,8 +825,11 @@ async function imageForOpenRouter(file: File) {
   }
 }
 
-function messageHistoryText(message: Message) {
-  const body = message.role === "user" ? clarifyLeadingOocForModel(message.body) : message.body;
+function messageHistoryText(message: Message, useCondensation = true) {
+  const source = useCondensation && message.contextCondensation && message.contextCondensationSourceUpdatedAt === message.updatedAt
+    ? message.contextCondensation
+    : message.body;
+  const body = message.role === "user" ? clarifyLeadingOocForModel(source) : source;
   return message.attachmentContext
     ? `${body}\n\n[Attachment context for this message:\n${message.attachmentContext}]`
     : body;
@@ -714,8 +844,23 @@ function clarifyLeadingOocForModel(text: string) {
 function chatHistoryContent(history: Message[], currentMessageId: string | undefined, currentImages: { dataUrl: string; mimeType: string }[]) {
   return history.map((message) => ({
     role: (message.role === "system" ? "system" : message.role === "assistant" ? "assistant" : "user") as OpenRouterMessage["role"],
-    content: message.id === currentMessageId && currentImages.length ? openRouterContent(clarifyLeadingOocForModel(message.body), currentImages) : messageHistoryText(message)
+    content: message.id === currentMessageId && currentImages.length ? openRouterContent(clarifyLeadingOocForModel(message.body), currentImages) : messageHistoryText(message, message.id !== currentMessageId)
   }));
+}
+
+function auditSafeValue(value: unknown): unknown {
+  if (typeof value === "string") {
+    if (/^data:image\//i.test(value)) {
+      const mimeType = value.slice(5, value.indexOf(";")) || "image";
+      return `[${mimeType} attachment bytes omitted from local audit]`;
+    }
+    return value;
+  }
+  if (Array.isArray(value)) return value.map(auditSafeValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, item]) => [key, auditSafeValue(item)]));
+  }
+  return value;
 }
 
 async function storedMessageImages(messageId: string) {
@@ -791,12 +936,51 @@ function LoadingSignal() {
   return <span className="loading-signal" aria-label="Thinking" role="status" />;
 }
 
-function DeltaTurnText({ text }: { text: string }) {
-  const lines = text.split(/\r?\n/);
+const deltaRevealSpeedsMs = [1400, 1200, 1000, 850, 720, 600, 480, 360, 260, 180] as const;
+
+function deltaRevealStepMs(speed?: number) {
+  const index = Math.max(0, Math.min(deltaRevealSpeedsMs.length - 1, Math.round(speed ?? 5) - 1));
+  return deltaRevealSpeedsMs[index];
+}
+
+function deltaRevealLines(text: string) {
+  return text
+    .split(/\r?\n/)
+    .flatMap((line) => line.trim().split(/(?<=[.!?])\s+(?=["'“‘(*A-Z0-9])/))
+    .filter((line) => line.trim().length > 0 && !/^---+$/.test(line.trim()));
+}
+
+function DeltaTurnText({
+  text,
+  animate = false,
+  startDelayMs = 0,
+  stepMs = deltaRevealStepMs(),
+  onReveal
+}: {
+  text: string;
+  animate?: boolean;
+  startDelayMs?: number;
+  stepMs?: number;
+  onReveal?: () => void;
+}) {
+  const lines = deltaRevealLines(text);
+  const [visibleLineCount, setVisibleLineCount] = useState(animate ? 0 : lines.length);
+  useEffect(() => {
+    if (!animate) {
+      setVisibleLineCount(lines.length);
+      return;
+    }
+    setVisibleLineCount(0);
+    const timers = lines.map((_, index) => window.setTimeout(() => {
+      setVisibleLineCount(index + 1);
+      onReveal?.();
+    }, startDelayMs + index * stepMs));
+    return () => timers.forEach((timer) => window.clearTimeout(timer));
+  }, [text]);
   return (
     <div className="delta-turn-lines">
-      {lines.map((line, index) => (
-        <div className="delta-turn-line" key={index} style={{ animationDelay: `${index * 360}ms` }}>
+      {lines.slice(0, visibleLineCount).map((line, index) => (
+        <div className="delta-turn-line" key={`${index}:${line}`}>
           <MarkdownText text={line} emptyText=" " inventoryMarkers />
         </div>
       ))}
@@ -850,10 +1034,64 @@ type OpenRouterResponse = {
   usage?: OpenRouterUsage;
 };
 
+type MemoryReviewCandidate = {
+  text: string;
+  tags: string[];
+  reason: string;
+  confidence: number;
+};
+
+type ContextCondensationCandidate = {
+  id: string;
+  text: string;
+};
+
+const contextCondensationMinimumCharacters = 400;
+const contextCondensationRatio = 0.8;
+
+function contextCondensationLimit(message: Message) {
+  return Math.max(1, Math.floor(message.body.length * contextCondensationRatio));
+}
+
+function parseContextCondensations(text: string): ContextCondensationCandidate[] {
+  try {
+    const parsed = JSON.parse(extractJsonObject(text)) as { condensedMessages?: unknown };
+    if (!Array.isArray(parsed.condensedMessages)) return [];
+    return parsed.condensedMessages.map((value) => {
+      const row = value as Record<string, unknown>;
+      return {
+        id: typeof row.id === "string" ? row.id : "",
+        text: typeof row.text === "string" ? row.text.trim() : ""
+      };
+    }).filter((item) => item.id && item.text);
+  } catch {
+    return [];
+  }
+}
+
+function parseMemoryReview(text: string): MemoryReviewCandidate[] {
+  try {
+    const parsed = JSON.parse(extractJsonObject(text)) as { memories?: unknown };
+    if (!Array.isArray(parsed.memories)) return [];
+    return parsed.memories.slice(0, 3).map((value) => {
+      const row = value as Record<string, unknown>;
+      return {
+        text: typeof row.text === "string" ? row.text.trim() : "",
+        tags: Array.isArray(row.tags) ? row.tags.filter((tag): tag is string => typeof tag === "string").map((tag) => tag.trim()).filter(Boolean) : [],
+        reason: typeof row.reason === "string" ? row.reason.trim() : "",
+        confidence: Number.isFinite(Number(row.confidence)) ? Math.max(0, Math.min(1, Number(row.confidence))) : 0.5
+      };
+    }).filter((memory) => memory.text);
+  } catch {
+    return [];
+  }
+}
+
 type DeltaImminentProposal = {
   brief: string;
   handoffContext?: string;
   playerCharacterName?: string;
+  roster: DeltaBriefRoster;
   mapSize: DeltaMapSize;
   avoidLabel?: string;
   avoidPrompt?: string;
@@ -985,14 +1223,17 @@ const deltaImminentTools = [
       parameters: {
         type: "object",
         properties: {
-          brief: { type: "string", description: "Short in-world third-person scene beat for the imminent engagement. Continue the user's roleplay voice. Explicitly name the actual player character and every actual known ally present. Never hide named allies behind 'the team', 'their team', or similar collective wording. Carry through opposing people, quantities, and roles already established by the scene. If the scene opens an engagement but no opposition is established, invent only the encounter participants the immediate place, project world, tone, and current situation naturally call for. Make that cast specific to this scene, not a generic fallback roster, and never reuse a sample cast, role, faction, or location from another engagement. Ground the exact immediate location, lighting/cover/proximity, what is happening right now, what pressure forces the engagement, and any important character reaction. Do not write a cast list, mission synopsis, objective block, or assistant-facing explanation." },
-          handoffContext: { type: "string", description: "Compact exact continuity anchors for Delta startup. Put each participant on its own line, using only concrete roster forms such as Player: Halle, Ally: Jaeger, Neutral: Gate Clerk, or Hostile: Vex. Add an optional role only in parentheses, such as Hostile: Vex (leader). Never write placeholder text like <name>, character name, NPC name, or enemy name. Do not put scene prose, actions, locations, objectives, or descriptive clauses on participant lines. Preserve already established facts. If an encounter must be created because the scene has no established opposition, include only the specific participants newly and naturally created for this immediate setting; do not use a stock roster or carry over people/roles from another engagement. Include named one-off NPCs even if they are not saved character pages. Put other continuity facts on separate terse lines beginning with Location:, Objective:, or Situation:. This is for Delta context, not decorative prose." },
+          brief: { type: "string", description: "One to three compact third-person sentences continuing the roleplay at the exact immediate place and moment. State what is physically happening and what forces the engagement. Prefer concrete information over atmospheric description. Do not write a cast list, mission synopsis, movie-trailer language, or assistant-facing explanation." },
+          handoffContext: { type: "string", description: "Compact exact non-roster continuity anchors for Delta startup. Use separate terse lines beginning with Location:, Objective:, Situation:, or Constraint:. Preserve exact names, item codes, and facts. Participant membership belongs only in team, neutral, and enemies." },
+          team: { type: "array", items: { type: "string" }, description: "Every allied participant physically involved, including the likely player character when appropriate. Use a canonical name or a concrete observable identity such as Armed woman or Grey wolf. Never use unknown, mysterious, unidentified, figure, shape, presence, or creature as an abstract identity." },
+          neutral: { type: "array", items: { type: "string" }, description: "Concrete neutral participants physically involved. Use an empty list when there are none." },
+          enemies: { type: "array", items: { type: "string" }, description: "Every opposing participant physically involved. Use canonical names where known; otherwise use concrete visible identities such as Scarred enforcer, Woman with shotgun, or Grey wolf. Distinguish multiples concretely. Never use unknown, mysterious, unidentified, figure, shape, presence, or creature as an abstract identity." },
           playerCharacterName: { type: "string", description: "Likely player-controlled character name, if known." },
           mapSize: { type: "string", enum: ["S", "M", "L", "XL", "XXL"], description: "Choose the engagement map boundary from the immediate scene: S = 30m, M = 50m, L = 80m, XL = 100m, XXL = 200m. This is the actual scene boundary, not a zoom level. Choose the smallest size that fairly contains the engagement and likely movement." },
           avoidLabel: { type: "string", description: "Button label for avoiding the engagement, usually Escape for danger or Cancel for a proposed mission." },
           avoidPrompt: { type: "string", description: "Short UI question asking what the player does to avoid or cancel the engagement." }
         },
-        required: ["brief", "mapSize"]
+        required: ["brief", "team", "neutral", "enemies", "mapSize"]
       }
     }
   }
@@ -1115,16 +1356,32 @@ const deltaEntityTools = [
     type: "function",
     function: {
       name: "request_delta_roll",
-      description: "Request authoritative client-generated dice results. For player rolls, Delta Mode waits for the user to click the required die. For NPC/ally/hostile/non-player rolls, the client rolls immediately and returns the result. Do not write a textual request_delta_roll block in prose.",
+      description: "Request authoritative client-generated dice results with the rolling entity's real stat modifier. For player rolls, Delta Mode waits for the user to click the required die. For NPC/ally/hostile/non-player rolls, the client rolls immediately, displays its own verified roll row, and returns the modified total. Never write or repeat a dice-result line in prose.",
       parameters: {
         type: "object",
         properties: {
           die: { type: "number", description: "Required die sides. Use 4, 6, 8, 9, 12, 20, or 100." },
           count: { type: "number", description: "How many of this die must be rolled. Defaults to 1." },
           label: { type: "string", description: "Short roleplay-facing roll label, such as initiative, lockpick, damage, or resist fear." },
-          rollerName: { type: "string", description: "Name of the entity rolling, especially for NPC/ally/hostile rolls." }
+          rollerName: { type: "string", description: "Name of the entity rolling, especially for NPC/ally/hostile rolls." },
+          ability: { type: "string", enum: ["STR", "DEX", "CON", "INT", "WIS", "CHA", "NONE"], description: "Governing stat whose modifier the client must apply. Use NONE only when this roll genuinely has no stat modifier." }
         },
-        required: ["die", "label"]
+        required: ["die", "label", "ability"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "request_delta_reaction",
+      description: "Check whether an active target can react to an incoming threat outside their turn. Call this after the initiating attack/check roll is known but before resolving damage or the final consequence. The client performs an authoritative 1d8 + DEX check against 6 and enforces one reaction attempt per entity per round. A successful player reaction pauses the current turn for the player's response.",
+      parameters: {
+        type: "object",
+        properties: {
+          targetEntityId: { type: "string", description: "Entity ID of the active entity threatened by the current action." },
+          trigger: { type: "string", description: "One concise in-world description of the immediate threat being reacted to." }
+        },
+        required: ["targetEntityId", "trigger"]
       }
     }
   },
@@ -1145,6 +1402,38 @@ const deltaEntityTools = [
   {
     type: "function",
     function: {
+      name: "continue_delta_player_turn",
+      description: "Post the addressed entity's brief cinematic reply and keep the current player's numbered turn open after a dialogue-only or communication-only entry. Use this only when the player spoke, signalled, or communicated without attempting movement, an attack, an interaction, an item use, a roll-worthy influence attempt, or another turn-consuming action. This is not a new turn.",
+      parameters: {
+        type: "object",
+        properties: {
+          cinematicReply: { type: "string", description: "Required concise in-world reply or immediate nonverbal response from the entity the player addressed. Do not include the cinematic marker." },
+          prompt: { type: "string", description: "Optional short prompt indicating that the player's turn remains open." }
+        },
+        required: ["cinematicReply"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "apply_delta_damage",
+      description: "Apply damage through the client after request_delta_roll returns a verified damage roll. The client subtracts the amount atomically, clamps HP at zero, and prevents the same roll receipt from damaging the same entity twice. Never calculate or overwrite currentHp yourself.",
+      parameters: {
+        type: "object",
+        properties: {
+          entityId: { type: "string", description: "Target entity ID from the current entity list." },
+          amount: { type: "number", description: "Final positive whole-number damage amount to subtract." },
+          rollReceiptId: { type: "string", description: "Receipt ID returned by the authoritative request_delta_roll result used for this damage." },
+          zeroHpOutcome: { type: "string", enum: ["ko", "dead"], description: "State to apply if this damage reduces the target to 0 HP. Choose KO when the target remains alive but unable to act, or DEAD when the fiction establishes death." }
+        },
+        required: ["entityId", "amount", "rollReceiptId", "zeroHpOutcome"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
       name: "update_delta_entity",
       description: "Update an existing current Delta entity by entityId. Template values are readable labels only.",
       parameters: {
@@ -1153,12 +1442,12 @@ const deltaEntityTools = [
           entityId: { type: "string" },
           name: { type: "string" },
           side: { type: "string", enum: ["ally", "neutral", "hostile"] },
+          engagementState: { type: "string", enum: ["active", "ko", "dead", "escaped"], description: "Whether this entity can still take turns. Use escaped immediately when an entity leaves the engagement." },
           prefix: { type: "string" },
           base: { type: "string" },
           job: { type: "string" },
           jobCategory: { type: "string" },
           statusText: { type: "string" },
-          currentHp: { type: "number", description: "Current HP after the resolved event." },
           maxHp: { type: "number", description: "Maximum HP only when it must be corrected." },
           initiative: { type: "number", description: "Initiative result used to order the entity list." },
           distanceFromPlayer: { type: "string" },
@@ -1183,6 +1472,7 @@ export function App() {
   const [route, setRoute] = useState<RouteName>("chat");
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [editingProjectId, setEditingProjectId] = useState<string>();
+  const [projectEditInitialTab, setProjectEditInitialTab] = useState<"general" | "delta">("general");
   const [profileCharacterId, setProfileCharacterId] = useState<string>();
   const [models, setModels] = useState<{ modelId: string; cosmeticName: string }[]>([]);
   const [selectedModelId, setSelectedModelId] = useState("");
@@ -1190,6 +1480,7 @@ export function App() {
   const [gearOpen, setGearOpen] = useState(false);
   const [gearEditingCharacterId, setGearEditingCharacterId] = useState<string>();
   const [deltaOpen, setDeltaOpen] = useState(false);
+  const [deltaProjectSettingsOpen, setDeltaProjectSettingsOpen] = useState(false);
   const [deltaSession, setDeltaSession] = useState<DeltaSession>();
   const [deltaMessages, setDeltaMessages] = useState<DeltaMessage[]>([]);
   const [deltaEntities, setDeltaEntities] = useState<DeltaEntity[]>([]);
@@ -1204,12 +1495,21 @@ export function App() {
 
   useEffect(() => {
     setDeltaOpen(false);
+    setDeltaProjectSettingsOpen(false);
     setDeltaSession(undefined);
     setDeltaMessages([]);
     setDeltaEntities([]);
     setArchivedDeltaSessions([]);
     setDeltaAllyCache([]);
   }, [selectedChatId]);
+  useEffect(() => {
+    if (!deltaProjectSettingsOpen) return;
+    const closeProjectSettingsFromHistory = (event: PopStateEvent) => {
+      if (!(event.state as { mirrorDeltaProjectSettings?: boolean } | null)?.mirrorDeltaProjectSettings) setDeltaProjectSettingsOpen(false);
+    };
+    window.addEventListener("popstate", closeProjectSettingsFromHistory);
+    return () => window.removeEventListener("popstate", closeProjectSettingsFromHistory);
+  }, [deltaProjectSettingsOpen]);
   useEffect(() => {
     let alive = true;
     if (!selectedChatId) {
@@ -1227,7 +1527,7 @@ export function App() {
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
-      if (deltaOpen) {
+      if (deltaProjectSettingsOpen || deltaOpen) {
         event.preventDefault();
         window.history.back();
       } else if (gearOpen) {
@@ -1243,7 +1543,7 @@ export function App() {
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [deltaOpen, gearOpen, inventoryOpen, drawerOpen]);
+  }, [deltaProjectSettingsOpen, deltaOpen, gearOpen, inventoryOpen, drawerOpen]);
 
   async function refresh() {
     const [nextSettings, nextProjects, unsortedChats] = await Promise.all([
@@ -1456,6 +1756,7 @@ export function App() {
       <Header
         title={title}
         subtitle={route === "chat" ? selectedChat?.title : undefined}
+        contextNote={route === "chat" && selectedChat?.infiniteHistoryLocked ? "⚠︎ infinite context" : undefined}
         onMenu={() => setDrawerOpen(true)}
         right={route === "chat" && selectedProject ? (
           <div className="header-actions">
@@ -1526,9 +1827,29 @@ export function App() {
           startContext={deltaStartContext}
           onStartContextConsumed={() => setDeltaStartContext("")}
           onOpenInventory={() => setInventoryOpen(true)}
+          onOpenProjectDeltaSettings={() => {
+            setEditingProjectId(selectedProject.id);
+            setProjectEditInitialTab("delta");
+            setDeltaProjectSettingsOpen(true);
+            window.history.pushState({ ...window.history.state, mirrorDeltaProjectSettings: true }, "", window.location.href);
+          }}
           onClose={() => setDeltaOpen(false)}
           onRefresh={refreshDeltaMode}
         />
+      )}
+      {selectedProject && deltaOpen && deltaProjectSettingsOpen && (
+        <section className="delta-project-settings-layer">
+          <ProjectEditPage
+            key={`${selectedProject.id}:delta-overlay`}
+            project={selectedProject}
+            initialTab="delta"
+            onRefresh={refresh}
+            onDone={() => {
+              if (window.history.state?.mirrorDeltaProjectSettings) window.history.back();
+              else setDeltaProjectSettingsOpen(false);
+            }}
+          />
+        </section>
       )}
       <Drawer
         open={drawerOpen}
@@ -1538,6 +1859,7 @@ export function App() {
         selectedChatId={selectedChatId}
         onClose={() => setDrawerOpen(false)}
         onRoute={(nextRoute) => {
+          if (nextRoute === "projectEdit") setProjectEditInitialTab("general");
           setRoute(nextRoute);
           setDrawerOpen(false);
         }}
@@ -1575,8 +1897,8 @@ export function App() {
             }}
           />
         )}
-        {route === "projects" && <ProjectsPage projects={projects} selectedProjectId={selectedProjectId} onSelect={setSelectedProjectId} onEdit={(id) => { setEditingProjectId(id); setRoute("projectEdit"); }} onRefresh={refresh} />}
-        {route === "projectEdit" && editingProject && <ProjectEditPage project={editingProject} onRefresh={refresh} onDone={() => setRoute("projects")} />}
+        {route === "projects" && <ProjectsPage projects={projects} selectedProjectId={selectedProjectId} onSelect={setSelectedProjectId} onEdit={(id) => { setEditingProjectId(id); setProjectEditInitialTab("general"); setRoute("projectEdit"); }} onRefresh={refresh} />}
+        {route === "projectEdit" && editingProject && <ProjectEditPage key={`${editingProject.id}:${projectEditInitialTab}`} project={editingProject} initialTab={projectEditInitialTab} onRefresh={refresh} onDone={() => setRoute("projects")} />}
         {route === "stars" && <StarsPage project={selectedProject} />}
         {route === "archives" && <ArchivesPage project={selectedProject} />}
         {route === "characters" && <CharactersPage project={selectedProject} onOpenProfile={(id) => { setProfileCharacterId(id); setRoute("characterProfile"); }} />}
@@ -1590,7 +1912,7 @@ export function App() {
   );
 }
 
-function Header({ title, subtitle, onMenu, right }: { title: string; subtitle?: string; onMenu: () => void; right?: React.ReactNode }) {
+function Header({ title, subtitle, contextNote, onMenu, right }: { title: string; subtitle?: string; contextNote?: string; onMenu: () => void; right?: React.ReactNode }) {
   return (
     <header className="topbar">
       <button className="icon-button" onClick={onMenu} aria-label="Open navigation">
@@ -1598,7 +1920,7 @@ function Header({ title, subtitle, onMenu, right }: { title: string; subtitle?: 
       </button>
       <div className="brand-mini">
         <MothMark />
-        <div className="title-stack"><strong>{title}</strong>{subtitle && <span>{subtitle}</span>}</div>
+        <div className="title-stack"><strong>{title}</strong>{(subtitle || contextNote) && <div className="title-meta">{subtitle && <span>{subtitle}</span>}{contextNote && <small>{contextNote}</small>}</div>}</div>
       </div>
       <div className="header-right">{right}</div>
     </header>
@@ -1740,6 +2062,82 @@ function InventoryItemRow({ item, onRefresh }: { item: InventoryItem; onRefresh:
   );
 }
 
+function DeltaVerifiedRollRow({
+  message,
+  relationship,
+  expanded,
+  onToggle,
+  animate = false,
+  revealDelayMs = 0,
+  onReveal
+}: {
+  message: DeltaMessage;
+  relationship: "ally" | "neutral" | "hostile";
+  expanded: boolean;
+  onToggle: () => void;
+  animate?: boolean;
+  revealDelayMs?: number;
+  onReveal?: () => void;
+}) {
+  const receipt = message.rollReceipt;
+  const [visible, setVisible] = useState(!animate);
+  useEffect(() => {
+    if (!animate) {
+      setVisible(true);
+      return;
+    }
+    setVisible(false);
+    const timer = window.setTimeout(() => {
+      setVisible(true);
+      onReveal?.();
+    }, revealDelayMs);
+    return () => window.clearTimeout(timer);
+  }, [message.id]);
+  if (!receipt) return null;
+  if (!visible) return null;
+  const toolArguments = {
+    die: receipt.die,
+    count: receipt.count,
+    label: receipt.label,
+    rollerName: receipt.rollerName,
+    ability: receipt.ability ?? "NONE"
+  };
+  return (
+    <article className={`delta-log-row delta-roll-event ${relationship}`}>
+      <span className="delta-log-number delta-roll-marker" aria-label="App-generated dice roll">🎲</span>
+      <div className="delta-roll-event-content">
+        <button type="button" className="delta-roll-summary" onClick={onToggle} aria-expanded={expanded} aria-label={`${message.body}. Show client roll receipt`}>
+          <span>{message.body}</span>
+        </button>
+        {expanded && (
+          <div className="delta-roll-audit">
+            <div className="delta-roll-audit-heading"><strong>Client roll receipt</strong><span>{receipt.id}</span></div>
+            <dl>
+              <div><dt>Tool</dt><dd>{receipt.toolName}</dd></div>
+              <div><dt>Request</dt><dd><code>{JSON.stringify(toolArguments)}</code></dd></div>
+              <div><dt>Generator</dt><dd>{receipt.generator}</dd></div>
+              <div><dt>Method</dt><dd>{receipt.algorithm}</dd></div>
+              <div><dt>Accepted uint32</dt><dd>{receipt.rawValues.join(", ")}</dd></div>
+              <div><dt>Raw dice</dt><dd>{receipt.results.join(", ")}</dd></div>
+              {receipt.ability && <div><dt>Stat modifier</dt><dd>{receipt.ability} {receipt.modifier !== undefined && receipt.modifier >= 0 ? "+" : ""}{receipt.modifier ?? 0}</dd></div>}
+              {receipt.total !== undefined && <div><dt>Total</dt><dd>{receipt.total}</dd></div>}
+              <div><dt>Generated</dt><dd>{new Date(receipt.generatedAt).toLocaleString()}</dd></div>
+              {receipt.hpApplications?.map((application) => (
+                <div key={`${application.entityId}:${application.appliedAt}`}>
+                  <dt>HP applied</dt>
+                  <dd>{application.entityName}: {application.beforeHp} - {application.amount} = {application.afterHp}</dd>
+                </div>
+              ))}
+            </dl>
+            <pre>{`crypto.getRandomValues(uint32)\nlimit = 2^32 - (2^32 % ${receipt.die})\naccept only uint32 < limit\nresult = (uint32 % ${receipt.die}) + 1`}</pre>
+            <p>This receipt was created by the client at the same point the random values were generated. It was not parsed from AI-written text.</p>
+          </div>
+        )}
+      </div>
+    </article>
+  );
+}
+
 function DeltaModeWorkspace({
   project,
   chat,
@@ -1753,6 +2151,7 @@ function DeltaModeWorkspace({
   startContext,
   onStartContextConsumed,
   onOpenInventory,
+  onOpenProjectDeltaSettings,
   onClose,
   onRefresh
 }: {
@@ -1768,6 +2167,7 @@ function DeltaModeWorkspace({
   startContext?: string;
   onStartContextConsumed: () => void;
   onOpenInventory: () => void;
+  onOpenProjectDeltaSettings: () => void;
   onClose: () => void;
   onRefresh: () => Promise<void>;
 }) {
@@ -1791,12 +2191,14 @@ function DeltaModeWorkspace({
   const [deltaBusy, setDeltaBusy] = useState(false);
   const [forfeitConfirmOpen, setForfeitConfirmOpen] = useState(false);
   const [expandedEntityId, setExpandedEntityId] = useState<string>();
+  const [expandedRollId, setExpandedRollId] = useState<string>();
   const [projectCharacters, setProjectCharacters] = useState<Character[]>([]);
   const [actionCharacterId, setActionCharacterId] = useState("");
   const [actionSlots, setActionSlots] = useState<CharacterActionSlot[]>([]);
   const [selectedActionSlotId, setSelectedActionSlotId] = useState("");
   const [actionMacros, setActionMacros] = useState<CharacterActionMacro[]>([]);
   const [settingsDraft, setSettingsDraft] = useState(session.settings);
+  const [settingsLeaveOpen, setSettingsLeaveOpen] = useState(false);
   const [playerCharacterId, setPlayerCharacterId] = useState(chat.deltaPlayerCharacterId ?? "");
   const [previewSession, setPreviewSession] = useState<DeltaSession>();
   const [previewMessages, setPreviewMessages] = useState<DeltaMessage[]>([]);
@@ -1813,10 +2215,24 @@ function DeltaModeWorkspace({
   }>();
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const turnQueueRef = useRef<HTMLDivElement>(null);
+  const deltaBodyRef = useRef<HTMLDivElement>(null);
+  const deltaRevealSessionRef = useRef("");
+  const deltaMessageSignaturesRef = useRef<Map<string, string>>(new Map());
   const stagedStartContextRef = useRef("");
   const deltaBusyRef = useRef(false);
+  const pendingSettingsNavigationRef = useRef<() => void>(() => undefined);
   const [turnQueueEdges, setTurnQueueEdges] = useState({ left: false, right: false });
   const [saved, showSaved] = useSavedNotice();
+  if (deltaRevealSessionRef.current !== session.id) {
+    deltaRevealSessionRef.current = session.id;
+    deltaMessageSignaturesRef.current = new Map(messages.map((message) => [message.id, `${message.status}:${message.body}`]));
+  }
+  const revealMessageIds = new Set(messages
+    .filter((message) => deltaMessageSignaturesRef.current.get(message.id) !== `${message.status}:${message.body}`)
+    .map((message) => message.id));
+  useEffect(() => {
+    deltaMessageSignaturesRef.current = new Map(messages.map((message) => [message.id, `${message.status}:${message.body}`]));
+  }, [session.id, messages]);
   const archiveLimitOptions = [0, 1, 3, 5, 8, 12, 16, 20, 30, 40, 50, Infinity];
   function updateTurnQueueEdges() {
     const element = turnQueueRef.current;
@@ -1828,6 +2244,12 @@ function DeltaModeWorkspace({
     setTurnQueueEdges({
       left: element.scrollLeft > 2,
       right: maxScroll > 2 && element.scrollLeft < maxScroll - 2
+    });
+  }
+  function scrollDeltaToLatest() {
+    window.requestAnimationFrame(() => {
+      const element = deltaBodyRef.current;
+      if (element) element.scrollTop = element.scrollHeight;
     });
   }
   useEffect(() => {
@@ -1852,7 +2274,7 @@ function DeltaModeWorkspace({
       window.visualViewport?.removeEventListener("scroll", handleViewportChange);
     };
   }, []);
-  useEffect(() => setSettingsDraft(session.settings), [session.id, session.settings]);
+  useEffect(() => setSettingsDraft(session.settings), [session.id]);
   useEffect(() => setPlayerCharacterId(chat.deltaPlayerCharacterId ?? ""), [chat.id, chat.deltaPlayerCharacterId]);
   useEffect(() => {
     if (!startContext || messages.length > 0) return;
@@ -1925,12 +2347,15 @@ function DeltaModeWorkspace({
         const matched = stagedEntities.find((entity) => entity.name.trim().toLocaleLowerCase() === playerName || entity.name.trim().toLocaleLowerCase().includes(playerName));
         if (matched) nextSettings.playerEntityId = matched.id;
       }
-      await db.deltaSessions.update(session.id, { settings: nextSettings, initiativeStarted: false, awaitingPlayerRoll: true, awaitingPlayerAction: false, requiredRollDie: 20, requiredRollCount: 1, requiredRollResults: [], requiredRollKind: "initiative", requiredRollLabel: "initiative", requiredRollerName: undefined, actionPrompt: undefined, turnIndex: 0, updatedAt: now() });
+      await db.deltaSessions.update(session.id, { settings: nextSettings, initiativeStarted: false, awaitingPlayerRoll: true, awaitingPlayerAction: false, requiredRollDie: 20, requiredRollCount: 1, requiredRollResults: [], requiredRollKind: "initiative", requiredRollLabel: "initiative", requiredRollerName: undefined, requiredRollAbility: undefined, requiredRollModifier: undefined, requiredRollTurnNumber: undefined, requiredRollRawValues: [], actionPrompt: undefined, continuedTurnNumber: undefined, turnIndex: 0, updatedAt: now() });
       await onRefresh();
     });
   }, [startContext, messages.length]);
   useEffect(() => {
-    const closeFromHistory = () => onClose();
+    const closeFromHistory = (event: PopStateEvent) => {
+      if ((event.state as { mirrorDeltaMode?: boolean } | null)?.mirrorDeltaMode) return;
+      onClose();
+    };
     window.addEventListener("popstate", closeFromHistory);
     return () => window.removeEventListener("popstate", closeFromHistory);
   }, [onClose]);
@@ -2002,7 +2427,7 @@ function DeltaModeWorkspace({
       return {};
     }
   }
-  async function runDeltaTool(toolCall: OpenRouterToolCall) {
+  async function runDeltaTool(toolCall: OpenRouterToolCall, turnNumber?: number) {
     const args = deltaToolArgs(toolCall);
     const stringArg = (key: string) => typeof args[key] === "string" ? String(args[key]).trim() : "";
     const mapCoordinate = (key: "mapRow" | "mapColumn") => {
@@ -2105,9 +2530,9 @@ function DeltaModeWorkspace({
             ? await db.characters.where("projectId").equals(project.id).and((item) => item.name.trim().toLowerCase() === requestedName.toLowerCase()).first()
             : undefined;
         const entityName = character?.name || requestedName || "Unnamed entity";
-        if (!character && isInvalidDeltaEntityName(entityName)) {
+        if (!character && (isInvalidDeltaEntityName(entityName) || abstractDeltaRosterName(entityName))) {
           return {
-            error: "Rejected non-entity name. Create only people/creatures/active participants as Delta entities. Put range, cover, terrain, and position details in statusText, distanceFromPlayer, elevation, or map coordinates instead.",
+            error: "Use a concrete observable identity for this participant: a canonical name, visible person, animal/species, or recognizable role. Put range, cover, terrain, and position details in their dedicated fields.",
             rejectedName: entityName
           };
         }
@@ -2183,6 +2608,11 @@ function DeltaModeWorkspace({
           requiredRollKind: undefined,
           requiredRollLabel: undefined,
           requiredRollerName: undefined,
+          requiredRollAbility: undefined,
+          requiredRollModifier: undefined,
+          requiredRollTurnNumber: undefined,
+          requiredRollRawValues: undefined,
+          continuedTurnNumber: undefined,
           updatedAt: now()
         });
         return { finishing: true, message: "The client will show the End Engagement control. Do not write a closing response." };
@@ -2199,11 +2629,18 @@ function DeltaModeWorkspace({
         const allowedDice = [4, 6, 8, 9, 12, 20, 100];
         if (!allowedDice.includes(die)) return { error: "Unsupported die. Use d4, d6, d8, d9, d12, d20, or d100." };
         const current = await db.deltaSessions.get(session.id);
-        const ordered = (await db.deltaEntities.where("sessionId").equals(session.id).toArray()).sort((a, b) => a.orderIndex - b.orderIndex);
+        const ordered = (await db.deltaEntities.where("sessionId").equals(session.id).toArray())
+          .filter(canTakeDeltaTurn)
+          .sort((a, b) => a.orderIndex - b.orderIndex);
         const currentActor = ordered[current?.turnIndex ?? 0];
         const playerEntityId = current?.settings.playerEntityId ?? ordered.find((entity) => entity.characterId === chat.deltaPlayerCharacterId)?.id;
         const count = Math.max(1, Math.min(12, Math.floor(typeof args.count === "number" && Number.isFinite(args.count) ? args.count : 1)));
         const label = stringArg("label").slice(0, 80) || `d${die} roll`;
+        const abilityArg = stringArg("ability").toUpperCase();
+        if (abilityArg !== "NONE" && !deltaRollAbilities.includes(abilityArg as DeltaRollAbility)) {
+          return { error: "A governing ability is required. Use STR, DEX, CON, INT, WIS, CHA, or NONE." };
+        }
+        const ability = abilityArg === "NONE" ? undefined : abilityArg as DeltaRollAbility;
         const rollerNameArg = stringArg("rollerName").slice(0, 80);
         const normalizedLabel = `${rollerNameArg} ${label}`.toLowerCase();
         const playerEntity = playerEntityId ? ordered.find((entity) => entity.id === playerEntityId) : undefined;
@@ -2212,10 +2649,29 @@ function DeltaModeWorkspace({
           ? ordered.find((entity) => entity.name.trim().toLowerCase() === rollerNameArg.trim().toLowerCase()) ?? labelEntity
           : labelEntity ?? currentActor;
         const isNonPlayerRoll = Boolean(rollerEntity && (!playerEntityId || rollerEntity.id !== playerEntityId));
+        const modifier = deltaRollModifier(rollerEntity, ability);
         if (isNonPlayerRoll) {
-          const results = Array.from({ length: count }, () => rollDie(die));
-          const resultText = count > 1 ? `${count}d${die} = ${results.join(", ")}` : `d${die} = ${results[0]}`;
+          const samples = Array.from({ length: count }, () => secureRollSample(die));
+          const results = samples.map((sample) => sample.result);
+          const rollResult = deltaRollResultText(die, results, modifier);
+          const resultText = rollResult.text;
           const roller = rollerEntity?.name ?? "NPC";
+          const receipt = createRollReceipt({
+            toolName: "request_delta_roll",
+            rollerName: roller,
+            label,
+            ability,
+            modifier,
+            die,
+            results,
+            rawValues: samples.map((sample) => sample.rawValue),
+            total: rollResult.total
+          });
+          await addDeltaMessage(session.id, "system", `${roller}: Roll ${label}${ability ? ` (${ability})` : ""}: ${resultText}`, {
+            turnNumber,
+            eventType: "roll",
+            rollReceipt: receipt
+          });
           return {
             rolled: true,
             automatic: true,
@@ -2224,9 +2680,16 @@ function DeltaModeWorkspace({
             die,
             count,
             results,
+            ability: ability ?? "NONE",
+            modifier,
+            total: rollResult.total,
             resultText,
-            rollLine: `${roller}: Roll ${label}: ${resultText}`,
-            instruction: "These are actual client-generated dice results. Use these exact numbers, do not reroll, and include the provided rollLine in the turn text."
+            receiptId: receipt.id,
+            instruction: /damage/i.test(label)
+              ? "This is an authoritative client-generated damage roll. Before writing aftermath, call apply_delta_damage with the correct target entityId, this exact total, and this receipt ID. Do not merely narrate damage and do not repeat the roll line."
+              : /(?:attack|strike|shot)/i.test(label)
+                ? "This is an authoritative client-generated attack roll. Determine hit or miss. If it hits, call request_delta_roll for damage and stop before writing hit aftermath. If it misses, resolve the miss without a damage roll. Do not repeat the attack roll line."
+                : "These are authoritative client-generated dice results. The app has already displayed them in a separate verified roll row. Use these exact numbers to resolve the turn, but do not repeat or rewrite the roll line in narrative text."
           };
         }
         await db.deltaSessions.update(session.id, {
@@ -2238,10 +2701,90 @@ function DeltaModeWorkspace({
           requiredRollKind: "check",
           requiredRollLabel: label,
           requiredRollerName: isNonPlayerRoll ? rollerEntity?.name ?? "NPC" : playerEntity?.name ?? currentActor?.name ?? "player",
+          requiredRollAbility: ability,
+          requiredRollModifier: modifier,
+          requiredRollTurnNumber: turnNumber,
+          requiredRollRawValues: [],
           actionPrompt: undefined,
           updatedAt: now()
         });
-        return { waitingForRoll: `${count}d${die}`, label, roller: isNonPlayerRoll ? rollerEntity?.name ?? "NPC" : playerEntity?.name ?? currentActor?.name ?? "player" };
+        return { waitingForRoll: `${count}d${die}`, label, roller: isNonPlayerRoll ? rollerEntity?.name ?? "NPC" : playerEntity?.name ?? currentActor?.name ?? "player", ability: ability ?? "NONE", modifier };
+      }
+      case "request_delta_reaction": {
+        const current = await db.deltaSessions.get(session.id);
+        const roster = (await db.deltaEntities.where("sessionId").equals(session.id).toArray())
+          .filter(canTakeDeltaTurn)
+          .sort((a, b) => a.orderIndex - b.orderIndex);
+        const targetEntityId = stringArg("targetEntityId");
+        const target = roster.find((entity) => entity.id === targetEntityId);
+        if (!current || !target) return { error: "The reaction target is not an active entity in this engagement." };
+        const used = new Set(current.reactionUsedEntityIds ?? []);
+        if (used.has(target.id)) {
+          return { reactionAvailable: false, target: target.name, reason: "Reaction already attempted this round. Resolve the incoming action without another reaction check." };
+        }
+        const trigger = stringArg("trigger").slice(0, 240) || "Incoming threat";
+        const modifier = deltaRollModifier(target, "DEX");
+        const reactionUsedEntityIds = [...used, target.id];
+        const playerEntityId = current.settings.playerEntityId
+          ?? roster.find((entity) => entity.characterId === chat.deltaPlayerCharacterId)?.id;
+        const currentActor = roster[current.turnIndex ?? 0];
+        if (target.id !== playerEntityId) {
+          const sample = secureRollSample(8);
+          const rollResult = deltaRollResultText(8, [sample.result], modifier);
+          const receipt = createRollReceipt({
+            toolName: "request_delta_roll",
+            rollerName: target.name,
+            label: "reaction",
+            ability: "DEX",
+            modifier,
+            die: 8,
+            results: [sample.result],
+            rawValues: [sample.rawValue],
+            total: rollResult.total
+          });
+          await addDeltaMessage(session.id, "system", `${target.name}: Roll reaction (DEX): ${rollResult.text}`, {
+            turnNumber,
+            eventType: "roll",
+            rollReceipt: receipt
+          });
+          await db.deltaSessions.update(session.id, { reactionUsedEntityIds, updatedAt: now() });
+          return {
+            reactionAvailable: rollResult.total >= 6,
+            target: target.name,
+            trigger,
+            die: 8,
+            ability: "DEX",
+            modifier,
+            total: rollResult.total,
+            receiptId: receipt.id,
+            instruction: rollResult.total >= 6
+              ? "The reaction check succeeded. Resolve one brief, physically plausible reaction for this non-player entity before finishing the current actor's turn. Do not create a separate turn."
+              : "The reaction check failed. The target receives no reaction; finish resolving the current actor's action."
+          };
+        }
+        await db.deltaSessions.update(session.id, {
+          reactionUsedEntityIds,
+          reactionState: "checking",
+          reactionSourceActorId: currentActor?.id,
+          reactionTargetEntityId: target.id,
+          reactionTrigger: trigger,
+          reactionTurnNumber: turnNumber,
+          awaitingPlayerRoll: true,
+          awaitingPlayerAction: false,
+          requiredRollDie: 8,
+          requiredRollCount: 1,
+          requiredRollResults: [],
+          requiredRollKind: "reaction",
+          requiredRollLabel: "reaction",
+          requiredRollerName: target.name,
+          requiredRollAbility: "DEX",
+          requiredRollModifier: modifier,
+          requiredRollTurnNumber: turnNumber,
+          requiredRollRawValues: [],
+          actionPrompt: undefined,
+          updatedAt: now()
+        });
+        return { waitingForRoll: "1d8", reactionCheck: true, target: target.name, trigger, ability: "DEX", modifier, threshold: 6 };
       }
       case "request_delta_action": {
         const prompt = stringArg("prompt").slice(0, 180) || "It is your turn.";
@@ -2255,9 +2798,51 @@ function DeltaModeWorkspace({
           requiredRollKind: undefined,
           requiredRollLabel: undefined,
           requiredRollerName: undefined,
+          requiredRollAbility: undefined,
+          requiredRollModifier: undefined,
+          requiredRollTurnNumber: undefined,
+          requiredRollRawValues: undefined,
           updatedAt: now()
         });
         return { waitingForAction: true, prompt };
+      }
+      case "continue_delta_player_turn": {
+        const current = await db.deltaSessions.get(session.id);
+        const ordered = (await db.deltaEntities.where("sessionId").equals(session.id).toArray())
+          .filter(canTakeDeltaTurn)
+          .sort((a, b) => a.orderIndex - b.orderIndex);
+        const currentActor = ordered[current?.turnIndex ?? 0];
+        const playerEntityId = current?.settings.playerEntityId
+          ?? ordered.find((entity) => entity.characterId === chat.deltaPlayerCharacterId)?.id;
+        if (!current?.initiativeStarted || !currentActor || currentActor.id !== playerEntityId) {
+          return { error: "Only the current player entity can retain its turn for free dialogue." };
+        }
+        const cinematicReply = cleanDeltaCinematic(stringArg("cinematicReply")).slice(0, 500).trim();
+        if (!cinematicReply) return { error: "A concise cinematicReply is required to retain a dialogue-only turn." };
+        const prompt = stringArg("prompt").slice(0, 180) || "Your turn remains open.";
+        await addDeltaMessage(session.id, "assistant", `${cinematicMarker()} ${cinematicReply}`, { turnNumber, eventType: "narrative" });
+        await db.deltaSessions.update(session.id, {
+          awaitingPlayerAction: true,
+          awaitingPlayerRoll: false,
+          actionPrompt: prompt,
+          continuedTurnNumber: turnNumber,
+          updatedAt: now()
+        });
+        return { waitingForAction: true, retainedTurn: turnNumber, cinematicReplyPosted: true, prompt };
+      }
+      case "apply_delta_damage": {
+        const entityId = stringArg("entityId");
+        const rollReceiptId = stringArg("rollReceiptId");
+        const amount = Number(args.amount);
+        if (!entityId || !rollReceiptId || !Number.isFinite(amount)) return { error: "entityId, amount, and rollReceiptId are required." };
+        const zeroHpOutcome = stringArg("zeroHpOutcome") === "dead" ? "dead" : "ko";
+        const result = await applyDeltaDamage(session.id, entityId, amount, rollReceiptId, zeroHpOutcome);
+        if ("applied" in result && result.applied) {
+          const updatedEntity = await db.deltaEntities.get(entityId);
+          if (updatedEntity) await upsertDeltaAllyCache(chat.id, updatedEntity);
+          await markFinishReadyIfOppositionResolved();
+        }
+        return result;
       }
       case "update_delta_entity": {
         const entity = await db.deltaEntities.get(stringArg("entityId"));
@@ -2270,8 +2855,10 @@ function DeltaModeWorkspace({
           ...patch,
           name: stringArg("name") || entity.name,
           side: stringArg("side") ? normaliseDeltaRelationship(stringArg("side")) : entity.side,
+          engagementState: ["active", "ko", "dead", "escaped"].includes(stringArg("engagementState"))
+            ? stringArg("engagementState") as DeltaEntity["engagementState"]
+            : entity.engagementState,
           statusText: stringArg("statusText") || entity.statusText,
-          currentHp: typeof args.currentHp === "number" && Number.isFinite(args.currentHp) ? Math.max(0, args.currentHp) : entity.currentHp,
           maxHp: typeof args.maxHp === "number" && Number.isFinite(args.maxHp) ? Math.max(1, args.maxHp) : entity.maxHp,
           initiative: typeof args.initiative === "number" && Number.isFinite(args.initiative) ? args.initiative : entity.initiative,
           distanceFromPlayer: stringArg("distanceFromPlayer") || entity.distanceFromPlayer,
@@ -2281,21 +2868,49 @@ function DeltaModeWorkspace({
         };
         await db.deltaEntities.update(entity.id, next);
         await upsertDeltaAllyCache(chat.id, { ...entity, ...next });
+        await markFinishReadyIfOppositionResolved();
         return { updated: next.name, entityId: entity.id, templateTag: "templateTag" in next ? next.templateTag ?? "" : entity.templateTag ?? "" };
       }
       default:
         return { error: `Unknown Delta tool ${toolCall.function.name}.` };
     }
   }
-  async function completeDeltaTurn(history: OpenRouterMessage[], toolLog: string[], requireInitialTool = false) {
+  async function nextDeltaTurnNumber() {
+    const stored = await db.deltaMessages.where("sessionId").equals(session.id).toArray();
+    return deltaLogTurnCount(stored.sort((a, b) => a.sequence - b.sequence)) + 1;
+  }
+  async function completeDeltaTurn(
+    history: OpenRouterMessage[],
+    toolLog: string[],
+    requireInitialTool = false,
+    turnNumber?: number,
+    persistBeforeTools?: (content: string, includesRoll: boolean) => Promise<void>
+  ) {
     let messagesToSend = history;
     const visibleChunks: string[] = [];
-    for (let index = 0; index < 4; index += 1) {
+    const latestRequestContent = history[history.length - 1]?.content;
+    let hasCurrentVerifiedRoll = typeof latestRequestContent === "string" && /(?:dice roll receipt|authoritative (?:roll|total))/i.test(latestRequestContent);
+    const latestRequestText = typeof latestRequestContent === "string" ? latestRequestContent.toLowerCase() : "";
+    let pendingAttackResolution = /client-generated[^.\n]*(?:attack|strike|shot)/i.test(latestRequestText);
+    let pendingDamageApplication = /client-generated[^.\n]*damage/i.test(latestRequestText);
+    const verifiedDice = new Set<number>();
+    if (hasCurrentVerifiedRoll && typeof latestRequestContent === "string") {
+      for (const match of latestRequestContent.matchAll(/\bd(4|6|8|9|12|20|100)\b/gi)) verifiedDice.add(Number(match[1]));
+    }
+    let forceCorrectiveTool = false;
+    let forcedToolName: "request_delta_roll" | "apply_delta_damage" | undefined;
+    for (let index = 0; index < 6; index += 1) {
       const response = await deltaOpenRouterRequest({
         model: session.settings.modelId || chat.modelId || selectedModelId || settings.defaultModelId,
         messages: messagesToSend,
         tools: [...characterTools, ...deltaEntityTools, ...(project.inventoryEnabled && settings.autoManageInventory ? [...inventoryTools] : [])],
-        ...(requireInitialTool && index === 0 ? { tool_choice: "required" } : {}),
+        ...(forcedToolName
+          ? { tool_choice: { type: "function", function: { name: forcedToolName } } }
+          : forceCorrectiveTool
+          ? { tool_choice: "required" }
+          : requireInitialTool && index === 0
+            ? { tool_choice: "required" }
+            : {}),
         temperature: session.settings.temperature ?? 0,
         top_p: session.settings.topP ?? 0,
         ...(session.settings.maxTokens ? { max_tokens: session.settings.maxTokens } : {})
@@ -2303,31 +2918,95 @@ function DeltaModeWorkspace({
       const json = await response.json() as OpenRouterResponse;
       const assistantMessage = json.choices?.[0]?.message;
       const toolCalls = assistantMessage?.tool_calls ?? [];
+      const rawContent = assistantMessage?.content ?? "";
+      const content = cleanDeltaToolCallText(rawContent);
+      const inlineRollDice = deltaInlineRollResultDice(content);
+      if (inlineRollDice.length > 0) {
+        const onlyRepeatsVerifiedRoll = hasCurrentVerifiedRoll
+          && inlineRollDice.every((die) => die !== 0 && verifiedDice.has(die));
+        forceCorrectiveTool = !onlyRepeatsVerifiedRoll;
+        toolLog.push("rejected_unverified_roll_text");
+        messagesToSend = [
+          ...messagesToSend,
+          {
+            role: "user",
+            content: onlyRepeatsVerifiedRoll
+              ? "The client rejected that response because dice results must never be written inside narrative text, including repetitions of a verified roll. Rewrite the outcome without any roll line or dice arithmetic. Use the existing authoritative receipt and do not reroll."
+              : "The client discarded your entire response because it invented a dice result. That discarded response is not evidence that a roll was needed. Re-read the latest actual player entry and classify it again. If it was only direct speech, signalling, or communication, call continue_delta_player_turn with the addressed entity's brief response in cinematicReply; do not create an attack. If it contained a genuine uncertain action, call request_delta_roll with the correct rollerName, die, label, and ability. Never invent an action that the player did not declare, and do not write dice results in prose."
+          }
+        ];
+        continue;
+      }
+      forceCorrectiveTool = false;
+      forcedToolName = undefined;
       if (!toolCalls.length) {
-        const content = cleanDeltaToolCallText(assistantMessage?.content ?? "");
+        if (pendingDamageApplication) {
+          forcedToolName = "apply_delta_damage";
+          messagesToSend = [
+            ...messagesToSend,
+            {
+              role: "user",
+              content: "The verified damage roll has not been applied to the target entity. Discard that aftermath. Call apply_delta_damage now with the correct target entityId, the verified damage total, its exact receipt ID, and the appropriate KO or DEAD zero-HP outcome. Do not narrate the aftermath until the client confirms the HP update."
+            }
+          ];
+          continue;
+        }
+        if (pendingAttackResolution && /\b(?:hit|hits|strikes?|clips?|connects?|grazes?|pierces?|wounds?|damage)\b/i.test(content)) {
+          pendingAttackResolution = false;
+          forcedToolName = "request_delta_roll";
+          messagesToSend = [
+            ...messagesToSend,
+            {
+              role: "user",
+              content: "The verified attack appears to hit, but no verified damage roll exists. Discard that hit aftermath. Call request_delta_roll now for damage with the correct rollerName, damage die/count, label containing 'damage', and governing ability. Do not estimate damage or change HP yet."
+            }
+          ];
+          continue;
+        }
         if (content) visibleChunks.push(content);
         return visibleChunks.join("\n").trim();
       }
+      const dialogueContinuationOwnsReply = toolCalls.some((toolCall) => toolCall.function.name === "continue_delta_player_turn");
+      const contentBeforeTools = dialogueContinuationOwnsReply ? "" : content;
+      const includesRoll = toolCalls.some((toolCall) => toolCall.function.name === "request_delta_roll" || toolCall.function.name === "request_delta_reaction");
+      if (persistBeforeTools) await persistBeforeTools(contentBeforeTools, includesRoll);
+      else if (contentBeforeTools) visibleChunks.push(contentBeforeTools);
       let pauseRequested = false;
       messagesToSend = [
         ...messagesToSend,
         { role: "assistant", content: assistantMessage?.content ?? "", tool_calls: toolCalls }
       ];
       for (const toolCall of toolCalls) {
-        const result = await runDeltaTool(toolCall);
+        const result = await runDeltaTool(toolCall, turnNumber);
         toolLog.push(toolCall.function.name);
         if (typeof result === "object" && result && ("waitingForRoll" in result || "waitingForAction" in result)) pauseRequested = true;
+        if (toolCall.function.name === "request_delta_roll" && typeof result === "object" && result && "total" in result && typeof result.total === "number") {
+          hasCurrentVerifiedRoll = true;
+          if ("die" in result && typeof result.die === "number") verifiedDice.add(result.die);
+          const label = "label" in result && typeof result.label === "string" ? result.label.toLowerCase() : "";
+          if (/damage/.test(label)) {
+            pendingAttackResolution = false;
+            pendingDamageApplication = true;
+          } else if (/(?:attack|strike|shot)/.test(label)) {
+            pendingAttackResolution = true;
+          }
+        }
+        if (toolCall.function.name === "request_delta_reaction" && typeof result === "object" && result && "total" in result && typeof result.total === "number") {
+          hasCurrentVerifiedRoll = true;
+          verifiedDice.add(8);
+        }
+        if (toolCall.function.name === "apply_delta_damage" && typeof result === "object" && result && "applied" in result && result.applied === true) {
+          pendingDamageApplication = false;
+        }
         messagesToSend.push({ role: "tool", tool_call_id: toolCall.id, content: JSON.stringify(result) });
       }
       if (pauseRequested) {
-        const content = cleanDeltaToolCallText(assistantMessage?.content ?? "");
-        if (content) visibleChunks.push(content);
         return visibleChunks.join("\n").trim();
       }
     }
-    return visibleChunks.join("\n").trim() || "Delta tools reached their turn limit. Continue from the current engagement state.";
+    throw new Error("Delta blocked repeated AI-authored dice results. The current turn was not advanced; retry it.");
   }
-  async function submitDeltaTurn(clean: string, options: { hideUser?: boolean; instruction?: string; stageEngagement?: boolean; turnActorId?: string } = {}) {
+  async function submitDeltaTurn(clean: string, options: { hideUser?: boolean; instruction?: string; stageEngagement?: boolean; turnActorId?: string; turnNumber?: number; allowDialogueReply?: boolean } = {}) {
     if (!clean || !session.active) return false;
     if (deltaBusyRef.current) return false;
     if (!settings.apiKey) {
@@ -2339,22 +3018,22 @@ function DeltaModeWorkspace({
       alert("Choose a model before sending Delta AI requests. Your draft is still here.");
       return false;
     }
-    if (!options.hideUser) await addDeltaMessage(session.id, "user", clean);
+    const turnNumber = options.turnNumber ?? await nextDeltaTurnNumber();
+    if (!options.hideUser) await addDeltaMessage(session.id, "user", clean, { turnNumber, eventType: "narrative" });
     const timestamp = now();
     const replyId = uid();
     const replySequence = ((await db.deltaMessages.where("[sessionId+sequence]").between([session.id, Dexie.minKey], [session.id, Dexie.maxKey]).last())?.sequence ?? -1) + 1;
-    await db.deltaMessages.add({ id: replyId, sessionId: session.id, sequence: replySequence, role: "assistant", body: "...", status: "pending", modelId: model, createdAt: timestamp, updatedAt: timestamp });
+    await db.deltaMessages.add({ id: replyId, sessionId: session.id, sequence: replySequence, role: "assistant", body: "...", status: "pending", modelId: model, turnNumber, eventType: "narrative", createdAt: timestamp, updatedAt: timestamp });
     await onRefresh();
     const allCharacters = await db.characters.where("projectId").equals(project.id).toArray();
     const deltaPrompt = project.deltaSystemPrompt?.trim() || defaultDeltaSystemPrompt;
     const currentEntities = (await db.deltaEntities.where("sessionId").equals(session.id).toArray()).sort((a, b) => a.orderIndex - b.orderIndex);
-    const [inventoryRows, inventoryLogs, activeChat] = project.inventoryEnabled
+    const [inventoryRows, activeChat] = project.inventoryEnabled
       ? await Promise.all([
         db.inventoryItems.where("chatId").equals(chat.id).toArray(),
-        db.inventoryLogs.where("chatId").equals(chat.id).reverse().sortBy("updatedAt"),
         db.chats.get(chat.id)
       ])
-      : [[], [], undefined] as const;
+      : [[], undefined] as const;
     const inventoryDetails = project.inventoryEnabled
       ? [
         `Inventory:\n${[
@@ -2364,7 +3043,6 @@ function DeltaModeWorkspace({
             return `- ${item.name}: ${item.quantity}${item.unitWeightKg ? `, ${formatInventoryKg(item.unitWeightKg)}kg each, ${formatInventoryKg(totalKg)}kg total` : ""}`;
           })
         ].filter(Boolean).join("\n") || "(empty)"}`,
-        inventoryLogs.length ? `Recent inventory log:\n${inventoryLogs.slice(0, 8).map((log) => `- ${log.sentence}`).join("\n")}` : "",
         settings.autoManageInventory ? "Inventory auto-management is enabled in Delta: use update_inventory_item when the player or NPC action gains, spends, fires, drops, consumes, steals, reloads, or loses inventory/currency. Subtract only the actual amount used, not the whole stack. Inventory log sentences must include where the item came from or went." : "Inventory is read-only in Delta because auto-management is disabled.",
         "If the user's text contains [i], treat the nearby action as an explicit inventory-management signal."
       ].filter(Boolean).join("\n\n")
@@ -2378,7 +3056,7 @@ function DeltaModeWorkspace({
       project.worldSetting ? `World setting:\n${project.worldSetting}` : "",
       `Saved project character names:\n${allCharacters.map((character) => `- ${character.name} (${character.id})`).join("\n") || "(none)"}`,
       linkedCharacters ? `Linked involved character data:\n${linkedCharacters}` : "",
-      `Current entity list:\n${currentEntities.map((entity) => `- ${entity.id}: ${entity.name}, ${entity.side}${entity.characterId ? `, characterId=${entity.characterId}` : ""}${entity.templateTag ? `, ${entity.templateTag}` : ""}${entity.statusText ? `, ${entity.statusText}` : ""}${entityPositionLabel(entity) ? `, ${entityPositionLabel(entity)}` : ""}`).join("\n") || "(none)"}`,
+      `Current entity list:\n${currentEntities.map((entity) => `- ${entity.id}: ${entity.name}, ${entity.side}, state=${entity.engagementState ?? (entity.currentHp === 0 ? "ko" : "active")}, HP=${entity.currentHp ?? entity.maxHp ?? "?"}/${entity.maxHp ?? "?"}${entity.characterId ? `, characterId=${entity.characterId}` : ""}${entity.templateTag ? `, ${entity.templateTag}` : ""}${entity.statusText ? `, ${entity.statusText}` : ""}${entityPositionLabel(entity) ? `, ${entityPositionLabel(entity)}` : ""}`).join("\n") || "(none)"}`,
       options.turnActorId ? `Current turn actor: ${currentEntities.find((entity) => entity.id === options.turnActorId)?.name ?? options.turnActorId}` : "",
       inventoryDetails,
       `Map boundary: ${mapSize}, ${deltaMapPreviewSizes[mapSize].metres}m, ${deltaMapPreviewSizes[mapSize].cells} x ${deltaMapPreviewSizes[mapSize].cells} tiles. Current non-open terrain: ${mapDefinition}`,
@@ -2388,12 +3066,21 @@ function DeltaModeWorkspace({
       `Available JOB categories: ${jobCategories(project.deltaJobs ?? []).map(([category, count]) => `${category} (${count})`).join(", ") || "(none)"}`,
       "Continuity anchor rule: if the handoff contains DELTA CONTINUITY ANCHORS, preserve those exact item codes, location names, faction names, character names, current objective, and physical situation. Do not rename or replace them with similar invented details.",
       "Generated entity rule: for every unlinked entity, choose a suitable PREFIX and BASE from the available labels when they exist. If JOB categories exist, call list_delta_job_categories, then get_delta_jobs_for_category for the best category, and choose a JOB from that category. Pass prefix, base, job, and jobCategory to create_delta_entity so the entity receives generated stats. For saved linked characters, use characterId and do not use generated tags.",
-      "Player roll rule: when the player declares an action with uncertain success, do not resolve success or failure yet. Call request_delta_roll with the required die/count/label and stop. Only resolve the action after the client provides the actual roll result.",
-      "NPC roll rule: when an NPC, hostile, ally, hazard, resistance, detection, damage, or contest needs a roll, call request_delta_roll with rollerName instead of inventing the number. The client will immediately generate the NPC roll with the crypto dice roller and return the authoritative result. Use exact returned roll numbers in visible turn text. Do not write 'Requesting roll' or 'Calling for roll' in prose.",
+      "Player roll rule: when the player declares an action with uncertain success, do not resolve success or failure yet. Call request_delta_roll with the required die/count/label and governing ability, then stop. The client reads the player entity's actual stat and applies its modifier. Use NONE only for a roll that genuinely has no governing stat. Only resolve the action after the client provides the modified authoritative total.",
+      "NPC roll rule: when an NPC, hostile, ally, hazard, resistance, detection, damage, or contest needs a roll, call request_delta_roll with rollerName and the governing ability instead of inventing the number. The client reads that entity's actual stat, applies its modifier, immediately displays a separate verified roll row, and returns the authoritative total. Use NONE only when no stat applies. Resolve from the returned total, but do not repeat or rewrite the dice-result line in narrative text. Do not announce tool use with lines such as 'Requesting roll', 'Calling for damage roll', or 'Rolling attack for X'.",
+      "Roll enforcement: the client rejects every dice result or dice equation written in assistant prose before it reaches the Delta log. New rolls must come from request_delta_roll. Existing verified rolls must be resolved without repeating their numbers in prose.",
+      "Attack sequence: an attack roll never supplies damage. After a verified attack roll, determine hit or miss. On a miss, resolve without damage. On a hit, call request_delta_roll for damage and stop; after that verified damage roll, call apply_delta_damage with its receipt before writing aftermath. Never describe an entity taking damage until the client confirms the HP update.",
+      "Attack sequence: an attack roll never supplies damage. After a verified attack roll, determine hit or miss. On a miss, resolve without damage. On a hit, call request_delta_roll for damage and stop; after that verified damage roll, call apply_delta_damage with its receipt before writing aftermath. Never describe an entity taking damage until the client confirms the HP update.",
+      "Reaction rule: when an active entity is directly threatened outside its own turn and a physically meaningful reaction could affect the outcome, do not ask that entity to act automatically and do not resolve damage yet. After the initiating attack/check roll is known, call request_delta_reaction with the target entityId and immediate trigger. The client authoritatively rolls 1d8 + the target's DEX modifier against 6 and enforces one reaction attempt per entity per initiative round. A failed check grants no reaction. A successful player check pauses the same attacker's turn for one brief player reaction; a successful non-player check may be resolved immediately. A reaction is never a new numbered turn and never changes initiative order by itself.",
+      "HP rule: after a verified damage roll, call apply_delta_damage with the target entityId, final positive damage amount, exact roll receipt ID, and zeroHpOutcome of ko or dead. The client owns subtraction, clamps HP at zero, applies KO/DEAD at zero HP, and prevents duplicate application. KO, DEAD, and ESCAPED entities cannot take turns. When an entity escapes, immediately set engagementState to escaped with update_delta_entity. Never send currentHp through update_delta_entity and never merely narrate HP loss without applying it.",
       "Contested check rule: opposed control actions require both sides. Use contested checks for disarm, grapple, shove, restrain, escape, hold position, resist movement, stealth versus detection, deception versus insight, hacking versus active defense, and any action where another entity actively resists. Request rolls through the client, compare totals, and resolve from that comparison.",
       "Turn text format: never write labels such as 'Turn resolved:', 'Result:', or 'Outcome:'. Write the action and consequence directly. A turn may use multiple short lines when useful.",
       "Delta prose style: compact but not sterile. Add one or two precise sensory, emotional, or character-flavor details when they make the turn feel alive. Keep it lean; do not expand into main-chat story prose.",
       "Cinematic injection: default to no separate cinematic cut-in. Use a cut-in only for a major emotional, relationship, reveal, near-death, reversal, or scene-pivot beat, and only if several ordinary turns have passed since the last cut-in. Do not use cut-ins for ordinary attacks, movement, failed rolls, simple reactions, or routine enemy turns.",
+      "Dialogue inside a turn: direct in-character speech addressed to another involved entity must produce one brief cinematic reply or immediate nonverbal response. If the entry also contains a turn-consuming action, put that cut-in first and begin it with 🎞️. If the entire entry is only speech, signalling, or communication with no movement, attack, item use, physical interaction, roll-worthy influence attempt, or other turn-consuming action, do not write a separate assistant reply: call continue_delta_player_turn with the concise reply in cinematicReply so the client posts it and retains the same numbered turn. Do not advance initiative for free dialogue.",
+      options.allowDialogueReply
+        ? "Dialogue scope for this request: respond only to direct speech in the latest player entry currently being processed. Once posted, that dialogue is answered and must not be answered again on later turns."
+        : "Dialogue scope for this request: do not answer, paraphrase, continue, or add another cinematic response to player dialogue from any earlier message. That dialogue has already been handled. Resolve only the current roll, action, or current entity turn.",
       options.stageEngagement
         ? "Current phase: opening a new engagement. Before any transcript response, call set_delta_engagement_name and set_delta_map. The map must use only valid one-based coordinates inside the fixed grid; include only non-open tiles. Special terrain needs a concrete label and hex color. Then create or reconcile the entities from the handoff, assign every participating entity a unique valid mapRow/mapColumn on an open or passable tile, and mark the selected player entity before calling for initiative. Do not treat continuity labels such as Situation, Location, Objective, Map, or Terrain as entities."
         : ""
@@ -2404,18 +3091,38 @@ function DeltaModeWorkspace({
       { role: "user", content: [options.instruction, clean].filter(Boolean).join("\n\n") }
     ];
     const toolLog: string[] = [];
+    let pendingReplyOpen = true;
+    let requestSucceeded = true;
+    const persistBeforeTools = async (content: string, includesRoll: boolean) => {
+      if (content) {
+        if (pendingReplyOpen) {
+          await db.deltaMessages.update(replyId, { body: content, status: "complete", updatedAt: now() });
+          pendingReplyOpen = false;
+        } else {
+          await addDeltaMessage(session.id, "assistant", content, { turnNumber, eventType: "narrative", modelId: model });
+        }
+      } else if (includesRoll && pendingReplyOpen) {
+        await db.deltaMessages.delete(replyId);
+        pendingReplyOpen = false;
+      }
+    };
     setDeltaRequestBusy(true);
     try {
-      const reply = await completeDeltaTurn(requestMessages, toolLog, options.stageEngagement);
-      if (reply.trim()) await db.deltaMessages.update(replyId, { body: reply, status: "complete", updatedAt: now() });
-      else await db.deltaMessages.delete(replyId);
+      const reply = await completeDeltaTurn(requestMessages, toolLog, options.stageEngagement, turnNumber, persistBeforeTools);
+      if (reply.trim()) {
+        if (pendingReplyOpen) await db.deltaMessages.update(replyId, { body: reply, status: "complete", updatedAt: now() });
+        else await addDeltaMessage(session.id, "assistant", reply, { turnNumber, eventType: "narrative", modelId: model });
+      } else if (pendingReplyOpen) await db.deltaMessages.delete(replyId);
     } catch (error) {
-      await db.deltaMessages.update(replyId, { body: error instanceof Error ? error.message : "OpenRouter request failed.", status: "failed", updatedAt: now() });
+      requestSucceeded = false;
+      const body = error instanceof Error ? error.message : "OpenRouter request failed.";
+      if (pendingReplyOpen) await db.deltaMessages.update(replyId, { body, status: "failed", updatedAt: now() });
+      else await addDeltaMessage(session.id, "assistant", body, { turnNumber, eventType: "narrative", modelId: model });
     } finally {
       setDeltaRequestBusy(false);
     }
     await onRefresh();
-    return true;
+    return requestSucceeded;
   }
   async function send() {
     const clean = body.trim();
@@ -2427,49 +3134,207 @@ function DeltaModeWorkspace({
       await startFinishFlow();
       return;
     }
-    const ordered = (await db.deltaEntities.where("sessionId").equals(session.id).toArray()).sort((a, b) => a.orderIndex - b.orderIndex);
-    const turnActorId = ordered[session.turnIndex ?? 0]?.id;
+    const ordered = (await db.deltaEntities.where("sessionId").equals(session.id).toArray())
+      .filter(canTakeDeltaTurn)
+      .sort((a, b) => a.orderIndex - b.orderIndex);
+    const isReaction = session.reactionState === "available";
+    const turnActorId = isReaction
+      ? session.reactionSourceActorId ?? ordered[session.turnIndex ?? 0]?.id
+      : ordered[session.turnIndex ?? 0]?.id;
     const wasAwaitingPlayerAction = Boolean(session.awaitingPlayerAction);
-    if (wasAwaitingPlayerAction) await db.deltaSessions.update(session.id, { awaitingPlayerAction: false, actionPrompt: undefined, updatedAt: now() });
+    if (wasAwaitingPlayerAction) await db.deltaSessions.update(session.id, {
+      awaitingPlayerAction: false,
+      actionPrompt: undefined,
+      continuedTurnNumber: undefined,
+      ...(isReaction ? { reactionState: "resolving" as const } : {}),
+      updatedAt: now()
+    });
     const sent = await submitDeltaTurn(clean, wasAwaitingPlayerAction ? {
       turnActorId,
-      instruction: "The player just declared their action. If the action has uncertain success, risk, opposition, contested movement, attack, defense, stealth, persuasion, hacking, resistance, damage, or hazard interaction, do not resolve success/failure yet. Call request_delta_roll with the required die/count/label and stop. If it is an opposed control action such as disarm, grapple, shove, restrain, escape, hold position, stealth versus detection, deception versus insight, or hacking versus active defense, treat it as a contested check: request the player's roll now, then after the client provides that roll, call request_delta_roll with rollerName for the opposing entity if an opposing roll is needed. Compare totals only after all required client-generated rolls are returned. If no roll is needed, resolve exactly one compact outcome, persist entity changes, and stop without calling request_delta_action again for this same turn."
+      allowDialogueReply: !isReaction,
+      ...(isReaction && session.reactionTurnNumber !== undefined
+        ? { turnNumber: session.reactionTurnNumber }
+        : session.continuedTurnNumber !== undefined
+          ? { turnNumber: session.continuedTurnNumber }
+          : {}),
+      instruction: isReaction
+        ? `This is the player's successful out-of-turn reaction to: ${session.reactionTrigger ?? "the immediate threat"}. Resolve this reaction inside the interrupted actor's current turn, not as a new turn. If its success is uncertain, call request_delta_roll with the governing ability and stop for the player's roll. Otherwise resolve the reaction and then finish the interrupted actor's remaining action. Do not grant another reaction check, request_delta_action, or advance another entity; the client owns turn advancement.`
+        : "The player just submitted part of their current turn. Direct in-character speech addressed to another involved entity must receive one brief cinematic reply or immediate nonverbal response. If the entry also contains an action, put that cut-in first, begin it with 🎞️, and keep it concise. If the entry contains only speech, signalling, or communication and no movement, attack, item use, physical interaction, roll-worthy influence attempt, or other turn-consuming action, do not write a separate response: call continue_delta_player_turn with the addressed entity's concise response in cinematicReply so the client posts it and keeps the same numbered turn open. Never invent an action that the player did not declare. Otherwise, if the action has uncertain success, risk, opposition, contested movement, attack, defense, stealth, persuasion, hacking, resistance, damage, or hazard interaction, do not resolve success/failure yet. Call request_delta_roll with the required die/count/label and governing STR/DEX/CON/INT/WIS/CHA ability, then stop; use NONE only if no stat applies. The client applies the selected entity's real modifier. If it is an opposed control action such as disarm, grapple, shove, restrain, escape, hold position, stealth versus detection, deception versus insight, or hacking versus active defense, treat it as a contested check: request the player's roll now, then after the client provides that roll, call request_delta_roll with rollerName and governing ability for the opposing entity if an opposing roll is needed. Compare authoritative modified totals only after all required client-generated rolls are returned. If no roll is needed, resolve exactly one compact outcome, persist entity changes, and stop without calling request_delta_action again for this same turn."
     } : {});
     if (sent) {
       setBody("");
-      if (session.initiativeStarted && session.awaitingPlayerAction) await advanceTurn(turnActorId);
+      const latest = await db.deltaSessions.get(session.id);
+      if (isReaction && latest && !latest.awaitingPlayerAction && !latest.awaitingPlayerRoll) {
+        await db.deltaSessions.update(session.id, {
+          reactionState: undefined,
+          reactionSourceActorId: undefined,
+          reactionTargetEntityId: undefined,
+          reactionTrigger: undefined,
+          reactionTurnNumber: undefined,
+          updatedAt: now()
+        });
+      }
+      if (session.initiativeStarted && session.awaitingPlayerAction && !latest?.awaitingPlayerAction && !latest?.awaitingPlayerRoll) await advanceTurn(turnActorId);
     }
   }
-  function rollDie(sides: number) {
+  function secureRollSample(sides: number) {
+    if (!globalThis.crypto?.getRandomValues) throw new Error("Secure browser randomness is unavailable. Delta will not generate an unverifiable fallback roll.");
     const values = new Uint32Array(1);
     const range = 0x100000000;
     const limit = range - (range % sides);
     do {
-      crypto.getRandomValues(values);
+      globalThis.crypto.getRandomValues(values);
     } while (values[0] >= limit);
-    return (values[0] % sides) + 1;
+    return { rawValue: values[0], result: (values[0] % sides) + 1 };
+  }
+  function rollDie(sides: number) {
+    return secureRollSample(sides).result;
+  }
+  function createRollReceipt({
+    toolName,
+    rollerName,
+    label,
+    ability,
+    modifier,
+    die,
+    results,
+    rawValues,
+    total
+  }: {
+    toolName: DeltaRollReceipt["toolName"];
+    rollerName: string;
+    label: string;
+    ability?: DeltaRollAbility;
+    modifier?: number;
+    die: number;
+    results: number[];
+    rawValues: number[];
+    total?: number;
+  }): DeltaRollReceipt {
+    return {
+      id: uid(),
+      source: "client-web-crypto",
+      generator: "crypto.getRandomValues",
+      algorithm: "uint32-rejection-sampling-v1",
+      toolName,
+      rollerName,
+      label,
+      ability,
+      modifier,
+      die,
+      count: results.length,
+      rawValues,
+      results,
+      total,
+      generatedAt: now()
+    };
   }
   async function rollDeltaDie(sides: number) {
     if (deltaBusyRef.current) return;
     if (session.awaitingPlayerRoll && session.requiredRollDie && sides !== session.requiredRollDie) return;
-    const result = rollDie(sides);
+    const sample = secureRollSample(sides);
+    const result = sample.result;
     if (session.awaitingPlayerRoll) {
       const results = [...(session.requiredRollResults ?? []), result];
+      const rawValues = [...(session.requiredRollRawValues ?? []), sample.rawValue];
       const requiredCount = Math.max(1, session.requiredRollCount ?? 1);
       if (results.length < requiredCount) {
-        await db.deltaSessions.update(session.id, { requiredRollResults: results, updatedAt: now() });
+        await db.deltaSessions.update(session.id, { requiredRollResults: results, requiredRollRawValues: rawValues, updatedAt: now() });
         await onRefresh();
         return;
       }
       if ((session.requiredRollKind ?? "initiative") === "initiative") await resolveInitiative(results[0] ?? result);
       else {
-        const resultText = requiredCount > 1 ? `${requiredCount}d${sides} = ${results.join(", ")}` : `d${sides} = ${result}`;
         const latestSession = await db.deltaSessions.get(session.id);
-        const ordered = (await db.deltaEntities.where("sessionId").equals(session.id).toArray()).sort((a, b) => a.orderIndex - b.orderIndex);
+        const ordered = (await db.deltaEntities.where("sessionId").equals(session.id).toArray())
+          .filter(canTakeDeltaTurn)
+          .sort((a, b) => a.orderIndex - b.orderIndex);
         const currentActor = ordered[latestSession?.turnIndex ?? session.turnIndex ?? 0];
         const playerEntity = latestSession?.settings.playerEntityId ? ordered.find((entity) => entity.id === latestSession.settings.playerEntityId) : undefined;
         const rollerName = latestSession?.requiredRollerName ?? currentActor?.name ?? playerEntity?.name ?? "Player";
-        await addDeltaMessage(session.id, "system", `${rollerName}: Roll ${session.requiredRollLabel || `${requiredCount}d${sides} roll`}: ${resultText}`);
+        const label = latestSession?.requiredRollLabel || `${requiredCount}d${sides} roll`;
+        const ability = latestSession?.requiredRollAbility;
+        const modifier = latestSession?.requiredRollModifier ?? deltaRollModifier(playerEntity ?? currentActor, ability);
+        const rollResult = deltaRollResultText(sides, results, modifier);
+        const resultText = rollResult.text;
+        const receipt = createRollReceipt({
+          toolName: "player_delta_roll",
+          rollerName,
+          label,
+          ability,
+          modifier,
+          die: sides,
+          results,
+          rawValues,
+          total: rollResult.total
+        });
+        await addDeltaMessage(session.id, "system", `${rollerName}: Roll ${label}${ability ? ` (${ability})` : ""}: ${resultText}`, {
+          turnNumber: session.requiredRollTurnNumber,
+          eventType: "roll",
+          rollReceipt: receipt
+        });
+        if (latestSession?.requiredRollKind === "reaction") {
+          const reactionSucceeded = rollResult.total >= 6;
+          if (reactionSucceeded) {
+            await db.deltaSessions.update(session.id, {
+              reactionState: "available",
+              awaitingPlayerRoll: false,
+              awaitingPlayerAction: true,
+              actionPrompt: `Reaction available: ${latestSession.reactionTrigger ?? "respond to the immediate threat"}`,
+              requiredRollDie: undefined,
+              requiredRollCount: undefined,
+              requiredRollResults: undefined,
+              requiredRollKind: undefined,
+              requiredRollLabel: undefined,
+              requiredRollerName: undefined,
+              requiredRollAbility: undefined,
+              requiredRollModifier: undefined,
+              requiredRollTurnNumber: undefined,
+              requiredRollRawValues: undefined,
+              updatedAt: now()
+            });
+            await onRefresh();
+            return;
+          }
+          const sourceActorId = latestSession.reactionSourceActorId ?? currentActor?.id;
+          const reactionTurnNumber = latestSession.reactionTurnNumber ?? latestSession.requiredRollTurnNumber;
+          await db.deltaSessions.update(session.id, {
+            reactionState: "resolving",
+            awaitingPlayerRoll: false,
+            awaitingPlayerAction: false,
+            actionPrompt: undefined,
+            requiredRollDie: undefined,
+            requiredRollCount: undefined,
+            requiredRollResults: undefined,
+            requiredRollKind: undefined,
+            requiredRollLabel: undefined,
+            requiredRollerName: undefined,
+            requiredRollAbility: undefined,
+            requiredRollModifier: undefined,
+            requiredRollTurnNumber: undefined,
+            requiredRollRawValues: undefined,
+            updatedAt: now()
+          });
+          await submitDeltaTurn(`Reaction check receipt ${receipt.id}: ${resultText}. Authoritative total: ${rollResult.total}; reaction threshold: 6.`, {
+            hideUser: true,
+            turnActorId: sourceActorId,
+            turnNumber: reactionTurnNumber,
+            instruction: `The client-generated reaction check failed. ${latestSession.reactionTrigger ? `Immediate threat: ${latestSession.reactionTrigger}. ` : ""}The player receives no reaction. Resume and finish exactly the interrupted attacker's current turn using the already established attack and roll context. Do not start another entity's turn, request another reaction for this target this round, or invent a replacement roll.`
+          });
+          const afterReaction = await db.deltaSessions.get(session.id);
+          if (afterReaction?.initiativeStarted && !afterReaction.awaitingPlayerAction && !afterReaction.awaitingPlayerRoll) {
+            await db.deltaSessions.update(session.id, {
+              reactionState: undefined,
+              reactionSourceActorId: undefined,
+              reactionTargetEntityId: undefined,
+              reactionTrigger: undefined,
+              reactionTurnNumber: undefined,
+              updatedAt: now()
+            });
+            await advanceTurn(sourceActorId);
+          }
+          return;
+        }
         await db.deltaSessions.update(session.id, {
           awaitingPlayerRoll: false,
           requiredRollDie: undefined,
@@ -2478,15 +3343,36 @@ function DeltaModeWorkspace({
           requiredRollKind: undefined,
           requiredRollLabel: undefined,
           requiredRollerName: undefined,
+          requiredRollAbility: undefined,
+          requiredRollModifier: undefined,
+          requiredRollTurnNumber: undefined,
+          requiredRollRawValues: undefined,
           updatedAt: now()
         });
-        await submitDeltaTurn(`Dice roll: ${resultText}`, {
+        await submitDeltaTurn(`Dice roll receipt ${receipt.id}: ${resultText}. Authoritative total: ${rollResult.total}.`, {
           hideUser: true,
           turnActorId: currentActor?.id,
-          instruction: `This is the actual client-generated ${session.requiredRollLabel || `${requiredCount}d${sides} roll`}. The result is authoritative and has already been visibly logged. If this was a contested check and an opposing entity still needs a roll, call request_delta_roll with rollerName for that entity now; do not invent the opposing number. Compare totals only after all required client-generated rolls are returned. Resolve exactly one compact Delta outcome from this roll bundle. Include the aftermath and any HP/status/entity changes. If another player roll is required to finish this same action, call request_delta_roll with the next required die/count and stop. Otherwise stop without calling request_delta_action again for this same turn; the client will advance to the next entity.`
+          turnNumber: session.requiredRollTurnNumber,
+          instruction: /damage/i.test(label)
+            ? `This is the actual client-generated damage roll. The result and receipt ID are authoritative and already visibly logged. Before writing aftermath, call apply_delta_damage with the correct target entityId, final damage amount ${rollResult.total}, and receipt ID ${receipt.id}; never calculate or overwrite currentHp. Do not repeat the roll line.`
+            : /(?:attack|strike|shot)/i.test(label)
+              ? `This is the actual client-generated attack roll. The result and receipt ID are authoritative and already visibly logged. Determine hit or miss. If it hits, call request_delta_roll for the correct damage die/count with a label containing 'damage', then stop before writing hit aftermath. If it misses, resolve the miss without damage. Do not repeat the attack roll line or change HP from an attack roll.`
+              : `This is the actual client-generated ${session.requiredRollLabel || `${requiredCount}d${sides} roll`}. The result and receipt ID are authoritative and already visibly logged. If this was a contested check and an opposing entity still needs a roll, call request_delta_roll with rollerName for that entity now; do not invent the opposing number. Compare totals only after all required client-generated rolls are returned. Resolve exactly one compact Delta outcome from this roll bundle. Include the aftermath and persist non-HP status/entity changes. If another player roll is required to finish this same action, call request_delta_roll with the next required die/count and stop. Otherwise stop without calling request_delta_action again for this same turn; the client will advance to the next entity.`
         });
         const latest = await db.deltaSessions.get(session.id);
-        if (latest?.initiativeStarted && !latest.awaitingPlayerAction && !latest.awaitingPlayerRoll) await advanceTurn(currentActor?.id);
+        if (latest?.initiativeStarted && !latest.awaitingPlayerAction && !latest.awaitingPlayerRoll) {
+          if (latest.reactionState === "resolving") {
+            await db.deltaSessions.update(session.id, {
+              reactionState: undefined,
+              reactionSourceActorId: undefined,
+              reactionTargetEntityId: undefined,
+              reactionTrigger: undefined,
+              reactionTurnNumber: undefined,
+              updatedAt: now()
+            });
+          }
+          await advanceTurn(latest.reactionSourceActorId ?? currentActor?.id);
+        }
       }
       return;
     }
@@ -2522,7 +3408,18 @@ function DeltaModeWorkspace({
         requiredRollKind: undefined,
         requiredRollLabel: undefined,
         requiredRollerName: undefined,
+        requiredRollAbility: undefined,
+        requiredRollModifier: undefined,
+        requiredRollTurnNumber: undefined,
+        requiredRollRawValues: undefined,
         actionPrompt: undefined,
+        reactionUsedEntityIds: [],
+        reactionState: undefined,
+        reactionSourceActorId: undefined,
+        reactionTargetEntityId: undefined,
+        reactionTrigger: undefined,
+        reactionTurnNumber: undefined,
+        continuedTurnNumber: undefined,
         awaitingPlayerAction: first?.entity.id === playerId,
         turnIndex: 0,
         updatedAt: now()
@@ -2531,20 +3428,71 @@ function DeltaModeWorkspace({
     await addDeltaMessage(session.id, "system", `Initiative order (+DEX):\n${ranked.map(({ entity, rawRoll, dexModifier, initiative }, index) => `${index + 1}. ${entity.name}: ${rawRoll}${dexModifier === 0 ? "" : dexModifier > 0 ? ` + ${dexModifier}` : ` - ${Math.abs(dexModifier)}`} = ${initiative}`).join("\n")}`);
     await onRefresh();
   }
+  function canTakeDeltaTurn(entity: DeltaEntity) {
+    const state = entity.engagementState ?? "active";
+    return state === "active" && (entity.currentHp === undefined || entity.currentHp > 0);
+  }
+  async function markFinishReadyIfOppositionResolved() {
+    const current = await db.deltaSessions.get(session.id);
+    if (!current?.active || !current.initiativeStarted) return false;
+    if (current.finishReady) return true;
+    const roster = await db.deltaEntities.where("sessionId").equals(session.id).toArray();
+    const hostiles = roster.filter((entity) => entity.side === "hostile");
+    if (!hostiles.length || hostiles.some(canTakeDeltaTurn)) return false;
+    await db.deltaSessions.update(session.id, {
+      finishReady: true,
+      awaitingPlayerAction: false,
+      awaitingPlayerRoll: false,
+      actionPrompt: undefined,
+      requiredRollDie: undefined,
+      requiredRollCount: undefined,
+      requiredRollResults: undefined,
+      requiredRollKind: undefined,
+      requiredRollLabel: undefined,
+      requiredRollerName: undefined,
+      requiredRollAbility: undefined,
+      requiredRollModifier: undefined,
+      requiredRollTurnNumber: undefined,
+      requiredRollRawValues: undefined,
+      reactionState: undefined,
+      reactionSourceActorId: undefined,
+      reactionTargetEntityId: undefined,
+      reactionTrigger: undefined,
+      reactionTurnNumber: undefined,
+      continuedTurnNumber: undefined,
+      updatedAt: now()
+    });
+    return true;
+  }
   async function advanceTurn(expectedActorId?: string) {
     const current = await db.deltaSessions.get(session.id);
-    const ordered = (await db.deltaEntities.where("sessionId").equals(session.id).toArray()).sort((a, b) => a.orderIndex - b.orderIndex);
+    if (await markFinishReadyIfOppositionResolved()) {
+      await onRefresh();
+      return;
+    }
+    const ordered = (await db.deltaEntities.where("sessionId").equals(session.id).toArray())
+      .filter(canTakeDeltaTurn)
+      .sort((a, b) => a.orderIndex - b.orderIndex);
     if (!current || !ordered.length || !current.initiativeStarted) return;
     if (current.awaitingPlayerRoll || current.awaitingPlayerAction) return;
-    const currentActor = ordered[current.turnIndex ?? 0];
-    if (expectedActorId && currentActor?.id !== expectedActorId) return;
-    const nextIndex = ((current.turnIndex ?? 0) + 1) % ordered.length;
+    const expectedIndex = expectedActorId ? ordered.findIndex((entity) => entity.id === expectedActorId) : -1;
+    const currentIndex = expectedIndex >= 0
+      ? expectedIndex
+      : Math.max(0, Math.min(current.turnIndex ?? 0, ordered.length - 1));
+    const nextIndex = (currentIndex + 1) % ordered.length;
     const playerId = current.settings.playerEntityId ?? ordered[0]?.id;
     const next = ordered[nextIndex];
     await db.deltaSessions.update(session.id, {
       turnIndex: nextIndex,
       awaitingPlayerAction: next?.id === playerId,
       awaitingPlayerRoll: false,
+      ...(nextIndex === 0 ? { reactionUsedEntityIds: [] } : {}),
+      reactionState: undefined,
+      reactionSourceActorId: undefined,
+      reactionTargetEntityId: undefined,
+      reactionTrigger: undefined,
+      reactionTurnNumber: undefined,
+      continuedTurnNumber: undefined,
       updatedAt: now()
     });
     await onRefresh();
@@ -2554,20 +3502,31 @@ function DeltaModeWorkspace({
     if (!session.initiativeStarted || session.awaitingPlayerAction || session.awaitingPlayerRoll) return;
     const current = await db.deltaSessions.get(session.id);
     if (!current || !current.initiativeStarted || current.awaitingPlayerAction || current.awaitingPlayerRoll) return;
-    const ordered = (await db.deltaEntities.where("sessionId").equals(session.id).toArray()).sort((a, b) => a.orderIndex - b.orderIndex);
+    if (await markFinishReadyIfOppositionResolved()) {
+      await onRefresh();
+      return;
+    }
+    const ordered = (await db.deltaEntities.where("sessionId").equals(session.id).toArray())
+      .filter(canTakeDeltaTurn)
+      .sort((a, b) => a.orderIndex - b.orderIndex);
     const actor = ordered[current.turnIndex ?? 0];
     if (!actor) return;
     const sent = await submitDeltaTurn(`${actor.name}'s turn.`, {
       hideUser: true,
       turnActorId: actor.id,
-      instruction: `Play exactly one turn for ${actor.name}. If this turn involves attack, defense, hazard, detection, resistance, damage, contested movement, or another uncertain NPC/ally/non-player action, call request_delta_roll with rollerName for the needed die instead of inventing the number. Do not write 'Requesting roll' or 'Calling for roll' in prose. When the tool returns a roll immediately, use that exact roll visibly in the turn text. If another entity actively resists a disarm, grapple, shove, restrain, escape, stealth, deception, hacking, or similar opposed action, use contested logic and request the needed rolls through the client. Default to no separate cinematic cut-in; use one only for a major emotional, relationship, reveal, near-death, reversal, or scene-pivot beat after several ordinary turns without one. Write the action and consequence directly, without prefixes like 'Turn resolved:'. Use multiple short lines if needed. Add one or two small sensory or character-flavor details when they sharpen the moment, but do not expand into full story prose. Persist any HP, status, relationship, distance, or elevation changes with update_delta_entity. Do not resolve any later turns and do not tell the player to let you know what happens next.`
+      instruction: `Play exactly one turn for ${actor.name}. If this turn involves attack, defense, hazard, detection, resistance, damage, contested movement, or another uncertain NPC/ally/non-player action, call request_delta_roll with rollerName, the needed die, and the governing STR/DEX/CON/INT/WIS/CHA ability instead of inventing the number; use NONE only if no stat applies. Do not announce tool use with lines such as 'Requesting roll', 'Calling for damage roll', or 'Rolling attack for X'. The client applies the entity's real stat modifier and displays every returned roll in its own verified row; resolve from the returned total without repeating the dice line in prose. When this turn directly threatens another active entity and a physically meaningful reaction could affect the outcome, wait until the initiating attack/check roll is known, then call request_delta_reaction before resolving damage or the final consequence. The client owns the 1d8 + DEX reaction check and one-reaction-per-round limit. A reaction remains inside ${actor.name}'s current turn. If verified damage occurs, call apply_delta_damage with the target entityId, final damage amount, returned receipt ID, and a zeroHpOutcome of ko or dead; never overwrite currentHp. If an entity escapes, set engagementState to escaped immediately. KO, DEAD, and ESCAPED entities cannot act. If another entity actively resists a disarm, grapple, shove, restrain, escape, stealth, deception, hacking, or similar opposed action, use contested logic and request the needed rolls through the client. Default to no separate cinematic cut-in; use one only for a major emotional, relationship, reveal, near-death, reversal, or scene-pivot beat after several ordinary turns without one. Write the action and consequence directly, without prefixes like 'Turn resolved:'. Use multiple short lines if needed. Add one or two small sensory or character-flavor details when they sharpen the moment, but do not expand into main-chat story prose. Persist status, relationship, distance, elevation, or engagement-state changes with update_delta_entity. Do not resolve any later turns and do not tell the player to let you know what happens next.`
     });
     if (sent) await advanceTurn(actor.id);
   }
   async function cacheCurrentGeneratedAllies() {
     await Promise.all(entities.map((entity) => upsertDeltaAllyCache(chat.id, entity)));
   }
-  function finishContext(lootRoll: number, currencyRoll: { dice: number[]; amount: number }) {
+  function finishContext(
+    lootRoll: number,
+    currencyRoll: { dice: number[]; amount: number },
+    finishMessages: DeltaMessage[],
+    finishEntities: DeltaEntity[]
+  ) {
     const currencyName = project.currencyName?.trim() || "money";
     const extraLootInstruction = lootRoll === 6
       ? "Loot recovery roll: 1d6 = 6. Include one rare/special world-appropriate recoverable item, or three ordinary world-appropriate items plus one standout item if that fits better."
@@ -2576,17 +3535,17 @@ function DeltaModeWorkspace({
       "Finish the current Delta engagement and return only valid JSON with this exact object shape:",
       "{\"finalEngagementBeat\":\"\",\"outcomeSummary\":\"\",\"lootItems\":[{\"id\":\"\",\"name\":\"\",\"quantity\":1,\"pickedQuantity\":0}],\"parentChatHandoff\":\"\"}",
       "finalEngagementBeat: short in-world closing beat for the Delta transcript.",
-      "outcomeSummary: compact roleplay-facing summary of who was involved, what changed, injuries/deaths/escapes/captures/alliances/hostilities/unresolved threads, scene/location changes, discoveries, and consequences.",
+      "outcomeSummary: comprehensive factual account of the engagement outcome. Identify every involved participant and their final condition. Record every meaningful wound, who caused it, how it happened, deaths, knockouts, escapes, captures, relationship changes, unresolved threats, discoveries, objective changes, and important scene/location consequences. Do not omit an injury merely because that character survived.",
       "lootItems: assess recoverable loot from the engagement before returning JSON. Include concrete gained/recoverable items with quantities when anything was plausibly taken, dropped, captured, found, protected, disarmed, looted, or recovered from the scene, objective, containers, defeated/captured entities, or abandoned carried gear. Use pickedQuantity 0 initially. Use an empty array only when there is truly nothing recoverable.",
       extraLootInstruction,
       "The loot recovery roll is client-generated and authoritative. Do not reroll it or change the count.",
       `Currency recovery roll: 3d4 digits = ${currencyRoll.dice.join(", ")} for ${currencyRoll.amount} ${currencyName}. Currency is handled by the client as its own inventory category. Do not include currency in lootItems. Do not add money, credits, coins, cash, or any currency equivalent as a loot item.`,
-      "parentChatHandoff: short roleplay-facing continuation packet for the parent chat. No full transcript, no tool calls, no debug text, no UI wording, no technical explanation.",
+      "parentChatHandoff: write a detailed but condensed third-person narrative reconstruction that can stand alone as the next main-chat reply. It must read as though the engagement played out inside the story, not as a report to the user. Preserve chronological cause and effect: how the confrontation began, the meaningful actions and turning points, what each important participant did, every consequential injury and exactly how it was sustained, who was killed/knocked out/escaped/captured, how the engagement resolved, and the immediate state of the people and location afterward. Retain exact names, wounds, discoveries, objectives, and unresolved consequences. Condense repetition and routine failed actions, but do not sacrifice continuity-critical detail. Use several compact paragraphs when needed. Do not include the full turn log, dice values unless narratively essential, tool calls, debug text, UI wording, headings, or technical explanation.",
       `Project: ${project.name}`,
       project.instructions ? `Project instructions:\n${project.instructions}` : "",
       project.worldSetting ? `World setting:\n${project.worldSetting}` : "",
-      `Current entity list:\n${entities.map((entity) => `- ${entity.name}, ${entity.side}${entity.templateTag ? `, ${entity.templateTag}` : ""}${entity.statusText ? `, ${entity.statusText}` : ""}${entityPositionLabel(entity) ? `, ${entityPositionLabel(entity)}` : ""}`).join("\n") || "(none)"}`,
-      `Delta transcript:\n${messages.map((message) => `${message.role}: ${message.body}`).join("\n\n") || "(none)"}`
+      `Final entity state:\n${finishEntities.map((entity) => `- ${entity.name}, ${entity.side}, state=${entity.engagementState ?? (entity.currentHp === 0 ? "ko" : "active")}, HP=${entity.currentHp ?? entity.maxHp ?? "?"}/${entity.maxHp ?? "?"}${entity.templateTag ? `, ${entity.templateTag}` : ""}${entity.statusText ? `, ${entity.statusText}` : ""}${entityPositionLabel(entity) ? `, ${entityPositionLabel(entity)}` : ""}`).join("\n") || "(none)"}`,
+      `Complete active Delta transcript:\n${finishMessages.map((message) => `${message.turnNumber ? `Turn ${message.turnNumber} ` : ""}[${message.role}${message.eventType ? `/${message.eventType}` : ""}]: ${message.body}`).join("\n\n") || "(none)"}`
     ].filter(Boolean).join("\n\n");
   }
   async function startFinishFlow() {
@@ -2623,11 +3582,19 @@ function DeltaModeWorkspace({
     setFinishLoading(true);
     try {
       await cacheCurrentGeneratedAllies();
+      const [finishMessages, finishEntities] = await Promise.all([
+        db.deltaMessages.where("sessionId").equals(session.id).toArray(),
+        db.deltaEntities.where("sessionId").equals(session.id).toArray()
+      ]);
+      const completeTranscript = finishMessages
+        .filter((message) => message.status === "complete" && message.body.trim() && message.body.trim() !== "...")
+        .sort((a, b) => a.sequence - b.sequence);
+      const finalEntities = finishEntities.sort((a, b) => a.orderIndex - b.orderIndex);
       const response = await deltaOpenRouterRequest({
         model,
         messages: [
-          { role: "system", content: "You write concise roleplay-facing Delta finish packets as valid JSON only." },
-          { role: "user", content: finishContext(lootRoll, currencyRoll) }
+          { role: "system", content: "You write continuity-complete, roleplay-facing Delta finish packets as valid JSON only. Preserve consequential detail while condensing repetition." },
+          { role: "user", content: finishContext(lootRoll, currencyRoll, completeTranscript, finalEntities) }
         ],
         temperature: session.settings.temperature ?? 0,
         top_p: session.settings.topP ?? 0,
@@ -2757,10 +3724,30 @@ function DeltaModeWorkspace({
     await onRefresh();
   }
   async function saveSettings() {
-    await db.deltaSessions.update(session.id, { settings: settingsDraft, updatedAt: now() });
+    const timestamp = now();
+    await db.deltaSessions.update(session.id, { settings: settingsDraft, updatedAt: timestamp });
     await pruneArchivedDeltaSessions();
     showSaved();
     await onRefresh();
+  }
+  const settingsDirty = JSON.stringify(settingsDraft) !== JSON.stringify(session.settings);
+  function requestSettingsNavigation(action: () => void) {
+    if (settingsDirty) {
+      pendingSettingsNavigationRef.current = action;
+      setSettingsLeaveOpen(true);
+      return;
+    }
+    action();
+  }
+  async function saveSettingsAndContinue() {
+    await saveSettings();
+    setSettingsLeaveOpen(false);
+    pendingSettingsNavigationRef.current();
+  }
+  function discardSettingsAndContinue() {
+    setSettingsDraft(session.settings);
+    setSettingsLeaveOpen(false);
+    pendingSettingsNavigationRef.current();
   }
   async function renameActiveEngagement() {
     const title = prompt("Name this Delta engagement", session.title)?.trim();
@@ -3042,19 +4029,25 @@ function DeltaModeWorkspace({
   const playerEntityId = settingsDraft.playerEntityId ?? entities[0]?.id;
   const namesByEntityId = entityDisplayNames(entities);
   const orderedEntities = [...entities].sort((a, b) => a.orderIndex - b.orderIndex);
-  const turnIndex = Math.max(0, Math.min(session.turnIndex ?? 0, Math.max(0, orderedEntities.length - 1)));
-  const turnQueue = session.initiativeStarted ? [...orderedEntities.slice(turnIndex), ...orderedEntities.slice(0, turnIndex)] : [];
+  const activeOrderedEntities = orderedEntities.filter(canTakeDeltaTurn);
+  const turnIndex = Math.max(0, Math.min(session.turnIndex ?? 0, Math.max(0, activeOrderedEntities.length - 1)));
+  const turnQueue = session.initiativeStarted ? [...activeOrderedEntities.slice(turnIndex), ...activeOrderedEntities.slice(0, turnIndex)] : [];
   const currentTurn = turnQueue[0];
   const requiredRollCount = Math.max(1, session.requiredRollCount ?? 1);
   const completedRollCount = session.requiredRollResults?.length ?? 0;
   const remainingRollCount = Math.max(1, requiredRollCount - completedRollCount);
-  const requiredRollText = `${remainingRollCount} ${remainingRollCount === 1 ? "roll" : "rolls"} (d${session.requiredRollDie ?? 20}) left`;
+  const requiredRollAbility = session.requiredRollKind === "initiative" ? "DEX" : session.requiredRollAbility;
+  const requiredRollAbilityText = requiredRollAbility ? ` + ${requiredRollAbility}` : "";
+  const requiredRollText = `${remainingRollCount} ${remainingRollCount === 1 ? "roll" : "rolls"} (d${session.requiredRollDie ?? 20}${requiredRollAbilityText}) left`;
+  const revealTextEnabled = project.deltaRevealText !== false;
+  const revealSpeed = Math.max(1, Math.min(10, Math.round(project.deltaRevealSpeed ?? 5)));
+  const revealStepMs = deltaRevealStepMs(revealSpeed);
   const currentTurnLabel = session.awaitingPlayerRoll
-    ? `Roll ${requiredRollCount}d${session.requiredRollDie ?? 20} for ${session.requiredRollLabel || "initiative"}`
+    ? `Roll ${requiredRollCount}d${session.requiredRollDie ?? 20}${requiredRollAbilityText} for ${session.requiredRollLabel || "initiative"}`
     : currentTurn
       ? (namesByEntityId.get(currentTurn.id) ?? currentTurn.name)
       : "Engagement";
-  const currentTurnNumber = messages.filter((message) => message.role !== "system").length + 1;
+  const currentTurnNumber = session.continuedTurnNumber ?? deltaLogTurnCount(messages) + 1;
   const inputDisabled = Boolean(deltaBusy || session.awaitingPlayerRoll || (session.initiativeStarted && !session.awaitingPlayerAction));
   const isArchivedSession = !session.active;
   const relationshipForEntity = (entity?: DeltaEntity) => normaliseDeltaRelationship(entity?.side ?? "neutral");
@@ -3067,7 +4060,44 @@ function DeltaModeWorkspace({
     return relationshipForEntity(name ? entityByDisplayName.get(name) : undefined);
   };
   let displayedTurnNumber = 0;
+  let lastDisplayedTurnNumber: number | undefined;
+  let legacyRollPendingResolution = false;
+  let revealCursorMs = 0;
+  const numberForMessage = (message: DeltaMessage) => {
+    if (message.turnNumber !== undefined) {
+      displayedTurnNumber = Math.max(displayedTurnNumber, message.turnNumber);
+      const showNumber = lastDisplayedTurnNumber !== message.turnNumber;
+      lastDisplayedTurnNumber = message.turnNumber;
+      return showNumber ? String(message.turnNumber).padStart(2, "0") : "";
+    }
+    if (message.role === "assistant" && legacyRollPendingResolution && displayedTurnNumber > 0) {
+      legacyRollPendingResolution = false;
+      return "";
+    }
+    legacyRollPendingResolution = false;
+    displayedTurnNumber += 1;
+    lastDisplayedTurnNumber = displayedTurnNumber;
+    return String(displayedTurnNumber).padStart(2, "0");
+  };
   let previewTurnNumber = 0;
+  let lastPreviewTurnNumber: number | undefined;
+  let previewLegacyRollPendingResolution = false;
+  const numberForPreviewMessage = (message: DeltaMessage) => {
+    if (message.turnNumber !== undefined) {
+      previewTurnNumber = Math.max(previewTurnNumber, message.turnNumber);
+      const showNumber = lastPreviewTurnNumber !== message.turnNumber;
+      lastPreviewTurnNumber = message.turnNumber;
+      return showNumber ? String(message.turnNumber).padStart(2, "0") : "";
+    }
+    if (message.role === "assistant" && previewLegacyRollPendingResolution && previewTurnNumber > 0) {
+      previewLegacyRollPendingResolution = false;
+      return "";
+    }
+    previewLegacyRollPendingResolution = false;
+    previewTurnNumber += 1;
+    lastPreviewTurnNumber = previewTurnNumber;
+    return String(previewTurnNumber).padStart(2, "0");
+  };
   const previewEntityByName = new Map(previewEntities.map((entity) => [entity.name.trim().toLowerCase(), entity]));
   return (
     <div className="delta-layer">
@@ -3083,11 +4113,12 @@ function DeltaModeWorkspace({
         </div>
         <nav className="delta-toolbar" aria-label="Delta tools">
           {!isArchivedSession && <>
-            <button className={activeTool === "entities" ? "picked" : ""} onClick={() => setActiveTool(activeTool === "entities" ? undefined : "entities")} aria-label="Entity list"><UserRound size={18} /></button>
-            <button className={activeTool === "map" ? "picked" : ""} onClick={() => setActiveTool(activeTool === "map" ? undefined : "map")} aria-label="Map"><MapIcon size={18} /></button>
-            <button onClick={onOpenInventory} aria-label="Inventory"><ShoppingBag size={18} /></button>
+            <button className={activeTool === "entities" ? "picked" : ""} onClick={() => requestSettingsNavigation(() => setActiveTool(activeTool === "entities" ? undefined : "entities"))} aria-label="Entity list"><UserRound size={18} /></button>
+            <button className={activeTool === "map" ? "picked" : ""} onClick={() => requestSettingsNavigation(() => setActiveTool(activeTool === "map" ? undefined : "map"))} aria-label="Map"><MapIcon size={18} /></button>
+            <button onClick={() => requestSettingsNavigation(onOpenInventory)} aria-label="Inventory"><ShoppingBag size={18} /></button>
           </>}
-          <button className={`delta-archive-button ${activeTool === "history" ? "picked" : ""}`} onClick={() => setActiveTool(activeTool === "history" ? undefined : "history")} aria-label="Archive"><Archive size={16} /><span>Archive</span></button>
+          <button className={`delta-archive-button ${activeTool === "history" ? "picked" : ""}`} onClick={() => requestSettingsNavigation(() => setActiveTool(activeTool === "history" ? undefined : "history"))} aria-label="Archive"><Archive size={16} /><span>Archive</span></button>
+          {!isArchivedSession && <button className="delta-settings-button" onClick={() => requestSettingsNavigation(onOpenProjectDeltaSettings)} aria-label="Project Delta settings" title="Project Delta settings"><Settings size={17} /></button>}
         </nav>
         {!isArchivedSession && <div className={`delta-turn-queue-wrap ${turnQueueEdges.left ? "show-left" : ""} ${turnQueueEdges.right ? "show-right" : ""}`}>
           <div className="delta-turn-queue" aria-label="Turn order" ref={turnQueueRef} onScroll={updateTurnQueueEdges}>
@@ -3105,7 +4136,7 @@ function DeltaModeWorkspace({
                 <div className="section-title">
                   <h2>{pendingEntityMacro ? "Select Targets" : "Entity List"}</h2>
                   <div className="split-actions">
-                    <span className="save-status">{pendingEntityMacro ? "Macro target" : `${projectCharacters.length} project characters`}</span>
+                    {pendingEntityMacro && <span className="save-status">Macro target</span>}
                     <button className="icon-button" onClick={() => setEntitySettingsOpen(!entitySettingsOpen)} aria-label="Entity settings"><Settings size={16} /></button>
                   </div>
                 </div>
@@ -3172,7 +4203,7 @@ function DeltaModeWorkspace({
                     return (
                       <div key={entity.id} className="delta-entity-wrap">
                         <div
-                          className={`delta-entity ${relationship} ${entity.id === playerEntityId ? "player" : ""} ${selectedEntityIds.has(entity.id) ? "selected" : ""}`}
+                          className={`delta-entity ${relationship} ${entity.id === playerEntityId ? "player" : ""} ${selectedEntityIds.has(entity.id) ? "selected" : ""} ${canTakeDeltaTurn(entity) ? "" : "inactive"}`}
                           onClick={() => pendingEntityMacro ? toggleSelectedEntity(entity.id) : setExpandedEntityId(expandedEntityId === entity.id ? undefined : entity.id)}
                         >
                           <small className="delta-initiative">{entity.initiative ?? "-"}</small>
@@ -3181,7 +4212,7 @@ function DeltaModeWorkspace({
                           <small>{hp}/{maxHp} HP</small>
                           <small className="delta-relationship-label">{deltaRelationshipLabel(relationship)}</small>
                         {entityPositionLabel(entity) && <small className="delta-position">{entityPositionLabel(entity)}</small>}
-                        <small className="delta-status">{entity.statusText || "No status"}</small>
+                        <small className="delta-status">{entity.engagementState && entity.engagementState !== "active" ? entity.engagementState.toUpperCase() : entity.statusText || "No status"}</small>
                       </div>
                       {expandedEntityId === entity.id && (
                         <div className="delta-entity-detail">
@@ -3256,7 +4287,7 @@ function DeltaModeWorkspace({
             )}
           </section>
         )}
-        <div className="delta-body">
+        <div className="delta-body" ref={deltaBodyRef}>
           {isArchivedSession ? (
             <section className="delta-archived-state">
               <Archive size={22} />
@@ -3266,10 +4297,29 @@ function DeltaModeWorkspace({
           ) : <div className="delta-messages">
             {messages.map((message) => {
               if (message.role === "system") {
+                if (message.rollReceipt) {
+                  const rollerEntity = entityByDisplayName.get(message.rollReceipt.rollerName.trim().toLowerCase());
+                  const animateRoll = revealTextEnabled && revealMessageIds.has(message.id);
+                  const revealDelayMs = animateRoll ? revealCursorMs : 0;
+                  if (animateRoll) revealCursorMs += revealStepMs;
+                  return (
+                    <DeltaVerifiedRollRow
+                      key={message.id}
+                      message={message}
+                      relationship={relationshipForEntity(rollerEntity)}
+                      expanded={expandedRollId === message.id}
+                      onToggle={() => setExpandedRollId(expandedRollId === message.id ? undefined : message.id)}
+                      animate={animateRoll}
+                      revealDelayMs={revealDelayMs}
+                      onReveal={scrollDeltaToLatest}
+                    />
+                  );
+                }
                 const initiativeLines = message.body.startsWith("Initiative order")
                   ? message.body.split("\n").slice(1).filter((line) => line.trim())
                   : [];
-                const isRollNotice = /^(Roll\b|[^:\n]{1,80}:\s*Roll\b)/.test(message.body.trim());
+                const isRollNotice = isDeltaRollNotice(message.body);
+                if (isRollNotice) legacyRollPendingResolution = displayedTurnNumber > 0;
                 return (
                   <article className={`delta-log-brief ${isRollNotice ? "delta-roll-notice" : ""}`} key={message.id}>
                     {initiativeLines.length > 0 ? (
@@ -3288,23 +4338,38 @@ function DeltaModeWorkspace({
               const visibleBody = cleanDeltaToolCallText(message.body);
               if (!visibleBody) return null;
               const cinematicSplit = splitDeltaCinematic(visibleBody);
-              const bodyText = cinematicSplit.turn || visibleBody;
+              const bodyText = cinematicSplit.turn;
+              const cinematicOnly = Boolean(cinematicSplit.cinematic && !bodyText);
               const isLoading = message.status === "pending" && bodyText.trim() === "...";
-              const rowEntity = session.initiativeStarted && orderedEntities.length > 0
-                ? orderedEntities[displayedTurnNumber % orderedEntities.length]
+              const animateMessage = revealTextEnabled && revealMessageIds.has(message.id) && !isLoading;
+              const cinematicDelayMs = animateMessage ? revealCursorMs : 0;
+              if (animateMessage && cinematicSplit.cinematic) revealCursorMs += deltaRevealLines(cinematicSplit.cinematic).length * revealStepMs;
+              if (cinematicOnly) {
+                return (
+                  <article className="delta-cinematic-beat" key={message.id}>
+                    <span className="delta-log-number delta-cinematic-icon">{cinematicMarker()}</span>
+                    <div className="message-body"><DeltaTurnText text={cinematicSplit.cinematic} animate={animateMessage} startDelayMs={cinematicDelayMs} stepMs={revealStepMs} onReveal={scrollDeltaToLatest} /></div>
+                  </article>
+                );
+              }
+              const bodyDelayMs = animateMessage ? revealCursorMs : 0;
+              if (animateMessage) revealCursorMs += deltaRevealLines(bodyText).length * revealStepMs;
+              const numberLabel = numberForMessage(message);
+              const effectiveTurnNumber = message.turnNumber ?? displayedTurnNumber;
+              const rowEntity = session.initiativeStarted && activeOrderedEntities.length > 0
+                ? activeOrderedEntities[Math.max(0, effectiveTurnNumber - 1) % activeOrderedEntities.length]
                 : undefined;
-              displayedTurnNumber += 1;
               return (
                 <Fragment key={message.id}>
                   {cinematicSplit.cinematic && (
                     <article className="delta-cinematic-beat">
                       <span className="delta-log-number delta-cinematic-icon">{cinematicMarker()}</span>
-                      <div className="message-body"><DeltaTurnText text={cinematicSplit.cinematic} /></div>
+                      <div className="message-body"><DeltaTurnText text={cinematicSplit.cinematic} animate={animateMessage} startDelayMs={cinematicDelayMs} stepMs={revealStepMs} onReveal={scrollDeltaToLatest} /></div>
                     </article>
                   )}
                   <article className={`delta-log-row ${message.role === "user" ? "user" : "assistant"} ${relationshipForEntity(rowEntity)}`}>
-                    <span className="delta-log-number">{String(displayedTurnNumber).padStart(2, "0")}</span>
-                    <div className="message-body">{isLoading ? <LoadingSignal /> : <DeltaTurnText text={bodyText} />}</div>
+                    <span className="delta-log-number">{numberLabel}</span>
+                    <div className="message-body">{isLoading ? <LoadingSignal /> : <DeltaTurnText text={bodyText} animate={animateMessage} startDelayMs={bodyDelayMs} stepMs={revealStepMs} onReveal={scrollDeltaToLatest} />}</div>
                   </article>
                 </Fragment>
               );
@@ -3314,7 +4379,11 @@ function DeltaModeWorkspace({
         {!isArchivedSession && <div className="delta-turn-status">
           <span className="delta-ap-box"><b>AP</b><strong>4/4</strong></span>
           <div className="delta-current-turn">Turn {currentTurnNumber}: {currentTurnLabel}</div>
-          {session.awaitingPlayerAction && !session.awaitingPlayerRoll && <div className="delta-turn-callout">It is your turn.</div>}
+          {session.awaitingPlayerAction && !session.awaitingPlayerRoll && (
+            <div className={`delta-turn-callout ${session.reactionState === "available" ? "reaction" : ""}`}>
+              {session.reactionState === "available" ? session.actionPrompt || "Reaction available." : "It is your turn."}
+            </div>
+          )}
         </div>}
         {!isArchivedSession && session.awaitingPlayerRoll && <div className="delta-floating-prompt roll">{requiredRollText}</div>}
         {!isArchivedSession && session.awaitingPlayerRoll && deltaDiceImages[session.requiredRollDie ?? 20] && (
@@ -3330,7 +4399,7 @@ function DeltaModeWorkspace({
         {!isArchivedSession && !session.finishReady && <section className="composer delta-composer">
           <button className="delta-composer-tool" type="button" onClick={() => undefined} disabled={deltaBusy || session.awaitingPlayerRoll} aria-label="Movement" title="Movement"><Share2 size={18} /><span>MOVE</span></button>
           <button className="delta-composer-tool" type="button" onClick={() => { if (deltaBusy || session.awaitingPlayerRoll) return; setActiveTool(activeTool === "actions" ? undefined : "actions"); }} disabled={deltaBusy || session.awaitingPlayerRoll} aria-label="Actions" title="Actions"><Zap size={18} /><span>ACTIONS</span></button>
-          <textarea ref={composerRef} value={body} onChange={(event) => setBody(event.target.value)} onFocus={() => keepComposerVisible(composerRef.current)} onClick={() => keepComposerVisible(composerRef.current)} disabled={inputDisabled} placeholder={session.awaitingPlayerRoll ? "Waiting on your roll..." : session.awaitingPlayerAction ? "Write your move" : currentTurn ? `Next: ${currentTurn.name}` : "Write Delta message"} rows={2} />
+          <textarea ref={composerRef} value={body} onChange={(event) => setBody(event.target.value)} onFocus={() => keepComposerVisible(composerRef.current)} onClick={() => keepComposerVisible(composerRef.current)} disabled={inputDisabled} placeholder={session.awaitingPlayerRoll ? "Waiting on your roll..." : session.reactionState === "available" ? "Write your reaction" : session.awaitingPlayerAction ? "Write your move" : currentTurn ? `Next: ${currentTurn.name}` : "Write Delta message"} rows={2} />
           <button className="send-button" onClick={send} disabled={inputDisabled}>Send</button>
           <button className="delta-next-button" type="button" onClick={nextTurn} disabled={deltaBusy || !session.initiativeStarted || session.awaitingPlayerAction || session.awaitingPlayerRoll}>Next</button>
         </section>}
@@ -3388,6 +4457,21 @@ function DeltaModeWorkspace({
             <div className="split-actions">
               <button onClick={saveMacroDraft}><Save size={18} /> Save</button>
               <button onClick={() => setMacroDraft(undefined)}>Cancel</button>
+            </div>
+          </section>
+        </div>
+      )}
+      {settingsLeaveOpen && (
+        <div className="modal-backdrop confirm-backdrop" onClick={() => setSettingsLeaveOpen(false)}>
+          <section className="confirm-modal delta-settings-leave-modal" onClick={(event) => event.stopPropagation()}>
+            <div className="section-title">
+              <h2>Unsaved Delta settings</h2>
+              <button className="icon-button" onClick={() => setSettingsLeaveOpen(false)} aria-label="Stay in Delta settings"><X size={18} /></button>
+            </div>
+            <p>You have changes in this Delta workspace that have not been saved.</p>
+            <div className="split-actions">
+              <button onClick={saveSettingsAndContinue}><Save size={16} /> Save and continue</button>
+              <button onClick={discardSettingsAndContinue}>Discard</button>
             </div>
           </section>
         </div>
@@ -3536,9 +4620,22 @@ function DeltaModeWorkspace({
             <div className="delta-messages delta-archive-log">
               {previewMessages.map((message) => {
                 if (message.role === "system") {
+                  if (message.rollReceipt) {
+                    const rollerEntity = previewEntityByName.get(message.rollReceipt.rollerName.trim().toLowerCase());
+                    return (
+                      <DeltaVerifiedRollRow
+                        key={message.id}
+                        message={message}
+                        relationship={relationshipForEntity(rollerEntity)}
+                        expanded={expandedRollId === message.id}
+                        onToggle={() => setExpandedRollId(expandedRollId === message.id ? undefined : message.id)}
+                      />
+                    );
+                  }
                   const initiativeLines = message.body.startsWith("Initiative order")
                     ? message.body.split("\n").slice(1).filter((line) => line.trim())
                     : [];
+                  if (isDeltaRollNotice(message.body)) previewLegacyRollPendingResolution = previewTurnNumber > 0;
                   return (
                     <article className="delta-log-brief" key={message.id}>
                       {initiativeLines.length > 0 ? (
@@ -3554,11 +4651,20 @@ function DeltaModeWorkspace({
                   );
                 }
                 const cinematicSplit = splitDeltaCinematic(message.body);
-                const bodyText = cinematicSplit.turn || message.body;
+                const bodyText = cinematicSplit.turn;
+                if (cinematicSplit.cinematic && !bodyText) {
+                  return (
+                    <article className="delta-cinematic-beat" key={message.id}>
+                      <span className="delta-log-number delta-cinematic-icon">{cinematicMarker()}</span>
+                      <div className="message-body"><DeltaTurnText text={cinematicSplit.cinematic} /></div>
+                    </article>
+                  );
+                }
+                const numberLabel = numberForPreviewMessage(message);
+                const effectiveTurnNumber = message.turnNumber ?? previewTurnNumber;
                 const rowEntity = previewSession.initiativeStarted && previewEntities.length > 0
-                  ? previewEntities[previewTurnNumber % previewEntities.length]
+                  ? previewEntities[Math.max(0, effectiveTurnNumber - 1) % previewEntities.length]
                   : undefined;
-                previewTurnNumber += 1;
                 return (
                   <Fragment key={message.id}>
                     {cinematicSplit.cinematic && (
@@ -3568,7 +4674,7 @@ function DeltaModeWorkspace({
                       </article>
                     )}
                     <article className={`delta-log-row ${message.role === "user" ? "user" : "assistant"} ${relationshipForEntity(rowEntity)}`}>
-                      <span className="delta-log-number">{String(previewTurnNumber).padStart(2, "0")}</span>
+                      <span className="delta-log-number">{numberLabel}</span>
                       <div className="message-body"><DeltaTurnText text={bodyText} /></div>
                     </article>
                   </Fragment>
@@ -3875,6 +4981,7 @@ function ChatScreen({
   const [maxTokens, setMaxTokens] = useState(settings.maxTokens?.toString() ?? "");
   const [maxHistory, setMaxHistory] = useState(settings.maxHistoryMessages?.toString() ?? "");
   const [historyNoLimit, setHistoryNoLimit] = useState(!settings.maxHistoryMessages);
+  const [infiniteWarningOpen, setInfiniteWarningOpen] = useState(false);
   const [compactionEnabled, setCompactionEnabled] = useState(settings.compactionEnabled ?? false);
   const [streamingEnabled, setStreamingEnabled] = useState(settings.streamingEnabled ?? false);
   const [autoManageInventory, setAutoManageInventory] = useState(settings.autoManageInventory ?? false);
@@ -3904,18 +5011,20 @@ function ChatScreen({
     setTopP(settings.topP?.toString() ?? "0");
     setMaxTokens(settings.maxTokens?.toString() ?? "");
     setMaxHistory(settings.maxHistoryMessages?.toString() ?? "");
-    setHistoryNoLimit(!settings.maxHistoryMessages);
+    setHistoryNoLimit(Boolean(chat?.infiniteHistoryLocked) || !settings.maxHistoryMessages);
     setCompactionEnabled(settings.compactionEnabled ?? false);
     setStreamingEnabled(settings.streamingEnabled ?? false);
     setAutoManageInventory(settings.autoManageInventory ?? false);
     setConfirmInventoryUpdates(settings.confirmInventoryUpdates ?? true);
     setAutoManageGear(settings.autoManageGear ?? false);
     setConfirmGearUpdates(settings.confirmGearUpdates ?? true);
-  }, [settings, selectedModelId]);
+  }, [settings, selectedModelId, chat?.id, chat?.infiniteHistoryLocked]);
   useEffect(() => {
     setInventoryEnabled(project?.inventoryEnabled ?? false);
     setGearEnabled(project?.gearEnabled ?? false);
+    setInfiniteWarningOpen(false);
   }, [project?.id, project?.inventoryEnabled, project?.gearEnabled]);
+  useEffect(() => setInfiniteWarningOpen(false), [chat?.id]);
   useEffect(() => {
     const composer = composerRef.current;
     fitComposerTextarea(composer);
@@ -3933,14 +5042,16 @@ function ChatScreen({
       window.visualViewport?.removeEventListener("scroll", handleViewportChange);
     };
   }, []);
-  async function saveChatSettings() {
+  const infiniteHistoryLocked = Boolean(chat?.infiniteHistoryLocked);
+  const effectiveHistoryNoLimit = infiniteHistoryLocked || historyNoLimit;
+  async function persistChatSettings(lockInfiniteHistory = false) {
     const timestamp = now();
     await db.settings.update("settings", {
       defaultModelId: draftModelId || undefined,
       temperature: optionalNumber(temperature),
       topP: optionalNumber(topP),
       maxTokens: optionalNumber(maxTokens),
-      maxHistoryMessages: historyNoLimit ? undefined : optionalNumber(maxHistory),
+      maxHistoryMessages: effectiveHistoryNoLimit ? undefined : optionalNumber(maxHistory),
       compactionEnabled,
       includeWorld,
       includeInstructions,
@@ -3954,8 +5065,17 @@ function ChatScreen({
       updatedAt: timestamp
     });
     if (project) await db.projects.update(project.id, { inventoryEnabled, gearEnabled, updatedAt: timestamp });
+    if (chat && lockInfiniteHistory) await db.chats.update(chat.id, { infiniteHistoryLocked: true, updatedAt: timestamp });
+    setInfiniteWarningOpen(false);
     showSaved();
     await onSettingsSaved(draftModelId);
+  }
+  async function saveChatSettings() {
+    if (chat && effectiveHistoryNoLimit && !infiniteHistoryLocked) {
+      setInfiniteWarningOpen(true);
+      return;
+    }
+    await persistChatSettings();
   }
 
   function openRouterPayload(messagesToSend: OpenRouterMessage[], stream: boolean, imageContextMessageId?: string, forceImageContextTool = false) {
@@ -4008,9 +5128,8 @@ function ChatScreen({
 
   async function inventoryContext(chatId: string) {
     if (!project || !project.inventoryEnabled) return "";
-    const [items, logs, activeChat] = await Promise.all([
+    const [items, activeChat] = await Promise.all([
       db.inventoryItems.where("chatId").equals(chatId).toArray(),
-      db.inventoryLogs.where("chatId").equals(chatId).reverse().sortBy("updatedAt"),
       db.chats.get(chatId)
     ]);
     const inventoryRows = project.inventoryEnabled
@@ -4027,14 +5146,13 @@ function ChatScreen({
     ].filter(Boolean);
     const parts = [
       inventoryRows.length || project.currencyName ? `Inventory:\n${project.currencyName ? `- ${project.currencyName}: ${activeChat?.currencyAmount ?? 0}` : ""}${project.currencyName && inventoryRows.length ? "\n" : ""}${inventoryRows.join("\n") || ""}` : "",
-      logs.length ? `Recent inventory log:\n${logs.slice(0, 8).map((log) => `- ${log.sentence}`).join("\n")}` : "",
       managementLines.join("\n")
     ].filter(Boolean);
     return parts.length ? parts.join("\n\n") : "";
   }
 
   async function memoryContext(currentUserMessage: string, selectedHistory: Message[]) {
-    if (!project || project.memoryMode === "manual") return "";
+    if (!project || project.memoryMode === "manual") return { text: "", query: "", concepts: [] as string[], hits: [] as MainChatRequestAudit["memoryRetrieval"]["hits"] };
     const recentScene = selectedHistory.slice(-4).map((message) => message.body);
     const characterNames = includeCharacters
       ? (await db.characters.where("projectId").equals(project.id).toArray()).map((character) => character.name)
@@ -4056,13 +5174,206 @@ function ChatScreen({
         if (row) await db.memories.update(row.id, { lastRecalledAt: timestamp, recallCount: (row.recallCount ?? 0) + 1, updatedAt: timestamp });
       }));
     }
-    return [
+    const text = [
       `Memory instruction:\n${project.memoryInstruction}`,
       `Memory retrieval query:\n${query || "(none)"}`,
       memories.length
         ? `Retrieved memories for this reply only:\n${memories.map((memory) => `- ${memory.text}${memory.tags.length ? ` [${memory.tags.join(", ")}]` : ""}`).join("\n")}`
         : "Retrieved memories for this reply only:\n(none)"
     ].join("\n\n");
+    return {
+      text,
+      query,
+      concepts,
+      hits: memories.map((memory) => ({ id: memory.id, text: memory.text, tags: memory.tags, relevance: memory.relevance }))
+    };
+  }
+
+  async function storeContextCondensations(sourceMessages: Message[], responseText: string) {
+    const byId = new Map(sourceMessages.map((message) => [message.id, message]));
+    for (const candidate of parseContextCondensations(responseText)) {
+      const source = byId.get(candidate.id);
+      if (!source || source.body.length < contextCondensationMinimumCharacters) continue;
+      const limit = contextCondensationLimit(source);
+      if (candidate.text.length >= source.body.length || candidate.text.length > limit) continue;
+      const latest = await db.messages.get(source.id);
+      if (!latest || latest.updatedAt !== source.updatedAt || latest.body !== source.body) continue;
+      await db.messages.update(source.id, {
+        contextCondensation: candidate.text,
+        contextCondensationSourceUpdatedAt: source.updatedAt
+      });
+    }
+  }
+
+  async function ensureContextCondensations(history: Message[], currentMessageId?: string) {
+    if (!settings.apiKey?.trim() || !draftModelId) return history;
+    const candidates = history.filter((message) =>
+      message.id !== currentMessageId
+      && message.body.length >= contextCondensationMinimumCharacters
+      && (!message.contextCondensation || message.contextCondensationSourceUpdatedAt !== message.updatedAt)
+    );
+    if (!candidates.length) return history;
+    try {
+      const response = await openRouterRequest({
+        model: draftModelId,
+        messages: [
+          {
+            role: "system",
+            content: [
+              "Create high-fidelity context condensations for the supplied prior chat messages. Return only valid JSON with shape {\"condensedMessages\":[{\"id\":\"\",\"text\":\"\"}] }.",
+              "Condense each message independently. Preserve names, actions, outcomes, dialogue and its tone, intentions, emotional and relationship subtext, locations, positions, injuries, discoveries, consequences, exact codes, quantities, unresolved ambiguity, and who knows what.",
+              "Remove only redundant wording, repeated atmosphere, decorative prose, and sentences that restate the same fact. Do not add interpretation, explanations, headings, facts, or connective details.",
+              "Aim to retain roughly 70-80% of the original when it carries meaningful nuance. Prefer a longer faithful condensation over stripping subtext; go shorter only when the source is genuinely repetitive or mostly decorative.",
+              "Never expand a message. Obey each exact maximum-character limit. If a message cannot be shortened safely without losing important nuance, omit that message from condensedMessages so the original remains in use."
+            ].join("\n")
+          },
+          {
+            role: "user",
+            content: candidates.map((message) => `MESSAGE ${message.id}\nROLE: ${message.role}\nMAXIMUM CHARACTERS: ${contextCondensationLimit(message)}\nORIGINAL:\n${message.body}`).join("\n\n")
+          }
+        ],
+        temperature: 0,
+        top_p: 0,
+        max_tokens: Math.min(16000, Math.max(300, Math.ceil(candidates.reduce((total, message) => total + estimateTokens(message.body), 0) * contextCondensationRatio) + 200))
+      });
+      const json = await response.json() as OpenRouterResponse;
+      await storeContextCondensations(candidates, json.choices?.[0]?.message?.content ?? "");
+      const refreshed = await db.messages.bulkGet(history.map((message) => message.id));
+      return refreshed.map((message, index) => message ?? history[index]);
+    } catch {
+      return history;
+    }
+  }
+
+  async function reviewTurnForMemories(chatId: string, userText: string, assistantText: string, sourceMessageIds: string[]): Promise<MainChatMemoryReviewAudit> {
+    const skipped = (reason: string): MainChatMemoryReviewAudit => ({ status: "skipped", reason, condensationMessageIds: [], candidates: [] });
+    if (!project) return skipped("No active project.");
+    if (!settings.apiKey?.trim() || !draftModelId) return skipped("No API key or model was available for post-response memory review.");
+    if (!assistantText.trim()) return skipped("The assistant response was empty.");
+    const sourceMessages = (await db.messages.bulkGet(sourceMessageIds)).filter((message): message is Message => Boolean(message));
+    const condensationCandidates = sourceMessages.filter((message) => message.body.length >= contextCondensationMinimumCharacters);
+    if (project.memoryMode === "manual" && !condensationCandidates.length) return skipped("Memory mode is manual and no message needed context condensation.");
+    let reviewPayload: Record<string, unknown> | undefined;
+    try {
+      reviewPayload = {
+        model: draftModelId,
+        messages: [
+          {
+            role: "system",
+            content: [
+              "Review one completed conversation turn. Return only valid JSON with shape {\"condensedMessages\":[{\"id\":\"\",\"text\":\"\"}],\"memories\":[{\"text\":\"\",\"tags\":[],\"reason\":\"\",\"confidence\":0.0}] }.",
+              "For each supplied message eligible for condensation, create an independent high-fidelity condensation within its exact maximum-character limit. Preserve dialogue and tone, actions, outcomes, intentions, emotional and relationship subtext, names, locations, injuries, discoveries, consequences, exact terms, ambiguity, and who knows what. Remove only redundancy and decorative prose. Aim to retain roughly 70-80% when meaningful nuance exists; go shorter only for genuinely repetitive or mostly decorative text. Never add interpretation or facts. Omit a condensation when shortening would lose important nuance.",
+              project.memoryMode === "manual" ? "Return an empty memories array because project memory saving is manual." : "Return an empty memories array when nothing qualifies. Maximum three memories. Follow the project's memory instruction exactly. Do not save ordinary narration, transient actions, momentary emotion, speculation, duplicate facts, inventory/log details, or technical/tool text.",
+              `Project memory instruction:\n${project.memoryInstruction || defaultMemoryInstruction}`
+            ].join("\n\n")
+          },
+          {
+            role: "user",
+            content: [
+              `User message ID ${sourceMessageIds[0] ?? "user"}${condensationCandidates.some((message) => message.id === sourceMessageIds[0]) ? `; maximum ${contextCondensationLimit(condensationCandidates.find((message) => message.id === sourceMessageIds[0])!)} characters` : "; do not condense"}:\n${userText}`,
+              `Assistant message ID ${sourceMessageIds[1] ?? "assistant"}${condensationCandidates.some((message) => message.id === sourceMessageIds[1]) ? `; maximum ${contextCondensationLimit(condensationCandidates.find((message) => message.id === sourceMessageIds[1])!)} characters` : "; do not condense"}:\n${assistantText}`
+            ].join("\n\n")
+          }
+        ],
+        temperature: 0,
+        top_p: 0,
+        max_tokens: Math.min(16000, Math.max(300, Math.ceil(condensationCandidates.reduce((total, message) => total + estimateTokens(message.body), 0) * contextCondensationRatio) + 300))
+      };
+      const response = await openRouterRequest(reviewPayload);
+      const json = await response.json() as OpenRouterResponse;
+      const responseText = json.choices?.[0]?.message?.content ?? "";
+      await storeContextCondensations(condensationCandidates, responseText);
+      const auditRequest = auditSafeValue(reviewPayload) as Record<string, unknown>;
+      if (project.memoryMode === "manual") return { status: "completed", reason: "Only context condensation was reviewed; memory saving is manual.", requestPayload: auditRequest, rawResponse: responseText, condensationMessageIds: condensationCandidates.map((message) => message.id), candidates: [] };
+      const candidates = parseMemoryReview(responseText);
+      if (!candidates.length) return { status: "completed", reason: "The review proposed no memories.", requestPayload: auditRequest, rawResponse: responseText, condensationMessageIds: condensationCandidates.map((message) => message.id), candidates: [] };
+      const [saved, pending] = await Promise.all([
+        db.memories.where("projectId").equals(project.id).toArray(),
+        db.pendingMemories.where("projectId").equals(project.id).toArray()
+      ]);
+      const existing = new Set([...saved.map((memory) => memory.text), ...pending.map((memory) => memory.text)].map((text) => text.trim().toLocaleLowerCase()));
+      const auditedCandidates: MainChatMemoryReviewAudit["candidates"] = [];
+      for (const candidate of candidates) {
+        const identity = candidate.text.toLocaleLowerCase();
+        if (existing.has(identity)) {
+          auditedCandidates.push({ text: candidate.text, tags: candidate.tags, action: "duplicate" });
+          continue;
+        }
+        existing.add(identity);
+        if (project.memoryMode === "approval") {
+          const timestamp = now();
+          await db.pendingMemories.add({
+            id: uid(),
+            projectId: project.id,
+            text: candidate.text,
+            tags: candidate.tags,
+            reason: candidate.reason,
+            confidence: candidate.confidence,
+            sourceMessageIds,
+            createdAt: timestamp,
+            updatedAt: timestamp
+          });
+          auditedCandidates.push({ text: candidate.text, tags: candidate.tags, action: "pending approval" });
+        } else {
+          const memory = await createMemory(project.id, candidate.text, candidate.tags, "automatic", sourceMessageIds);
+          await db.memories.update(memory.id, { sourceChatId: chatId });
+          auditedCandidates.push({ text: candidate.text, tags: candidate.tags, action: "saved" });
+        }
+      }
+      return { status: "completed", requestPayload: auditRequest, rawResponse: responseText, condensationMessageIds: condensationCandidates.map((message) => message.id), candidates: auditedCandidates };
+    } catch (error) {
+      // Memory review must never turn a successful chat reply into a failed send.
+      return { status: "failed", error: error instanceof Error ? error.message : "Unknown memory review error.", requestPayload: reviewPayload ? auditSafeValue(reviewPayload) as Record<string, unknown> : undefined, condensationMessageIds: condensationCandidates.map((message) => message.id), candidates: [] };
+    }
+  }
+
+  async function updateCompactionMemory(activeChat: Chat, orderedHistory: Message[], historyLimit: number, rebuild = false) {
+    if (!compactionEnabled || historyLimit < 1 || !settings.apiKey?.trim() || !draftModelId) return activeChat.compactionMemory;
+    const hasExistingCompaction = Boolean(activeChat.compactionMemory || activeChat.compactedThroughSequence !== undefined);
+    const historyLimitChanged = hasExistingCompaction && activeChat.compactionHistoryLimit !== undefined && activeChat.compactionHistoryLimit !== historyLimit;
+    rebuild = rebuild || Boolean(activeChat.compactionNeedsRebuild) || historyLimitChanged;
+    const compactedThrough = rebuild ? -1 : activeChat.compactedThroughSequence ?? -1;
+    const expired = messagesForIncrementalCompaction(orderedHistory, historyLimit, compactedThrough);
+    if (!expired.length) {
+      if (rebuild) await db.chats.update(activeChat.id, { compactionMemory: "", compactedThroughSequence: undefined, compactionNeedsRebuild: false, compactionHistoryLimit: historyLimit, updatedAt: now() });
+      else if (hasExistingCompaction && activeChat.compactionHistoryLimit === undefined) await db.chats.update(activeChat.id, { compactionHistoryLimit: historyLimit, updatedAt: now() });
+      return rebuild ? "" : activeChat.compactionMemory;
+    }
+    try {
+      const response = await openRouterRequest({
+        model: draftModelId,
+        messages: [
+          {
+            role: "system",
+            content: [
+              "Maintain a compact continuity outline for chat messages that have fallen outside the active message-history limit.",
+              "Return only the updated outline as terse bullet points, not prose and not JSON.",
+              "Preserve major plot events, decisions, relationships, injuries and their causes, deaths, discoveries, unresolved conflicts, exact names, locations, and lasting narrative state changes.",
+              "Do not preserve inventory or gear acquisitions, losses, quantities, currency amounts, item provenance, or inventory-log details. Those are maintained by separate live systems.",
+              "Discard small talk, routine actions, repeated facts, decorative prose, and minor moment-to-moment details. Never add facts that are not present.",
+              rebuild ? "Rebuild the outline only from the supplied expired messages." : "Merge the newly expired messages into the existing outline without duplicating facts."
+            ].join("\n")
+          },
+          {
+            role: "user",
+            content: [
+              !rebuild && activeChat.compactionMemory ? `Existing outline:\n${activeChat.compactionMemory}` : "Existing outline:\n(none)",
+              `Newly expired messages:\n${expired.map((message) => `${message.role}: ${message.body}`).join("\n\n")}`
+            ].join("\n\n")
+          }
+        ],
+        temperature: 0,
+        top_p: 0
+      });
+      const json = await response.json() as OpenRouterResponse;
+      const summary = json.choices?.[0]?.message?.content?.trim();
+      if (!summary) return activeChat.compactionMemory;
+      const compactedThroughSequence = Math.max(...expired.map((message) => message.sequence));
+      await db.chats.update(activeChat.id, { compactionMemory: summary, compactedThroughSequence, compactionNeedsRebuild: false, compactionHistoryLimit: historyLimit, updatedAt: now() });
+      return summary;
+    } catch {
+      return activeChat.compactionMemory;
+    }
   }
 
   function shouldConfirmInventoryUpdate(kind: InventoryUpdateRequest["kind"]) {
@@ -4081,6 +5392,69 @@ function ChatScreen({
 
   function toolsEnabled(imageContextMessageId?: string) {
     return true;
+  }
+
+  function createMainChatAudit(options: {
+    requestKind: MainChatRequestAudit["requestKind"];
+    chatId: string;
+    userMessageId?: string;
+    preparedHistory: Message[];
+    memoryDetails: Awaited<ReturnType<typeof memoryContext>>;
+    requestPayload: Record<string, unknown>;
+    sourceFiles: Array<{ name: string; textContent?: string }>;
+    characterDetails: string;
+    inventoryDetails: string;
+    compactionMemory: string;
+    compactionIncluded: boolean;
+    imageCount: number;
+    attachedFileCount: number;
+    toolEvents: MainChatAuditToolEvent[];
+  }): MainChatRequestAudit {
+    return {
+      version: 1,
+      capturedAt: now(),
+      requestKind: options.requestKind,
+      projectId: project?.id ?? "",
+      projectName: project?.name ?? "",
+      chatId: options.chatId,
+      userMessageId: options.userMessageId,
+      selectedHistory: options.preparedHistory.map((message) => ({
+        id: message.id,
+        sequence: message.sequence,
+        role: message.role,
+        usedCondensation: Boolean(message.contextCondensation && message.contextCondensationSourceUpdatedAt === message.updatedAt && message.id !== options.userMessageId)
+      })),
+      contextSources: [
+        { name: "Project instructions", included: Boolean(includeInstructions && project?.instructions), detail: project?.instructions ? `${project.instructions.length} characters` : undefined },
+        { name: "World setting", included: Boolean(includeWorld && project?.worldSetting), detail: project?.worldSetting ? `${project.worldSetting.length} characters` : undefined },
+        { name: "Character library", included: Boolean(options.characterDetails), detail: options.characterDetails ? `${options.characterDetails.length} characters` : undefined },
+        { name: "Source files", included: options.sourceFiles.length > 0, detail: options.sourceFiles.length ? options.sourceFiles.map((file) => `${file.name} (${file.textContent?.length ?? 0} characters)`).join(", ") : undefined },
+        { name: "Compaction memory", included: options.compactionIncluded, detail: options.compactionIncluded ? `${options.compactionMemory.length} characters` : undefined },
+        { name: "Retrieved project memories", included: options.memoryDetails.hits.length > 0, detail: `${options.memoryDetails.hits.length} hit${options.memoryDetails.hits.length === 1 ? "" : "s"}` },
+        { name: "Live inventory", included: Boolean(options.inventoryDetails), detail: options.inventoryDetails ? `${options.inventoryDetails.length} characters` : undefined },
+        { name: "Attached images", included: options.imageCount > 0, detail: `${options.imageCount}` },
+        { name: "Attached files", included: options.attachedFileCount > 0, detail: `${options.attachedFileCount}` }
+      ],
+      memoryRetrieval: {
+        mode: project?.memoryMode ?? "manual",
+        query: options.memoryDetails.query,
+        concepts: options.memoryDetails.concepts,
+        hits: options.memoryDetails.hits
+      },
+      requestPayload: auditSafeValue(options.requestPayload) as Record<string, unknown>,
+      toolEvents: options.toolEvents
+    };
+  }
+
+  async function storePostResponseMemoryAudit(messageId: string, audit: MainChatMemoryReviewAudit) {
+    const latest = await db.messages.get(messageId);
+    if (!latest?.requestInfo?.audit) return;
+    await db.messages.update(messageId, {
+      requestInfo: {
+        ...latest.requestInfo,
+        audit: { ...latest.requestInfo.audit, postResponseMemory: audit }
+      }
+    });
   }
 
 
@@ -4232,15 +5606,19 @@ function ChatScreen({
     const brief = typeof args.brief === "string" ? args.brief.trim() : "";
     if (!brief) return { error: "brief is required." };
     const handoffContext = typeof args.handoffContext === "string" ? args.handoffContext.trim() : "";
-    const alliesMatch = /^\s*allies?\s+present\s*:\s*(.+)$/im.exec(handoffContext);
-    const hasNamedAllies = Boolean(alliesMatch?.[1] && !/^(none|unknown|n\/a)$/i.test(alliesMatch[1].trim()));
-    if (/\b(?:the\s+team|their\s+team|allies?)\b/i.test(brief) && !hasNamedAllies) {
-      return { error: "If the brief refers to a team or allies, handoffContext must include an Allies present: line listing their actual names. Do not hide participants behind collective wording." };
+    const playerCharacterName = typeof args.playerCharacterName === "string" ? args.playerCharacterName.trim() : "";
+    const roster = normaliseDeltaBriefRoster({ team: args.team, neutral: args.neutral, enemies: args.enemies });
+    if (playerCharacterName && ![...roster.team, ...roster.neutral, ...roster.enemies].some((name) => name.toLowerCase() === playerCharacterName.toLowerCase())) {
+      roster.team.unshift(playerCharacterName);
     }
+    const abstractName = [...roster.team, ...roster.neutral, ...roster.enemies].find(abstractDeltaRosterName);
+    if (abstractName) return { error: `Roster entry "${abstractName}" is abstract. Identify the visible person, animal, species, or concrete role instead.` };
+    if (![...roster.team, ...roster.neutral, ...roster.enemies].length) return { error: "A Delta engagement needs a concrete participant roster." };
     const proposal: DeltaImminentProposal = {
       brief,
       handoffContext,
-      playerCharacterName: typeof args.playerCharacterName === "string" ? args.playerCharacterName.trim() : "",
+      playerCharacterName,
+      roster,
       mapSize: normaliseDeltaMapSize(args.mapSize),
       avoidLabel: typeof args.avoidLabel === "string" ? args.avoidLabel.trim() : "",
       avoidPrompt: typeof args.avoidPrompt === "string" ? args.avoidPrompt.trim() : ""
@@ -4265,7 +5643,7 @@ function ChatScreen({
     return runCharacterTool(toolCall);
   }
 
-  async function resolveToolCalls(messagesToSend: OpenRouterMessage[], toolLog: string[], inventoryUpdates: InventoryUpdateRequest[], chatId: string, sourceMessageIds: string[], imageContextMessageId?: string) {
+  async function resolveToolCalls(messagesToSend: OpenRouterMessage[], toolLog: string[], toolEvents: MainChatAuditToolEvent[], inventoryUpdates: InventoryUpdateRequest[], chatId: string, sourceMessageIds: string[], imageContextMessageId?: string) {
     if (!toolsEnabled(imageContextMessageId)) return { messages: messagesToSend, usage: undefined as OpenRouterUsage | undefined };
     let nextMessages = [...messagesToSend];
     let usage: OpenRouterUsage | undefined;
@@ -4288,6 +5666,13 @@ function ChatScreen({
       for (const toolCall of toolCalls) {
         const result = await runToolCall(toolCall, chatId, inventoryUpdates, sourceMessageIds, deltaImminentProposals, imageContextMessageId);
         toolLog.push(toolCall.function.name);
+        toolEvents.push({
+          round: index + 1,
+          callId: toolCall.id,
+          name: toolCall.function.name,
+          arguments: toolCall.function.arguments || "{}",
+          result: JSON.stringify(auditSafeValue(result), null, 2)
+        });
         nextMessages.push({
           role: "tool",
           tool_call_id: toolCall.id,
@@ -4305,8 +5690,8 @@ function ChatScreen({
     return { messages: nextMessages, usage, deltaImminentProposal: deltaImminentProposals[deltaImminentProposals.length - 1] };
   }
 
-  async function completeWithTools(messagesToSend: OpenRouterMessage[], toolLog: string[], inventoryUpdates: InventoryUpdateRequest[], chatId: string, sourceMessageIds: string[], imageContextMessageId?: string) {
-    const resolved = await resolveToolCalls(messagesToSend, toolLog, inventoryUpdates, chatId, sourceMessageIds, imageContextMessageId);
+  async function completeWithTools(messagesToSend: OpenRouterMessage[], toolLog: string[], toolEvents: MainChatAuditToolEvent[], inventoryUpdates: InventoryUpdateRequest[], chatId: string, sourceMessageIds: string[], imageContextMessageId?: string) {
+    const resolved = await resolveToolCalls(messagesToSend, toolLog, toolEvents, inventoryUpdates, chatId, sourceMessageIds, imageContextMessageId);
     const replyText = typeof resolved.assistantMessage?.content === "string" ? resolved.assistantMessage.content : "";
     return {
       replyText,
@@ -4317,7 +5702,7 @@ function ChatScreen({
   }
   async function createDeltaBrief(command: string, activeChat: Chat) {
     const activeProject = project;
-    if (!activeProject) return { brief: command, handoffContext: command, playerCharacterName: "", mapSize: "M" as DeltaMapSize };
+    if (!activeProject) return { brief: command, handoffContext: command, playerCharacterName: "", roster: normaliseDeltaBriefRoster(undefined), mapSize: "M" as DeltaMapSize };
     const history = await db.messages
       .where("[chatId+branchId+sequence]")
       .between([activeChat.id, activeChat.activeBranchId, Dexie.minKey], [activeChat.id, activeChat.activeBranchId, Dexie.maxKey])
@@ -4326,7 +5711,7 @@ function ChatScreen({
     const fallbackSource = [...recent].reverse().find((message) => message.role === "assistant")?.body || command;
     const fallbackBrief = fallbackSource.length > 1400 ? `${fallbackSource.slice(0, 1400).trim()}...` : fallbackSource;
     const fallbackHandoff = recent.map((message) => `${message.role}: ${message.body}`).join("\n\n").slice(-1800);
-    if (!settings.apiKey?.trim() || !draftModelId) return { brief: fallbackBrief, handoffContext: fallbackHandoff, playerCharacterName: "", mapSize: "M" as DeltaMapSize };
+    if (!settings.apiKey?.trim() || !draftModelId) return { brief: fallbackBrief, handoffContext: fallbackHandoff, playerCharacterName: "", roster: deltaBriefRosterFromContext(fallbackHandoff), mapSize: "M" as DeltaMapSize };
     try {
       const response = await openRouterRequest({
         model: draftModelId,
@@ -4335,15 +5720,16 @@ function ChatScreen({
             role: "system",
             content: [
               "Create a concise immersive Delta Mode imminent scene beat from the recent chat context. Return only valid JSON.",
-              "Shape: {\"brief\":\"\",\"handoffContext\":\"\",\"playerCharacterName\":\"\",\"mapSize\":\"M\",\"avoidLabel\":\"\",\"avoidPrompt\":\"\"}",
-              "brief: write in the same third-person narrative style as the user's roleplay. It must feel like the next paragraph in the scene, not a summary, report, cast list, mission briefing, or movie trailer.",
-              "brief: explicitly name who is actually involved in this scene. Name the player character and every known ally present; never hide known allies behind 'the team' or collective wording. Preserve established opposing participants. When an engagement is genuinely imminent but no opposition is established, create only the specific encounter participants the immediate place, project world, tone, and situation naturally call for. Do not fall back to a generic tactical roster or reuse a cast, role, faction, or location from another engagement.",
-              "brief: include concrete immediate details: exact place/terrain/interior, lighting or visibility, distance/proximity, what the threat is physically doing now, what the player character can perceive, and why the moment is about to become structured.",
+              "Shape: {\"brief\":\"\",\"handoffContext\":\"\",\"playerCharacterName\":\"\",\"roster\":{\"team\":[],\"neutral\":[],\"enemies\":[]},\"mapSize\":\"M\",\"avoidLabel\":\"\",\"avoidPrompt\":\"\"}",
+              "brief: write one to three compact sentences in the same third-person narrative style as the user's roleplay. Continue the exact moment. State the immediate place, what is physically happening, and what pressure forces the engagement. Prefer useful concrete facts over lighting, scent, tension, mood, or movie-trailer atmosphere.",
+              "brief: do not carry the participant roster inside prose when the roster rows communicate it more clearly. Do not introduce known characters, summarize a mission, or speak to the user.",
               "brief: do not introduce known characters back to the user with roles or biographies. Use names naturally. If Jaeger or another known character is present, include a brief immersive reaction, gesture, or line when context supports it.",
               "brief: do not use labels such as Allies, Hostiles, Objective, Mission, Target, or PLAYER CHARACTER inside the brief text. Do not speak to the user. Do not ask a question.",
-              "brief length: 2 to 5 compact sentences, maximum 120 words.",
-              "handoffContext: terse exact continuity anchors for Delta startup, separate from visible prose. Put every participant on its own line using only concrete roster forms such as Player: Halle, Ally: Jaeger, Neutral: Gate Clerk, or Hostile: Vex. An optional role may appear only in parentheses, e.g. Hostile: Vex (leader). Never write placeholder text like <name>, character name, NPC name, or enemy name. Do not put actions, prose, locations, objectives, or descriptions on a participant line. Use separate Location:, Objective:, and Situation: lines for other facts. Never use 'the team' as a substitute for names. Preserve established facts. If an encounter must be created because the scene leaves opposition unknown, include only the specific participants naturally created for this immediate setting, never a stock roster or unrelated carry-over. Include named one-off NPCs even if they are not saved character pages. Preserve exact names, codes, item labels, locations, factions, current objective, immediate physical situation, and constraints.",
-              "handoffContext length: maximum 12 short lines.",
+              "brief length: maximum 80 words.",
+              "roster.team: list every allied participant physically involved, including the likely player character when appropriate. roster.neutral and roster.enemies: list every concrete participant in those relationships. Preserve established names and quantities. If opposition is newly revealed, create only what this exact scene naturally calls for.",
+              "roster naming: every entry must identify something observable: a person's name, a concrete human descriptor, an animal/species, or a recognizable role. Never use Unknown Figure, Unknown Creature, Mysterious Person, unidentified shape, presence, or similarly abstract labels. Distinguish multiples by visible role or trait rather than leaving them abstract.",
+              "handoffContext: terse non-roster continuity anchors only. Use Location:, Objective:, Situation:, and Constraint: lines. Preserve exact names, codes, item labels, locations, factions, immediate physical situation, and constraints.",
+              "handoffContext length: maximum 8 short lines.",
               "playerCharacterName: the likely player-controlled character name if the context implies one; otherwise use the lead/protagonist character name; otherwise empty.",
               "mapSize: choose exactly one map boundary based on the immediate scene: S (30m), M (50m), L (80m), XL (100m), or XXL (200m). It is the engagement boundary, not a zoom level. Choose the smallest fair scene boundary.",
               "avoidLabel: use Cancel for a proposed mission/commitment, Escape for immediate danger, or empty if avoidance does not make sense.",
@@ -4364,9 +5750,9 @@ function ChatScreen({
       });
       const json = await response.json() as OpenRouterResponse;
       const packet = parseDeltaBriefPacket(json.choices?.[0]?.message?.content ?? "");
-      return { brief: packet.brief || fallbackBrief, handoffContext: packet.handoffContext || fallbackHandoff, playerCharacterName: packet.playerCharacterName, mapSize: packet.mapSize, avoidLabel: packet.avoidLabel, avoidPrompt: packet.avoidPrompt };
+      return { brief: packet.brief || fallbackBrief, handoffContext: packet.handoffContext || fallbackHandoff, playerCharacterName: packet.playerCharacterName, roster: packet.roster, mapSize: packet.mapSize, avoidLabel: packet.avoidLabel, avoidPrompt: packet.avoidPrompt };
     } catch {
-      return { brief: fallbackBrief, handoffContext: fallbackHandoff, playerCharacterName: "", mapSize: "M" as DeltaMapSize };
+      return { brief: fallbackBrief, handoffContext: fallbackHandoff, playerCharacterName: "", roster: deltaBriefRosterFromContext(fallbackHandoff), mapSize: "M" as DeltaMapSize };
     }
   }
   async function send() {
@@ -4396,6 +5782,7 @@ function ChatScreen({
           brief: brief.brief,
           handoffContext: brief.handoffContext,
           playerCharacterName: brief.playerCharacterName,
+          roster: brief.roster,
           mapSize: brief.mapSize,
           avoidLabel: brief.avoidLabel,
           avoidPrompt: brief.avoidPrompt
@@ -4458,14 +5845,15 @@ function ChatScreen({
       }
       if (!createdChatId) await onRefresh();
       const toolLog: string[] = [];
+      const toolEvents: MainChatAuditToolEvent[] = [];
       const inventoryUpdates: InventoryUpdateRequest[] = [];
-      const requestInfo = {
+      const requestInfo: NonNullable<Message["requestInfo"]> = {
         settings: [
           `Model: ${draftModelId}`,
           `Temperature: ${temperature || "0"}`,
           `Top P: ${topP || "0"}`,
           `Max output: ${maxTokens || "no limit"}`,
-          historyNoLimit ? "History: no limit" : `History: ${maxHistory || "not set"} messages`,
+          effectiveHistoryNoLimit ? "History: no limit" : `History: ${maxHistory || "not set"} messages`,
           `Streaming: ${streamingEnabled ? "on" : "off"}`
         ],
         toggles: [
@@ -4501,9 +5889,14 @@ function ChatScreen({
         .between([chatId, branchId, Dexie.minKey], [chatId, branchId, Dexie.maxKey])
         .toArray();
       const orderedHistory = allHistory.sort((a, b) => a.sequence - b.sequence);
-      const historyLimit = historyNoLimit ? undefined : optionalNumber(maxHistory);
-      const selectedHistory = historyLimit ? orderedHistory.slice(-historyLimit) : orderedHistory;
+      const contextHistory = orderedHistory.filter((message) => message.id !== reply.id);
+      const historyLimit = effectiveHistoryNoLimit ? undefined : optionalNumber(maxHistory);
+      const compactionMemory = activeChat && historyLimit
+        ? await updateCompactionMemory(activeChat, contextHistory, historyLimit)
+        : activeChat?.compactionMemory ?? "";
+      const selectedHistory = historyLimit ? contextHistory.slice(-historyLimit) : contextHistory;
       const memoryDetails = await memoryContext(text, selectedHistory);
+      const preparedHistory = await ensureContextCondensations(selectedHistory, userMessageId);
       const deltaAvailable = deltaEngagementEnabled();
       const systemParts = [
         `Project: ${project.name}`,
@@ -4511,29 +5904,48 @@ function ChatScreen({
         includeInstructions && project.instructions ? `Project instructions:\n${project.instructions}` : "",
         includeWorld && project.worldSetting ? `World setting:\n${project.worldSetting}` : "",
         characterDetails,
-        compactionEnabled && activeChat?.compactionMemory ? `Compaction memory:\n${activeChat.compactionMemory}` : "",
+        compactionEnabled && historyLimit && compactionMemory ? `Compaction memory:\n${compactionMemory}` : "",
         sourceFiles.length ? `Source files:\n${sourceFiles.map((file) => `# ${file.name}\n${file.textContent}`).join("\n\n")}` : "",
         attachedFileDetails,
         images.length ? "An image is attached to the latest user message. First call save_image_context exactly once with a detailed concise visual extraction. It is hidden from the user. Then answer the user normally from the image." : "",
-        memoryDetails,
+        memoryDetails.text,
         inventoryDetails
       ].filter(Boolean);
-      const historyContent = chatHistoryContent(selectedHistory, userMessageId, images);
+      const historyContent = chatHistoryContent(preparedHistory, userMessageId, images);
       const requestMessages: OpenRouterMessage[] = [
         ...(systemParts.length ? [{ role: "system" as const, content: systemParts.join("\n\n") }] : []),
         ...historyContent
       ];
+      requestInfo.audit = createMainChatAudit({
+        requestKind: "send",
+        chatId,
+        userMessageId,
+        preparedHistory,
+        memoryDetails,
+        requestPayload: openRouterPayload(requestMessages, false, images.length ? userMessageId : undefined, images.length > 0),
+        sourceFiles,
+        characterDetails,
+        inventoryDetails,
+        compactionMemory,
+        compactionIncluded: Boolean(compactionEnabled && historyLimit && compactionMemory),
+        imageCount: images.length,
+        attachedFileCount: attachedFiles.length,
+        toolEvents
+      });
+      await db.messages.update(reply.id, { requestInfo, updatedAt: now() });
       try {
         if (toolsEnabled(images.length ? userMessageId : undefined)) {
-          const completed = await completeWithTools(requestMessages, toolLog, inventoryUpdates, chatId, selectedHistory.map((message) => message.id), images.length ? userMessageId : undefined);
+          const completed = await completeWithTools(requestMessages, toolLog, toolEvents, inventoryUpdates, chatId, selectedHistory.map((message) => message.id), images.length ? userMessageId : undefined);
           const deltaProposal = completed.deltaImminentProposal;
+          const completedReplyText = deltaProposal ? `### Δ Delta mode imminent...\n\n${deltaProposal.brief}` : completed.replyText || "(No response text returned.)";
           await db.messages.update(reply.id, {
-            body: deltaProposal ? `### Δ Delta mode imminent...\n\n${deltaProposal.brief}` : completed.replyText || "(No response text returned.)",
+            body: completedReplyText,
             deltaBrief: deltaProposal ? {
               status: "pending",
               brief: deltaProposal.brief,
               handoffContext: deltaProposal.handoffContext,
               playerCharacterName: deltaProposal.playerCharacterName,
+              roster: deltaProposal.roster,
               mapSize: deltaProposal.mapSize,
               avoidLabel: deltaProposal.avoidLabel || "Escape",
               avoidPrompt: deltaProposal.avoidPrompt || "What do you do to avoid the engagement?"
@@ -4549,8 +5961,12 @@ function ChatScreen({
           setAttachedFiles([]);
           if (createdChatId) await onChatCreated(createdChatId);
           else await onRefresh();
+          const memoryReview = await reviewTurnForMemories(chatId, text, completedReplyText, [userMessageId, reply.id].filter((id): id is string => Boolean(id)));
+          await storePostResponseMemoryAudit(reply.id, memoryReview);
+          await onRefresh();
           return;
         }
+        let completedReplyText = "";
         const response = await openRouterRequest(openRouterPayload(requestMessages, streamingEnabled));
         await db.messages.update(reply.id, { requestInfo: { ...requestInfo, toolCalls: toolLog.length ? toolLog : ["None"] } });
         if (streamingEnabled && response.body) {
@@ -4579,12 +5995,14 @@ function ChatScreen({
               await onRefresh();
             }
           }
-          await db.messages.update(reply.id, { body: replyText || "(No response text returned.)", inputTokens, outputTokens: outputTokens ?? estimateTokens(replyText), estimatedTokens: !outputTokens, status: "complete", updatedAt: now() });
+          completedReplyText = replyText || "(No response text returned.)";
+          await db.messages.update(reply.id, { body: completedReplyText, inputTokens, outputTokens: outputTokens ?? estimateTokens(replyText), estimatedTokens: !outputTokens, status: "complete", updatedAt: now() });
         } else {
           const json = await response.json() as { choices?: { message?: { content?: string } }[]; usage?: { prompt_tokens?: number; completion_tokens?: number } };
           const replyText = json.choices?.[0]?.message?.content ?? "";
+          completedReplyText = replyText || "(No response text returned.)";
           await db.messages.update(reply.id, {
-            body: replyText || "(No response text returned.)",
+            body: completedReplyText,
             inputTokens: json.usage?.prompt_tokens,
             outputTokens: json.usage?.completion_tokens ?? estimateTokens(replyText),
             estimatedTokens: !json.usage?.completion_tokens,
@@ -4592,6 +6010,10 @@ function ChatScreen({
             updatedAt: now()
           });
         }
+        await onRefresh();
+        const memoryReview = await reviewTurnForMemories(chatId, text, completedReplyText, [userMessageId, reply.id].filter((id): id is string => Boolean(id)));
+        await storePostResponseMemoryAudit(reply.id, memoryReview);
+        await onRefresh();
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown error";
         requestFailed = true;
@@ -4600,6 +6022,7 @@ function ChatScreen({
           body: `OpenRouter request failed: ${message}`,
           error: message,
           status: "failed",
+          requestInfo: { ...requestInfo, toolCalls: toolLog.length ? toolLog : ["None"], inventoryUpdates },
           updatedAt: now()
         });
       }
@@ -4616,9 +6039,11 @@ function ChatScreen({
     const clean = nextBody.trim();
     if (!clean) return message;
     const timestamp = now();
-    await db.transaction("rw", db.messages, db.stars, async () => {
+    await db.transaction("rw", db.messages, db.stars, db.chats, async () => {
       await db.messages.update(message.id, {
         body: clean,
+        contextCondensation: undefined,
+        contextCondensationSourceUpdatedAt: undefined,
         inputTokens: message.role === "user" ? estimateTokens(clean) : message.inputTokens,
         outputTokens: message.role === "assistant" ? estimateTokens(clean) : message.outputTokens,
         estimatedTokens: true,
@@ -4626,6 +6051,7 @@ function ChatScreen({
       });
       const star = await db.stars.where("messageId").equals(message.id).first();
       if (star) await db.stars.update(star.id, { bodyCopy: clean, updatedAt: timestamp });
+      if (compactionEnabled) await db.chats.update(message.chatId, { compactionNeedsRebuild: true, updatedAt: timestamp });
     });
     await onRefresh();
     return { ...message, body: clean, updatedAt: timestamp, estimatedTokens: true };
@@ -4668,10 +6094,14 @@ function ChatScreen({
       .between([chatId, branchId, Dexie.minKey], [chatId, branchId, promptMessage.sequence])
       .toArray();
     const orderedHistory = allHistory.sort((a, b) => a.sequence - b.sequence);
-    const historyLimit = historyNoLimit ? undefined : optionalNumber(maxHistory);
+    const historyLimit = effectiveHistoryNoLimit ? undefined : optionalNumber(maxHistory);
+    const compactionMemory = activeChat && historyLimit
+      ? await updateCompactionMemory(activeChat, orderedHistory, historyLimit, true)
+      : activeChat?.compactionMemory ?? "";
     const limitedHistory = historyLimit ? orderedHistory.slice(-historyLimit) : orderedHistory;
     const selectedHistory = limitedHistory.some((row) => row.id === promptMessage.id) ? limitedHistory : [...limitedHistory, promptMessage].sort((a, b) => a.sequence - b.sequence);
     const memoryDetails = await memoryContext(promptMessage.body, selectedHistory);
+    const preparedHistory = await ensureContextCondensations(selectedHistory, promptMessage.id);
     const resendImages = promptMessage.attachmentContext ? [] : await storedMessageImages(promptMessage.id);
     const deltaAvailable = deltaEngagementEnabled();
     const systemParts = [
@@ -4680,26 +6110,27 @@ function ChatScreen({
       includeInstructions && project.instructions ? `Project instructions:\n${project.instructions}` : "",
       includeWorld && project.worldSetting ? `World setting:\n${project.worldSetting}` : "",
       characterDetails,
-      compactionEnabled && activeChat?.compactionMemory ? `Compaction memory:\n${activeChat.compactionMemory}` : "",
+      compactionEnabled && historyLimit && compactionMemory ? `Compaction memory:\n${compactionMemory}` : "",
       sourceFiles.length ? `Source files:\n${sourceFiles.map((file) => `# ${file.name}\n${file.textContent}`).join("\n\n")}` : "",
       resendImages.length ? "An image is attached to the latest user message. First call save_image_context exactly once with a detailed concise visual extraction. It is hidden from the user. Then answer the user normally from the image." : "",
-      memoryDetails,
+      memoryDetails.text,
       inventoryDetails
     ].filter(Boolean);
-    const historyContent = chatHistoryContent(selectedHistory, promptMessage.id, resendImages);
+    const historyContent = chatHistoryContent(preparedHistory, promptMessage.id, resendImages);
     const requestMessages: OpenRouterMessage[] = [
       ...(systemParts.length ? [{ role: "system" as const, content: systemParts.join("\n\n") }] : []),
       ...historyContent
     ];
     const toolLog: string[] = [];
+    const toolEvents: MainChatAuditToolEvent[] = [];
     const inventoryUpdates: InventoryUpdateRequest[] = [];
-    const requestInfo = {
+    const requestInfo: NonNullable<Message["requestInfo"]> = {
       settings: [
         `Model: ${draftModelId}`,
         `Temperature: ${temperature || "0"}`,
         `Top P: ${topP || "0"}`,
         `Max output: ${maxTokens || "no limit"}`,
-        historyNoLimit ? "History: no limit" : `History: ${maxHistory || "not set"} messages`,
+        effectiveHistoryNoLimit ? "History: no limit" : `History: ${maxHistory || "not set"} messages`,
         `Streaming: ${streamingEnabled ? "on" : "off"}`
       ],
       toggles: [
@@ -4718,6 +6149,22 @@ function ChatScreen({
       toolCalls: toolLog,
       inventoryUpdates
     };
+    requestInfo.audit = createMainChatAudit({
+      requestKind: "resend",
+      chatId,
+      userMessageId: promptMessage.id,
+      preparedHistory,
+      memoryDetails,
+      requestPayload: openRouterPayload(requestMessages, false, resendImages.length ? promptMessage.id : undefined, resendImages.length > 0),
+      sourceFiles,
+      characterDetails,
+      inventoryDetails,
+      compactionMemory,
+      compactionIncluded: Boolean(compactionEnabled && historyLimit && compactionMemory),
+      imageCount: resendImages.length,
+      attachedFileCount: 0,
+      toolEvents
+    });
     let reply: Message | undefined;
     await db.transaction("rw", db.messages, db.stars, db.chats, async () => {
       const laterIds = await db.messages
@@ -4738,15 +6185,17 @@ function ChatScreen({
     await onRefresh();
     try {
       if (toolsEnabled(resendImages.length ? promptMessage.id : undefined)) {
-        const completed = await completeWithTools(requestMessages, toolLog, inventoryUpdates, chatId, selectedHistory.map((message) => message.id), resendImages.length ? promptMessage.id : undefined);
+        const completed = await completeWithTools(requestMessages, toolLog, toolEvents, inventoryUpdates, chatId, selectedHistory.map((message) => message.id), resendImages.length ? promptMessage.id : undefined);
         const deltaProposal = completed.deltaImminentProposal;
+        const completedReplyText = deltaProposal ? `### Δ Delta mode imminent...\n\n${deltaProposal.brief}` : completed.replyText || "(No response text returned.)";
         await db.messages.update(reply.id, {
-          body: deltaProposal ? `### Δ Delta mode imminent...\n\n${deltaProposal.brief}` : completed.replyText || "(No response text returned.)",
+          body: completedReplyText,
           deltaBrief: deltaProposal ? {
             status: "pending",
             brief: deltaProposal.brief,
             handoffContext: deltaProposal.handoffContext,
             playerCharacterName: deltaProposal.playerCharacterName,
+            roster: deltaProposal.roster,
             mapSize: deltaProposal.mapSize,
             avoidLabel: deltaProposal.avoidLabel || "Escape",
             avoidPrompt: deltaProposal.avoidPrompt || "What do you do to avoid the engagement?"
@@ -4759,8 +6208,12 @@ function ChatScreen({
           updatedAt: now()
         });
         await onRefresh();
+        const memoryReview = await reviewTurnForMemories(chatId, promptMessage.body, completedReplyText, [promptMessage.id, reply.id]);
+        await storePostResponseMemoryAudit(reply.id, memoryReview);
+        await onRefresh();
         return;
       }
+      let completedReplyText = "";
       const response = await openRouterRequest(openRouterPayload(requestMessages, streamingEnabled));
       await db.messages.update(reply.id, { requestInfo: { ...requestInfo, toolCalls: toolLog.length ? toolLog : ["None"] } });
       if (streamingEnabled && response.body) {
@@ -4789,12 +6242,14 @@ function ChatScreen({
             await onRefresh();
           }
         }
-        await db.messages.update(reply.id, { body: replyText || "(No response text returned.)", inputTokens, outputTokens: outputTokens ?? estimateTokens(replyText), estimatedTokens: !outputTokens, status: "complete", updatedAt: now() });
+        completedReplyText = replyText || "(No response text returned.)";
+        await db.messages.update(reply.id, { body: completedReplyText, inputTokens, outputTokens: outputTokens ?? estimateTokens(replyText), estimatedTokens: !outputTokens, status: "complete", updatedAt: now() });
       } else {
         const json = await response.json() as { choices?: { message?: { content?: string } }[]; usage?: { prompt_tokens?: number; completion_tokens?: number } };
         const replyText = json.choices?.[0]?.message?.content ?? "";
+        completedReplyText = replyText || "(No response text returned.)";
         await db.messages.update(reply.id, {
-          body: replyText || "(No response text returned.)",
+          body: completedReplyText,
           inputTokens: json.usage?.prompt_tokens,
           outputTokens: json.usage?.completion_tokens ?? estimateTokens(replyText),
           estimatedTokens: !json.usage?.completion_tokens,
@@ -4802,11 +6257,16 @@ function ChatScreen({
           updatedAt: now()
         });
       }
+      await onRefresh();
+      const memoryReview = await reviewTurnForMemories(chatId, promptMessage.body, completedReplyText, [promptMessage.id, reply.id]);
+      await storePostResponseMemoryAudit(reply.id, memoryReview);
+      await onRefresh();
     } catch (error) {
       await db.messages.update(reply.id, {
         body: "OpenRouter request failed.",
         error: error instanceof Error ? error.message : "Unknown error",
         status: "failed",
+        requestInfo: { ...requestInfo, toolCalls: toolLog.length ? toolLog : ["None"], inventoryUpdates },
         updatedAt: now()
       });
     }
@@ -4903,6 +6363,7 @@ function ChatScreen({
           brief: brief.brief,
           handoffContext: brief.handoffContext,
           playerCharacterName: brief.playerCharacterName,
+          roster: brief.roster,
           mapSize: brief.mapSize,
           avoidLabel: undefined,
           avoidPrompt: undefined
@@ -4929,6 +6390,17 @@ function ChatScreen({
     if (!deltaChat) return;
     const timestamp = now();
     const selectedCharacterId = brief.playerCharacterId;
+    const selectedCharacter = selectedCharacterId ? await db.characters.get(selectedCharacterId) : undefined;
+    const selectedPlayerName = selectedCharacter?.name || brief.playerCharacterName || "";
+    const baseRoster = brief.roster ?? deltaBriefRosterFromContext(brief.handoffContext);
+    const roster = normaliseDeltaBriefRoster(baseRoster);
+    if (selectedPlayerName) {
+      roster.neutral = roster.neutral.filter((name) => name.toLowerCase() !== selectedPlayerName.toLowerCase());
+      roster.enemies = roster.enemies.filter((name) => name.toLowerCase() !== selectedPlayerName.toLowerCase());
+      if (!roster.team.some((name) => name.toLowerCase() === selectedPlayerName.toLowerCase())) roster.team.unshift(selectedPlayerName);
+    }
+    const continuity = deltaContinuityWithoutRosterLines(brief.handoffContext);
+    const handoffContext = [...deltaBriefRosterLines(roster), continuity].filter(Boolean).join("\n");
     if (selectedCharacterId) await db.chats.update(deltaChat.id, { deltaPlayerCharacterId: selectedCharacterId, updatedAt: timestamp });
     await db.messages.update(message.id, {
       deltaBrief: { ...brief, status: "started", startedAt: timestamp },
@@ -4937,8 +6409,8 @@ function ChatScreen({
     await onRefresh();
     await onOpenDelta(deltaChat, [
       `DELTA BRIEF:\n${brief.brief}`,
-      brief.handoffContext ? `DELTA CONTINUITY ANCHORS:\n${brief.handoffContext}` : "",
-      brief.playerCharacterName ? `PLAYER CHARACTER:\n${brief.playerCharacterName}` : "",
+      handoffContext ? `DELTA CONTINUITY ANCHORS:\n${handoffContext}` : "",
+      selectedPlayerName ? `PLAYER CHARACTER:\n${selectedPlayerName}` : "",
       `MAP SIZE:\n${brief.mapSize ?? "M"}`,
       selectedCharacterId ? `PLAYER CHARACTER ID:\n${selectedCharacterId}` : ""
     ].filter(Boolean).join("\n\n"), brief.mapSize ?? "M");
@@ -5067,8 +6539,9 @@ function ChatScreen({
                 <label className="range-row"><span>Temperature <b>{temperature || "0"}</b></span><input type="range" min={0} max={2} step={0.05} value={temperature || "0"} onChange={(event) => setTemperature(event.target.value)} /></label>
                 <label className="range-row"><span>Top P <b>{topP || "0"}</b></span><input type="range" min={0} max={1} step={0.05} value={topP || "0"} onChange={(event) => setTopP(event.target.value)} /></label>
                 <label>Max output tokens<input type="number" min={1} max={16000} value={maxTokens} placeholder="no limit" onChange={(event) => setMaxTokens(event.target.value)} /></label>
-                <label className="compact-check"><input type="checkbox" checked={historyNoLimit} onChange={(event) => setHistoryNoLimit(event.target.checked)} /> No message history limit</label>
-                {!historyNoLimit && <label>Message history limit<input type="number" min={10} max={500} value={maxHistory} onChange={(event) => setMaxHistory(event.target.value)} /></label>}
+                <label className="compact-check"><input type="checkbox" checked={effectiveHistoryNoLimit} disabled={infiniteHistoryLocked} onChange={(event) => setHistoryNoLimit(event.target.checked)} /> No message history limit</label>
+                {infiniteHistoryLocked && <small className="setting-lock-note">This chat is permanently set to infinite context.</small>}
+                {!effectiveHistoryNoLimit && <label>Message history limit<input type="number" min={10} max={500} value={maxHistory} onChange={(event) => setMaxHistory(event.target.value)} /></label>}
                 <div className="split-actions">
                   <button onClick={saveChatSettings}><Save size={18} /> Save chat settings</button>
                   {saved && <span className="save-status">Saved</span>}
@@ -5093,6 +6566,18 @@ function ChatScreen({
               <div className="composer-file-chip" key={`${file.name}-${index}`}><Paperclip size={14} /><span>{file.name}</span><button type="button" className="attachment-remove" onClick={() => setAttachedFiles((current) => current.filter((_, itemIndex) => itemIndex !== index))} aria-label={`Remove ${file.name}`}><X size={13} /></button></div>
             ))}
             {attachmentError && <small className="error">{attachmentError}</small>}
+          </div>
+        )}
+        {infiniteWarningOpen && (
+          <div className="modal-backdrop" onClick={() => setInfiniteWarningOpen(false)}>
+            <section className="modal infinite-context-confirm" onClick={(event) => event.stopPropagation()}>
+              <div className="section-title"><h2>Use infinite context?</h2></div>
+              <p>This chat cannot be changed back to a limited message history after you save it as infinite.</p>
+              <div className="split-actions">
+                <button type="button" onClick={() => void persistChatSettings(true)}>Save as infinite</button>
+                <button type="button" onClick={() => setInfiniteWarningOpen(false)}>Cancel</button>
+              </div>
+            </section>
           </div>
         )}
         <button className="composer-plus" onClick={() => setContextOpen(!contextOpen)} disabled={deltaLocked} aria-label="Chat settings and attachments">
@@ -5253,6 +6738,17 @@ function MessageRow({
     });
     await onRefresh();
   }
+  const visibleDeltaRoster = (() => {
+    const brief = message.deltaBrief;
+    const roster = normaliseDeltaBriefRoster(brief?.roster ?? deltaBriefRosterFromContext(brief?.handoffContext));
+    const selectedName = deltaCharacters.find((character) => character.id === brief?.playerCharacterId)?.name || brief?.playerCharacterName || "";
+    if (selectedName) {
+      roster.neutral = roster.neutral.filter((name) => name.toLowerCase() !== selectedName.toLowerCase());
+      roster.enemies = roster.enemies.filter((name) => name.toLowerCase() !== selectedName.toLowerCase());
+      if (!roster.team.some((name) => name.toLowerCase() === selectedName.toLowerCase())) roster.team.unshift(selectedName);
+    }
+    return roster;
+  })();
   return (
     <>
       <article className={`message ${message.role}`} onClick={() => onExpand(message.id)}>
@@ -5262,8 +6758,8 @@ function MessageRow({
         {message.deltaBrief?.status === "pending" && (
           <div className="delta-brief-panel" onClick={(event) => event.stopPropagation()}>
             <div className="delta-brief-preflight">
-              <span>Map size: <b>{message.deltaBrief.mapSize ?? "M"}</b> ({deltaMapPreviewSizes[message.deltaBrief.mapSize ?? "M"].metres}m)</span>
               <div className="delta-brief-player">
+                <span>Player character</span>
                 <select
                   value={message.deltaBrief.playerCharacterId || deltaCharacters.find((character) => character.name === message.deltaBrief?.playerCharacterName)?.id || ""}
                   onChange={(event) => void updateDeltaPlayerCharacter(event.target.value)}
@@ -5274,6 +6770,14 @@ function MessageRow({
                 </select>
                 <button className="icon-button" type="button" onClick={() => void loadDeltaCharacters()} aria-label="Refresh character list" title="Refresh characters"><RefreshCw size={14} /></button>
               </div>
+              {(visibleDeltaRoster.team.length > 0 || visibleDeltaRoster.neutral.length > 0 || visibleDeltaRoster.enemies.length > 0) && (
+                <dl className="delta-brief-roster">
+                  {visibleDeltaRoster.team.length > 0 && <div><dt>Your team</dt><dd>{visibleDeltaRoster.team.join(", ")}</dd></div>}
+                  {visibleDeltaRoster.neutral.length > 0 && <div><dt>Neutral</dt><dd>{visibleDeltaRoster.neutral.join(", ")}</dd></div>}
+                  {visibleDeltaRoster.enemies.length > 0 && <div><dt>Enemies</dt><dd>{visibleDeltaRoster.enemies.join(", ")}</dd></div>}
+                </dl>
+              )}
+              <span className="delta-brief-map-size">Map size: <b>{message.deltaBrief.mapSize ?? "M"}</b> ({deltaMapPreviewSizes[message.deltaBrief.mapSize ?? "M"].metres}m)</span>
             </div>
             <div className="delta-brief-actions">
               {message.deltaBrief.avoidLabel && (
@@ -5293,7 +6797,7 @@ function MessageRow({
           <button aria-label="Edit message" title={deltaLocked ? "Resolve engagement to unlock editing" : "Edit"} disabled={deltaLocked} onClick={(event) => { event.stopPropagation(); if (!deltaLocked) setEditOpen(true); }}><Edit3 size={16} /></button>
           <button aria-label={message.starred ? "Unstar message" : "Star message"} title={message.starred ? "Unstar" : "Star"} onClick={(event) => { event.stopPropagation(); star(); }}><Star size={16} fill={message.starred ? "currentColor" : "none"} /></button>
           <button aria-label="Copy message" title="Copy" onClick={(event) => { event.stopPropagation(); copyMessage(); }}><Clipboard size={16} /></button>
-          <button aria-label="Message info" title="Info" onClick={(event) => { event.stopPropagation(); setInfoOpen(true); }}><FileText size={16} /></button>
+          <button aria-label="Response audit" title="Response audit" onClick={(event) => { event.stopPropagation(); setInfoOpen(true); }}><Info size={16} /></button>
           <span>{formatMessageDate(message.createdAt)}</span>
           <span>{message.inputTokens ?? message.outputTokens ?? estimateTokens(message.body)}t</span>
           <button className="resend" aria-label="Resend message" title={deltaLocked ? "Resolve engagement to unlock resend" : "Resend"} disabled={deltaLocked} onClick={(event) => { event.stopPropagation(); setResendConfirm("resend"); }}><RefreshCw size={16} /></button>
@@ -5436,12 +6940,17 @@ function InventoryUpdateCard({ updates, onAction }: { updates: InventoryUpdateRe
 }
 
 function MessageInfoModal({ message, onClose }: { message: Message; onClose: () => void }) {
+  const audit = message.requestInfo?.audit;
+  async function copyAudit() {
+    if (!audit) return;
+    await navigator.clipboard.writeText(JSON.stringify(audit, null, 2));
+  }
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <section className="star-modal message-info-modal" onClick={(event) => event.stopPropagation()}>
         <div className="section-title">
-          <h2>Message Info</h2>
-          <button className="icon-button" onClick={onClose} aria-label="Close message info"><X size={18} /></button>
+          <h2>Response Audit</h2>
+          <div className="split-actions">{audit && <button className="icon-button" onClick={copyAudit} aria-label="Copy complete audit" title="Copy complete audit"><Clipboard size={17} /></button>}<button className="icon-button" onClick={onClose} aria-label="Close response audit"><X size={18} /></button></div>
         </div>
         <div className="info-grid">
           <span>Role</span><strong>{message.role}</strong>
@@ -5452,13 +6961,38 @@ function MessageInfoModal({ message, onClose }: { message: Message; onClose: () 
           {message.error && <><span>Error</span><strong>{message.error}</strong></>}
         </div>
         {message.requestInfo && (
-          <div className="stack">
-            <h2>Settings Used</h2>
-            {message.requestInfo.settings.map((item) => <p key={item}>{item}</p>)}
-            <h2>Toggles</h2>
-            {message.requestInfo.toggles.map((item) => <p key={item}>{item}</p>)}
-            <h2>Tool Calls</h2>
-            {message.requestInfo.toolCalls.map((item) => <p key={item}>{item}</p>)}
+          <div className="response-audit-sections">
+            <details open>
+              <summary>Settings and toggles</summary>
+              <div className="audit-list">{message.requestInfo.settings.map((item, index) => <p key={`setting-${index}`}>{item}</p>)}{message.requestInfo.toggles.map((item, index) => <p key={`toggle-${index}`}>{item}</p>)}</div>
+            </details>
+            {audit ? <>
+              <details open>
+                <summary>Context sources</summary>
+                <div className="audit-source-list">{audit.contextSources.map((source) => <div key={source.name} className={source.included ? "included" : "excluded"}><span>{source.name}</span><strong>{source.included ? "Included" : "Not included"}</strong>{source.detail && <small>{source.detail}</small>}</div>)}</div>
+              </details>
+              <details open>
+                <summary>Memory retrieval ({audit.memoryRetrieval.hits.length} hit{audit.memoryRetrieval.hits.length === 1 ? "" : "s"})</summary>
+                <div className="audit-block"><p><b>Mode:</b> {audit.memoryRetrieval.mode}</p><p><b>Concepts:</b> {audit.memoryRetrieval.concepts.join(", ") || "None"}</p><p><b>Query:</b> {audit.memoryRetrieval.query || "No search was run"}</p>{audit.memoryRetrieval.hits.length ? audit.memoryRetrieval.hits.map((hit) => <section className="audit-memory-hit" key={hit.id}><strong>{hit.text}</strong><small>Relevance {hit.relevance.toFixed(3)}{hit.tags.length ? ` · ${hit.tags.join(", ")}` : ""}</small></section>) : <p>No memories were supplied to this response.</p>}</div>
+              </details>
+              <details open>
+                <summary>Tool execution ({audit.toolEvents.length})</summary>
+                <div className="audit-tool-list">{audit.toolEvents.length ? audit.toolEvents.map((tool, index) => <details key={`${tool.callId}-${index}`}><summary>{index + 1}. {tool.name} · round {tool.round}</summary><label>Arguments<pre>{tool.arguments}</pre></label><label>Returned result<pre>{tool.result}</pre></label><small>Call ID: {tool.callId}</small></details>) : <p>No tools were called.</p>}</div>
+              </details>
+              <details>
+                <summary>History selection ({audit.selectedHistory.length} messages)</summary>
+                <div className="audit-history-list">{audit.selectedHistory.map((item) => <div key={item.id}><span>#{item.sequence} · {item.role}</span><strong>{item.usedCondensation ? "Condensed" : "Original"}</strong><small>{item.id}</small></div>)}</div>
+              </details>
+              <details>
+                <summary>Exact sanitized request payload</summary>
+                <p className="audit-note">This is the payload sent to OpenRouter, except image bytes are replaced with a marker. The API key is never part of the payload.</p>
+                <pre className="audit-payload">{JSON.stringify(audit.requestPayload, null, 2)}</pre>
+              </details>
+              <details open>
+                <summary>Post-response memory review</summary>
+                {audit.postResponseMemory ? <div className="audit-block"><p><b>Status:</b> {audit.postResponseMemory.status}</p>{audit.postResponseMemory.reason && <p>{audit.postResponseMemory.reason}</p>}{audit.postResponseMemory.error && <p className="error">{audit.postResponseMemory.error}</p>}<p><b>Messages considered for condensation:</b> {audit.postResponseMemory.condensationMessageIds.join(", ") || "None"}</p>{audit.postResponseMemory.candidates.map((candidate, index) => <section className="audit-memory-hit" key={`${candidate.text}-${index}`}><strong>{candidate.text}</strong><small>{candidate.action}{candidate.tags.length ? ` · ${candidate.tags.join(", ")}` : ""}</small></section>)}{audit.postResponseMemory.requestPayload && <details><summary>Memory review request</summary><pre className="audit-payload">{JSON.stringify(audit.postResponseMemory.requestPayload, null, 2)}</pre></details>}{audit.postResponseMemory.rawResponse !== undefined && <details><summary>Raw memory review response</summary><pre className="audit-payload">{audit.postResponseMemory.rawResponse || "(empty response)"}</pre></details>}</div> : <p>Review has not completed or was not captured.</p>}
+              </details>
+            </> : <p className="notice">This message predates response auditing. New replies and resends will include the full audit.</p>}
           </div>
         )}
       </section>
@@ -5502,7 +7036,7 @@ function ProjectCard({ project, active, index, total, onSelect, onEdit, projects
     const count = await db.messages.where("chatId").anyOf((await db.chats.where("projectId").equals(project.id).primaryKeys()) as string[]).count();
     const ok = count > 0 ? prompt(`Deleting this project removes chats, messages, stars, archives, characters, and memories. Type DELETE ${project.name} to continue.`) === `DELETE ${project.name}` : confirm("Delete this project and its associated records?");
     if (!ok) return;
-    await db.transaction("rw", [db.projects, db.chats, db.branches, db.messages, db.stars, db.attachments, db.archives, db.archiveEntries, db.characters, db.characterBonuses, db.characterGearSlots, db.characterActionSlots, db.characterActionMacros, db.memories, db.inventoryItems, db.inventoryLogs, db.deltaSessions, db.deltaMessages, db.deltaEntities, db.deltaAllyCache, db.deltaActionMacros], async () => {
+    await db.transaction("rw", [db.projects, db.chats, db.branches, db.messages, db.stars, db.attachments, db.archives, db.archiveEntries, db.characters, db.characterBonuses, db.characterGearSlots, db.characterActionSlots, db.characterActionMacros, db.memories, db.inventoryItems, db.inventoryLogs, db.deltaSessions, db.deltaMessages, db.deltaEntities, db.deltaAllyCache, db.deltaActionMacros, db.deltaEffects, db.deltaIcons], async () => {
       const chatIds = (await db.chats.where("projectId").equals(project.id).primaryKeys()) as string[];
       const archiveIds = (await db.archives.where("projectId").equals(project.id).primaryKeys()) as string[];
       const characterIds = (await db.characters.where("projectId").equals(project.id).primaryKeys()) as string[];
@@ -5536,6 +7070,8 @@ function ProjectCard({ project, active, index, total, onSelect, onEdit, projects
         await db.deltaEntities.where("sessionId").anyOf(deltaSessionIds).delete();
       }
       if (deltaSessionIds.length) await db.deltaSessions.where("id").anyOf(deltaSessionIds).delete();
+      await db.deltaEffects.where("projectId").equals(project.id).delete();
+      await db.deltaIcons.where("projectId").equals(project.id).delete();
       await db.projects.delete(project.id);
     });
     await onRefresh();
@@ -5556,14 +7092,17 @@ function ProjectCard({ project, active, index, total, onSelect, onEdit, projects
   );
 }
 
-function ProjectEditPage({ project, onRefresh, onDone }: { project: Project; onRefresh: () => Promise<void>; onDone: () => void }) {
+function ProjectEditPage({ project, initialTab = "general", onRefresh, onDone }: { project: Project; initialTab?: "general" | "delta"; onRefresh: () => Promise<void>; onDone: () => void }) {
   const [draft, setDraft] = useState(project);
-  const [tab, setTab] = useState<"general" | "delta">("general");
+  const [tab, setTab] = useState<"general" | "delta">(initialTab);
+  const [deltaTab, setDeltaTab] = useState<"system" | "values" | "prefix" | "base" | "job" | "effects">("system");
   const [deltaStats, setDeltaStats] = useState<AbilityScores>(cleanAbilityScores(project.deltaDefaultNpcStats));
   const [deltaPrefixes, setDeltaPrefixes] = useState<DeltaPrefixTemplate[]>(effectiveDeltaPrefixes(project.deltaPrefixes));
   const [deltaBases, setDeltaBases] = useState<DeltaBaseTemplate[]>(deltaBaseDraft(project.deltaBases));
   const [deltaJobs, setDeltaJobs] = useState<DeltaJobTemplate[]>(project.deltaJobs ?? defaultDeltaJobs());
   const [deltaSystemPrompt, setDeltaSystemPrompt] = useState(project.deltaSystemPrompt ?? defaultDeltaSystemPrompt);
+  const [deltaRevealText, setDeltaRevealText] = useState(project.deltaRevealText ?? true);
+  const [deltaRevealSpeed, setDeltaRevealSpeed] = useState(project.deltaRevealSpeed ?? 5);
   const [showIconPicker, setShowIconPicker] = useState(false);
   const [saved, showSaved] = useSavedNotice();
   const [deltaSaved, showDeltaSaved] = useSavedNotice();
@@ -5574,6 +7113,8 @@ function ProjectEditPage({ project, onRefresh, onDone }: { project: Project; onR
     setDeltaBases(deltaBaseDraft(project.deltaBases));
     setDeltaJobs(project.deltaJobs ?? defaultDeltaJobs());
     setDeltaSystemPrompt(project.deltaSystemPrompt ?? defaultDeltaSystemPrompt);
+    setDeltaRevealText(project.deltaRevealText ?? true);
+    setDeltaRevealSpeed(project.deltaRevealSpeed ?? 5);
   }, [project.id]);
   async function save() {
     const nextDraft = { ...draft, deltaEnabled: Boolean(draft.deltaEnabled && draft.inventoryEnabled && draft.gearEnabled) };
@@ -5582,7 +7123,7 @@ function ProjectEditPage({ project, onRefresh, onDone }: { project: Project; onR
     showSaved();
     await onRefresh();
   }
-  async function saveDeltaPatch(patch: Pick<Project, "deltaDefaultNpcStats"> | Pick<Project, "deltaPrefixes"> | Pick<Project, "deltaBases"> | Pick<Project, "deltaJobs"> | Pick<Project, "deltaSystemPrompt">) {
+  async function saveDeltaPatch(patch: Partial<Pick<Project, "deltaDefaultNpcStats" | "deltaPrefixes" | "deltaBases" | "deltaJobs" | "deltaSystemPrompt" | "deltaRevealText" | "deltaRevealSpeed">>) {
     await db.projects.update(project.id, { ...patch, updatedAt: now() });
     showDeltaSaved();
     await onRefresh();
@@ -5634,57 +7175,433 @@ function ProjectEditPage({ project, onRefresh, onDone }: { project: Project; onR
       </section>
       )}
       {tab === "delta" && (
-        <section className="item-card stack delta-settings-editor">
+        <>
+        <div className="delta-settings-subtabs" role="tablist" aria-label="Project Delta settings sections">
+          <button className={deltaTab === "system" ? "picked" : ""} onClick={() => setDeltaTab("system")}>SYSTEM</button>
+          <button className={deltaTab === "values" ? "picked" : ""} onClick={() => setDeltaTab("values")}>VALUES</button>
+          <button className={deltaTab === "prefix" ? "picked" : ""} onClick={() => setDeltaTab("prefix")}>PREFIX</button>
+          <button className={deltaTab === "base" ? "picked" : ""} onClick={() => setDeltaTab("base")}>BASE</button>
+          <button className={deltaTab === "job" ? "picked" : ""} onClick={() => setDeltaTab("job")}>JOB</button>
+          <button className={deltaTab === "effects" ? "picked" : ""} onClick={() => setDeltaTab("effects")}>EFFECTS</button>
+        </div>
+        <div className="stack delta-settings-editor">
+          {deltaTab === "system" && (
           <section className="panel stack">
             <div className="section-title"><h2>System Prompt</h2></div>
             <p className="notice">This is the full Delta Mode system prompt for this project. Revert restores Mirror's default Delta behavior.</p>
             <textarea className="large-entry" value={deltaSystemPrompt} onChange={(event) => setDeltaSystemPrompt(event.target.value)} />
+            <div className="delta-stream-setting-row">
+              <label className="compact-check"><input type="checkbox" checked={deltaRevealText} onChange={(event) => setDeltaRevealText(event.target.checked)} /> Stream text</label>
+              {deltaRevealText && <label className="delta-stream-speed"><span>Speed <b>{deltaRevealSpeed}</b></span><input type="range" min={1} max={10} step={1} value={deltaRevealSpeed} onChange={(event) => setDeltaRevealSpeed(Number(event.target.value))} /></label>}
+            </div>
             <div className="split-actions">
-              <button onClick={() => saveDeltaPatch({ deltaSystemPrompt: deltaSystemPrompt.trim() || defaultDeltaSystemPrompt })}><Save size={18} /> Save System Prompt</button>
+              <button onClick={() => saveDeltaPatch({ deltaSystemPrompt: deltaSystemPrompt.trim() || defaultDeltaSystemPrompt, deltaRevealText, deltaRevealSpeed })}><Save size={18} /> Save SYSTEM</button>
               <button onClick={revertDeltaSystemPrompt}>Revert to default</button>
               {deltaSaved && <span className="save-status">Saved</span>}
+              <button className="delta-settings-done" onClick={onDone}>Done</button>
             </div>
           </section>
+          )}
 
+          {deltaTab === "values" && (
           <section className="panel stack">
             <div className="section-title"><h2>Default NPC Values</h2></div>
             <p className="notice">Starting stats for generated Delta characters that do not have saved character stats.</p>
             <AbilityScoreEditor value={deltaStats} onChange={setDeltaStats} />
-            <div className="split-actions"><button onClick={() => saveDeltaPatch({ deltaDefaultNpcStats: cleanAbilityScores(deltaStats) })}><Save size={18} /> Save Default NPC Values</button>{deltaSaved && <span className="save-status">Saved</span>}</div>
+            <div className="split-actions"><button onClick={() => saveDeltaPatch({ deltaDefaultNpcStats: cleanAbilityScores(deltaStats) })}><Save size={18} /> Save Default NPC Values</button>{deltaSaved && <span className="save-status">Saved</span>}<button className="delta-settings-done" onClick={onDone}>Done</button></div>
           </section>
+          )}
 
+          {deltaTab === "prefix" && (
           <section className="panel stack">
             <div className="section-title"><h2>PREFIXES</h2></div>
             <p className="notice">PREFIX templates are the first part of [PREFIX]-[BASE] [JOB].</p>
             <DeltaPrefixEditor value={deltaPrefixes} onChange={setDeltaPrefixes} />
             <div className="split-actions">
-              <button onClick={() => setDeltaPrefixes([...deltaPrefixes, { id: uid(), label: "", statModifiers: {}, notes: "" }])}><Plus size={18} /> Add PREFIX</button>
+              <button onClick={() => setDeltaPrefixes([...deltaPrefixes, { id: uid(), label: "", statModifiers: {} }])}><Plus size={18} /> Add PREFIX</button>
               <button onClick={() => saveDeltaPatch({ deltaPrefixes: cleanDeltaPrefixes(deltaPrefixes) })}><Save size={18} /> Save PREFIXES</button>
               {deltaSaved && <span className="save-status">Saved</span>}
+              <button className="delta-settings-done" onClick={onDone}>Done</button>
             </div>
           </section>
+          )}
 
+          {deltaTab === "base" && (
           <section className="panel stack">
             <div className="section-title"><h2>BASES</h2></div>
             <p className="notice">BASE templates are modifiers applied on top of Default NPC Values, not full repeated stat blocks.</p>
             <DeltaBaseEditor value={deltaBases} onChange={setDeltaBases} />
             <div className="split-actions">
-              <button onClick={() => setDeltaBases([...deltaBases, { id: uid(), label: "", statModifiers: {}, notes: "" }])}><Plus size={18} /> Add BASE</button>
+              <button onClick={() => setDeltaBases([...deltaBases, { id: uid(), label: "", statModifiers: {} }])}><Plus size={18} /> Add BASE</button>
               <button onClick={() => saveDeltaPatch({ deltaBases: cleanDeltaBases(deltaBases) })}><Save size={18} /> Save BASES</button>
               {deltaSaved && <span className="save-status">Saved</span>}
+              <button className="delta-settings-done" onClick={onDone}>Done</button>
             </div>
           </section>
+          )}
 
+          {deltaTab === "job" && (
           <section className="panel stack">
             <div className="section-title"><h2>JOBS</h2></div>
-            <p className="notice">Upload one or more .txt files. Each file is one JOB category; each line must be JOB STR DEX CON INT WIS CHA.</p>
+            <div className="notice delta-job-help">
+              <p>Each .txt filename becomes its JOB category. Each non-empty line must be JOB STR DEX CON INT WIS CHA.</p>
+              <small>Use dashes instead of spaces in filenames, for example street-lowlife.txt.</small>
+            </div>
             <DeltaJobImport value={deltaJobs} onChange={setDeltaJobs} />
-            <div className="split-actions"><button onClick={() => saveDeltaPatch({ deltaJobs: cleanDeltaJobs(deltaJobs) })}><Save size={18} /> Save JOBS</button>{deltaSaved && <span className="save-status">Saved</span>}</div>
+            <div className="split-actions"><button onClick={() => saveDeltaPatch({ deltaJobs: cleanDeltaJobs(deltaJobs) })}><Save size={18} /> Save JOBS</button>{deltaSaved && <span className="save-status">Saved</span>}<button className="delta-settings-done" onClick={onDone}>Done</button></div>
           </section>
-          <div className="split-actions"><button onClick={onDone}>Done</button></div>
-        </section>
+          )}
+
+          {deltaTab === "effects" && <DeltaEffectsEditor project={project} onDone={onDone} />}
+        </div>
+        </>
       )}
     </Page>
+  );
+}
+
+function newDeltaEffect(projectId: string, polarity: DeltaEffectPolarity): DeltaEffectDefinition {
+  const timestamp = now();
+  return {
+    id: uid(),
+    projectId,
+    name: "",
+    polarity,
+    turns: undefined,
+    effectText: "",
+    curable: false,
+    cureText: "",
+    cureEndBehavior: "remove",
+    ko: false,
+    koText: "",
+    koEndBehavior: "remove",
+    targetSelf: true,
+    targetOthers: false,
+    targetAllies: true,
+    targetNeutral: true,
+    targetEnemies: true,
+    targetMode: "single",
+    maxTargets: undefined,
+    savingThrowEnabled: false,
+    savingThrowStat: undefined,
+    savingThrowMinimum: undefined,
+    savingThrowTiming: "inflict",
+    cancelledByStatus: false,
+    cancellationPolarity: "negative",
+    cancelledByEffectIds: [],
+    createdAt: timestamp,
+    updatedAt: timestamp
+  };
+}
+
+const savingThrowTimingHelp: Record<DeltaSavingThrowTiming, string> = {
+  inflict: "Attempt saving throw when effect is inflicted.",
+  "turn-start": "Attempt saving throw at start of user's turn.",
+  "turn-end": "Attempt saving throw at end of user's turn.",
+  "every-turn": "Attempt saving throw at start of every turn, regardless of whose turn it is."
+};
+
+function DeltaEffectsEditor({ project, onDone }: { project: Project; onDone: () => void }) {
+  const [effects, setEffects] = useState<DeltaEffectDefinition[]>([]);
+  const [icons, setIcons] = useState<DeltaIconAsset[]>([]);
+  const [editing, setEditing] = useState<DeltaEffectDefinition>();
+  const [iconLibraryOpen, setIconLibraryOpen] = useState(false);
+  const [deleteEffect, setDeleteEffect] = useState<DeltaEffectDefinition>();
+  const [saved, showSaved] = useSavedNotice();
+
+  async function load() {
+    const [effectRows, iconRows] = await Promise.all([
+      db.deltaEffects.where("projectId").equals(project.id).sortBy("createdAt"),
+      db.deltaIcons.where("projectId").equals(project.id).sortBy("name")
+    ]);
+    setEffects(effectRows);
+    setIcons(iconRows);
+  }
+
+  useEffect(() => { void load(); }, [project.id]);
+
+  function saveDraftEffect() {
+    if (!editing?.name.trim()) return;
+    const cleaned = { ...editing, name: editing.name.trim(), updatedAt: now() };
+    setEffects((current) => current.some((effect) => effect.id === cleaned.id)
+      ? current.map((effect) => effect.id === cleaned.id ? cleaned : effect)
+      : [...current, cleaned]);
+    setEditing(undefined);
+  }
+
+  async function saveEffects() {
+    await db.transaction("rw", db.deltaEffects, async () => {
+      await db.deltaEffects.where("projectId").equals(project.id).delete();
+      if (effects.length) await db.deltaEffects.bulkPut(effects.map((effect) => ({ ...effect, projectId: project.id, updatedAt: now() })));
+    });
+    showSaved();
+  }
+
+  function confirmDeleteEffect() {
+    if (!deleteEffect) return;
+    setEffects((current) => current.filter((effect) => effect.id !== deleteEffect.id));
+    setDeleteEffect(undefined);
+  }
+
+  const iconFor = (id?: string) => icons.find((icon) => icon.id === id);
+  const renderGroup = (polarity: DeltaEffectPolarity, title: string) => {
+    const rows = effects.filter((effect) => effect.polarity === polarity);
+    return (
+      <section className="delta-effect-group">
+        <div className="section-title"><h3>{title}</h3><button className="icon-button" onClick={() => setEditing(newDeltaEffect(project.id, polarity))} aria-label={`Add ${title.toLowerCase()} effect`} title={`Add ${title.toLowerCase()} effect`}><Plus size={16} /></button></div>
+        {rows.length === 0 && <p className="delta-effect-empty">No effects configured.</p>}
+        {rows.map((effect) => {
+          const icon = iconFor(effect.iconId);
+          return (
+            <div className="delta-effect-row" key={effect.id}>
+              <span className="delta-effect-row-icon">{icon ? <img src={icon.dataUrl} alt="" /> : <span />}</span>
+              <strong>{effect.name}</strong>
+              <small>{effect.effectText || "No effect text"}</small>
+              <button className="icon-button" onClick={() => setEditing({ ...effect, cancelledByEffectIds: [...effect.cancelledByEffectIds] })} aria-label={`Edit ${effect.name}`}><Pencil size={15} /></button>
+              <button className="icon-button danger-icon" onClick={() => setDeleteEffect(effect)} aria-label={`Delete ${effect.name}`}><Trash2 size={15} /></button>
+            </div>
+          );
+        })}
+      </section>
+    );
+  };
+
+  return (
+    <section className="panel stack delta-effects-page">
+      <div className="section-title"><h2>Effects</h2><button onClick={() => setIconLibraryOpen(true)}><ImageIcon size={16} /> Icon library</button></div>
+      <p className="notice">Create reusable buffs and debuffs for this project's Delta system. Runtime effect application will plug into these definitions later.</p>
+      {renderGroup("positive", "Positive (buffs)")}
+      {renderGroup("negative", "Negative (debuffs)")}
+      <div className="split-actions"><button onClick={saveEffects}><Save size={18} /> Save EFFECTS</button>{saved && <span className="save-status">Saved</span>}<button className="delta-settings-done" onClick={onDone}>Done</button></div>
+
+      {editing && (
+        <div className="modal-backdrop delta-effect-modal-backdrop" onClick={() => setEditing(undefined)}>
+          <section className="delta-effect-modal" onClick={(event) => event.stopPropagation()}>
+            <div className="section-title"><h2>{effects.some((effect) => effect.id === editing.id) ? "Edit effect" : "Add effect"}</h2><button className="icon-button" onClick={() => setEditing(undefined)} aria-label="Close"><X size={18} /></button></div>
+            <div className="delta-effect-name-row">
+              <button className="delta-effect-icon-pick" onClick={() => setIconLibraryOpen(true)} aria-label="Choose effect icon">
+                {iconFor(editing.iconId) ? <img src={iconFor(editing.iconId)?.dataUrl} alt="" /> : <ImageIcon size={20} />}
+              </button>
+              <label>Name<input value={editing.name} onChange={(event) => setEditing({ ...editing, name: event.target.value })} placeholder="Effect name" /></label>
+              <label>Turns<input type="number" min={0} value={editing.turns ?? ""} onChange={(event) => setEditing({ ...editing, turns: event.target.value === "" ? undefined : Math.max(0, Number(event.target.value)) })} /></label>
+            </div>
+            <label>Effect<textarea value={editing.effectText} onChange={(event) => setEditing({ ...editing, effectText: event.target.value })} placeholder="What this effect does" /></label>
+
+            <div className="delta-effect-pair">
+              <section>
+                <label className="compact-check"><input type="checkbox" checked={editing.curable} onChange={(event) => setEditing({ ...editing, curable: event.target.checked })} /> Curable</label>
+                {editing.curable && <><label>Cure<input value={editing.cureText} onChange={(event) => setEditing({ ...editing, cureText: event.target.value })} placeholder="How this effect is cured" /></label><label>Cure on engagement end<select value={editing.cureEndBehavior} onChange={(event) => setEditing({ ...editing, cureEndBehavior: event.target.value as DeltaEffectDefinition["cureEndBehavior"] })}><option value="remove">Completely</option><option value="retain">Retain until expiry</option></select></label></>}
+              </section>
+              <section>
+                <label className="compact-check"><input type="checkbox" checked={editing.ko} onChange={(event) => setEditing({ ...editing, ko: event.target.checked })} /> KO</label>
+                {editing.ko && <><label>KO behavior<input value={editing.koText} onChange={(event) => setEditing({ ...editing, koText: event.target.value })} placeholder="What causes KO" /></label><label>Remove KO on engagement end<select value={editing.koEndBehavior} onChange={(event) => setEditing({ ...editing, koEndBehavior: event.target.value as DeltaEffectDefinition["koEndBehavior"] })}><option value="remove">Completely</option><option value="retain">Retain until expiry</option></select></label></>}
+              </section>
+            </div>
+
+            <fieldset className="delta-effect-fieldset"><legend>Targeting behavior</legend>
+              <div className="delta-effect-check-row"><label><input type="checkbox" checked={editing.targetSelf} onChange={(event) => setEditing({ ...editing, targetSelf: event.target.checked })} /> Self</label><label><input type="checkbox" checked={editing.targetOthers} onChange={(event) => setEditing({ ...editing, targetOthers: event.target.checked })} /> Others</label></div>
+              <div className="delta-effect-check-row"><label><input type="checkbox" checked={editing.targetAllies} onChange={(event) => setEditing({ ...editing, targetAllies: event.target.checked })} /> Allies</label><label><input type="checkbox" checked={editing.targetNeutral} onChange={(event) => setEditing({ ...editing, targetNeutral: event.target.checked })} /> Neutral</label><label><input type="checkbox" checked={editing.targetEnemies} onChange={(event) => setEditing({ ...editing, targetEnemies: event.target.checked })} /> Enemy</label></div>
+              <div className="delta-effect-check-row"><label><input type="radio" name="target-mode" checked={editing.targetMode === "single"} onChange={() => setEditing({ ...editing, targetMode: "single", maxTargets: undefined })} /> Single</label><label><input type="radio" name="target-mode" checked={editing.targetMode === "multiple"} onChange={() => setEditing({ ...editing, targetMode: "multiple" })} /> Multiple</label>{editing.targetMode === "multiple" && <label>Max targets<input type="number" min={1} value={editing.maxTargets ?? ""} onChange={(event) => setEditing({ ...editing, maxTargets: event.target.value === "" ? undefined : Math.max(1, Number(event.target.value)) })} /></label>}</div>
+            </fieldset>
+
+            <fieldset className="delta-effect-fieldset"><legend>Saving throw</legend>
+              <label className="compact-check"><input type="checkbox" checked={editing.savingThrowEnabled} onChange={(event) => setEditing({ ...editing, savingThrowEnabled: event.target.checked })} /> Enable saving throw</label>
+              {editing.savingThrowEnabled && <>
+                <div className="delta-effect-inline-fields"><label>Stat<select value={editing.savingThrowStat ?? ""} onChange={(event) => setEditing({ ...editing, savingThrowStat: event.target.value as Ability })}><option value="" disabled>Select</option>{abilities.map((ability) => <option key={ability} value={ability}>{ability}</option>)}</select></label><label>Minimum<input type="number" value={editing.savingThrowMinimum ?? ""} onChange={(event) => setEditing({ ...editing, savingThrowMinimum: event.target.value === "" ? undefined : Number(event.target.value) })} /></label></div>
+                <strong className="delta-effect-subheading">Initiate saving throw on:</strong>
+                <div className="delta-effect-timing">
+                  {(["inflict", "turn-start", "turn-end", "every-turn"] as DeltaSavingThrowTiming[]).map((timing) => <label key={timing}><input type="radio" name="saving-timing" checked={editing.savingThrowTiming === timing} onChange={() => setEditing({ ...editing, savingThrowTiming: timing })} /> {timing === "inflict" ? "INFLICT" : timing === "turn-start" ? "TURN START" : timing === "turn-end" ? "TURN END" : "EVERY TURN"}</label>)}
+                </div>
+                <p className="delta-effect-helper">{savingThrowTimingHelp[editing.savingThrowTiming]}</p>
+              </>}
+            </fieldset>
+
+            <fieldset className="delta-effect-fieldset"><legend>Cancelled by status</legend>
+              <label className="compact-check"><input type="checkbox" checked={editing.cancelledByStatus} onChange={(event) => setEditing({ ...editing, cancelledByStatus: event.target.checked })} /> Enable status cancellation</label>
+              {editing.cancelledByStatus && <>
+                <div className="delta-effect-check-row"><label><input type="radio" name="cancel-polarity" checked={editing.cancellationPolarity === "positive"} onChange={() => setEditing({ ...editing, cancellationPolarity: "positive", cancelledByEffectIds: [] })} /> Positive</label><label><input type="radio" name="cancel-polarity" checked={editing.cancellationPolarity === "negative"} onChange={() => setEditing({ ...editing, cancellationPolarity: "negative", cancelledByEffectIds: [] })} /> Negative</label></div>
+                <div className="delta-effect-cancel-list">{effects.filter((effect) => effect.id !== editing.id && effect.polarity === editing.cancellationPolarity).map((effect) => <label key={effect.id}><input type="checkbox" checked={editing.cancelledByEffectIds.includes(effect.id)} onChange={(event) => setEditing({ ...editing, cancelledByEffectIds: event.target.checked ? [...editing.cancelledByEffectIds, effect.id] : editing.cancelledByEffectIds.filter((id) => id !== effect.id) })} /> {effect.name}</label>)}{!effects.some((effect) => effect.id !== editing.id && effect.polarity === editing.cancellationPolarity) && <small>No matching effects yet.</small>}</div>
+              </>}
+            </fieldset>
+            <div className="split-actions"><button onClick={saveDraftEffect} disabled={!editing.name.trim()}><Save size={17} /> Save effect</button><button onClick={() => setEditing(undefined)}>Cancel</button></div>
+          </section>
+        </div>
+      )}
+
+      {iconLibraryOpen && <DeltaIconLibrary projectId={project.id} icons={icons} onIconsChange={(nextIcons) => { setIcons(nextIcons); setEffects((current) => current.map((effect) => effect.iconId && !nextIcons.some((icon) => icon.id === effect.iconId) ? { ...effect, iconId: undefined } : effect)); }} onSelect={editing ? (icon) => { setEditing({ ...editing, iconId: icon.id }); setIconLibraryOpen(false); } : undefined} onClose={() => setIconLibraryOpen(false)} />}
+      {deleteEffect && <div className="modal-backdrop" onClick={() => setDeleteEffect(undefined)}><section className="confirm-modal" onClick={(event) => event.stopPropagation()}><h2>Delete effect?</h2><p>{deleteEffect.name} will be removed when you save EFFECTS.</p><div className="split-actions"><button className="danger" onClick={confirmDeleteEffect}>Delete</button><button onClick={() => setDeleteEffect(undefined)}>Cancel</button></div></section></div>}
+    </section>
+  );
+}
+
+async function fitGeneratedIcon(dataUrl: string) {
+  const image = new Image();
+  await new Promise<void>((resolve, reject) => {
+    image.onload = () => resolve();
+    image.onerror = () => reject(new Error("The generated image could not be opened."));
+    image.src = dataUrl;
+  });
+  const source = document.createElement("canvas");
+  source.width = image.naturalWidth;
+  source.height = image.naturalHeight;
+  const sourceContext = source.getContext("2d", { willReadFrequently: true });
+  if (!sourceContext) throw new Error("Canvas is unavailable in this browser.");
+  sourceContext.drawImage(image, 0, 0);
+  const pixels = sourceContext.getImageData(0, 0, source.width, source.height).data;
+  const samplePoints = [[0, 0], [source.width - 1, 0], [0, source.height - 1], [source.width - 1, source.height - 1]];
+  const background = samplePoints.reduce((total, [x, y]) => {
+    const index = (y * source.width + x) * 4;
+    return [total[0] + pixels[index], total[1] + pixels[index + 1], total[2] + pixels[index + 2]];
+  }, [0, 0, 0]).map((value) => value / samplePoints.length);
+  let left = source.width;
+  let top = source.height;
+  let right = -1;
+  let bottom = -1;
+  for (let y = 0; y < source.height; y += 1) {
+    for (let x = 0; x < source.width; x += 1) {
+      const index = (y * source.width + x) * 4;
+      const difference = Math.abs(pixels[index] - background[0]) + Math.abs(pixels[index + 1] - background[1]) + Math.abs(pixels[index + 2] - background[2]);
+      if (pixels[index + 3] > 20 && difference > 78) {
+        left = Math.min(left, x);
+        top = Math.min(top, y);
+        right = Math.max(right, x);
+        bottom = Math.max(bottom, y);
+      }
+    }
+  }
+  const hasSubject = right >= left && bottom >= top;
+  const subjectWidth = hasSubject ? right - left + 1 : source.width;
+  const subjectHeight = hasSubject ? bottom - top + 1 : source.height;
+  const paddedSide = Math.min(Math.max(source.width, source.height), Math.max(1, Math.ceil(Math.max(subjectWidth, subjectHeight) * 1.16)));
+  const centerX = hasSubject ? (left + right + 1) / 2 : source.width / 2;
+  const centerY = hasSubject ? (top + bottom + 1) / 2 : source.height / 2;
+  const sourceX = Math.max(0, Math.min(source.width - paddedSide, Math.round(centerX - paddedSide / 2)));
+  const sourceY = Math.max(0, Math.min(source.height - paddedSide, Math.round(centerY - paddedSide / 2)));
+  const canvas = document.createElement("canvas");
+  canvas.width = 32;
+  canvas.height = 32;
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("Canvas is unavailable in this browser.");
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = "high";
+  context.drawImage(image, sourceX, sourceY, paddedSide, paddedSide, 0, 0, 32, 32);
+  return canvas.toDataURL("image/png");
+}
+
+function DeltaIconLibrary({ projectId, icons, onIconsChange, onSelect, onClose }: { projectId: string; icons: DeltaIconAsset[]; onIconsChange: (icons: DeltaIconAsset[]) => void; onSelect?: (icon: DeltaIconAsset) => void; onClose: () => void }) {
+  const [editing, setEditing] = useState<DeltaIconAsset>();
+  const [creating, setCreating] = useState(false);
+  const [deleteIcon, setDeleteIcon] = useState<DeltaIconAsset>();
+  const [recentIcons, setRecentIcons] = useState<string[]>([]);
+
+  async function saveIcon(icon: DeltaIconAsset) {
+    await db.deltaIcons.put(icon);
+    onIconsChange([...icons.filter((item) => item.id !== icon.id), icon].sort((a, b) => a.name.localeCompare(b.name)));
+    setEditing(undefined);
+    setCreating(false);
+  }
+
+  async function confirmDelete() {
+    if (!deleteIcon) return;
+    await db.transaction("rw", [db.deltaIcons, db.deltaEffects], async () => {
+      await db.deltaIcons.delete(deleteIcon.id);
+      await db.deltaEffects.where("projectId").equals(projectId).filter((effect) => effect.iconId === deleteIcon.id).modify({ iconId: undefined });
+    });
+    onIconsChange(icons.filter((icon) => icon.id !== deleteIcon.id));
+    setDeleteIcon(undefined);
+  }
+
+  return (
+    <div className="modal-backdrop delta-icon-library-backdrop" onClick={onClose}>
+      <section className="delta-icon-library" onClick={(event) => event.stopPropagation()}>
+        <div className="section-title"><h2>Icon library</h2><button className="icon-button" onClick={onClose} aria-label="Close"><X size={18} /></button></div>
+        <div className="delta-icon-grid">
+          {icons.map((icon) => <div className="delta-icon-cell" key={icon.id}><button onClick={() => onSelect ? onSelect(icon) : setEditing(icon)} title={onSelect ? `Use ${icon.name}` : `Edit ${icon.name}`}><img src={icon.dataUrl} alt="" /><span>{icon.name}</span></button><button className="icon-button" onClick={() => setEditing(icon)} aria-label={`Edit ${icon.name}`}><Pencil size={14} /></button><button className="icon-button danger-icon" onClick={() => setDeleteIcon(icon)} aria-label={`Delete ${icon.name}`}><Trash2 size={14} /></button></div>)}
+          {icons.length === 0 && <p className="delta-effect-empty">No saved icons.</p>}
+        </div>
+        <button onClick={() => setCreating(true)}><Plus size={17} /> Add new icon</button>
+      </section>
+      {(creating || editing) && <DeltaIconEditor projectId={projectId} icon={editing} recentIcons={recentIcons} onGenerated={(dataUrl) => setRecentIcons((current) => [dataUrl, ...current.filter((item) => item !== dataUrl)].slice(0, 3))} onSave={saveIcon} onClose={() => { setCreating(false); setEditing(undefined); }} />}
+      {deleteIcon && <div className="modal-backdrop nested-confirm" onClick={() => setDeleteIcon(undefined)}><section className="confirm-modal" onClick={(event) => event.stopPropagation()}><h2>Delete icon?</h2><p>The saved icon will be removed from this project. Effects using it will keep their other settings.</p><div className="split-actions"><button className="danger" onClick={confirmDelete}>Delete</button><button onClick={() => setDeleteIcon(undefined)}>Cancel</button></div></section></div>}
+    </div>
+  );
+}
+
+function DeltaIconEditor({ projectId, icon, recentIcons, onGenerated, onSave, onClose }: { projectId: string; icon?: DeltaIconAsset; recentIcons: string[]; onGenerated: (dataUrl: string) => void; onSave: (icon: DeltaIconAsset) => Promise<void>; onClose: () => void }) {
+  const fallbackModel = "black-forest-labs/flux.2-klein-4b";
+  const [models, setModels] = useState<{ id: string; name: string }[]>([{ id: fallbackModel, name: "FLUX.2 Klein 4B (budget)" }]);
+  const [model, setModel] = useState(icon?.sourceModel ?? fallbackModel);
+  const [prompt, setPrompt] = useState(icon?.sourcePrompt ?? "");
+  const [name, setName] = useState(icon?.name ?? "");
+  const [selectedCandidate, setSelectedCandidate] = useState(icon?.dataUrl ?? "");
+  const [status, setStatus] = useState("");
+  const [generating, setGenerating] = useState(false);
+
+  useEffect(() => {
+    void (async () => {
+      const settings = await db.settings.get("settings");
+      if (!settings?.apiKey?.trim()) return;
+      try {
+        const response = await fetch("https://openrouter.ai/api/v1/images/models", { headers: { Authorization: `Bearer ${settings.apiKey.trim()}` } });
+        if (!response.ok) return;
+        const json = await response.json() as { data?: { id: string; name?: string }[] };
+        const rows = (json.data ?? []).map((row) => ({ id: row.id, name: row.name ?? row.id }));
+        if (rows.length) setModels(rows);
+      } catch {
+        // Keep the known budget model available when discovery is offline.
+      }
+    })();
+  }, []);
+
+  async function generate() {
+    if (!prompt.trim()) return;
+    const settings = await db.settings.get("settings");
+    if (!settings?.apiKey?.trim()) { setStatus("Save an OpenRouter API key in API Settings first."); return; }
+    setGenerating(true);
+    setStatus("Generating icon...");
+    try {
+      const iconPrompt = `Create one isolated small game status icon: ${prompt.trim()}. The icon itself must fill 82-90% of the square canvas, with only a thin 5-8% margin. Crop tightly around the symbol. Use a simple high-contrast silhouette that remains clear at 32x32 pixels. No words, letters, numbers, captions, frames, borders, UI, or extra objects. Plain dark neutral background.`;
+      const response = await fetch("https://openrouter.ai/api/v1/images", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${settings.apiKey.trim()}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ model, prompt: iconPrompt, n: 1, aspect_ratio: "1:1", output_format: "png" })
+      });
+      if (!response.ok) throw new Error((await response.text()) || `Image request failed (${response.status}).`);
+      const json = await response.json() as { data?: { b64_json?: string; media_type?: string }[] };
+      const image = json.data?.[0];
+      if (!image?.b64_json) throw new Error("The image model returned no image.");
+      const fitted = await fitGeneratedIcon(`data:${image.media_type ?? "image/png"};base64,${image.b64_json}`);
+      onGenerated(fitted);
+      setSelectedCandidate(fitted);
+      setStatus("Added to the temporary recent-icons tray.");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Icon generation failed.");
+    } finally {
+      setGenerating(false);
+    }
+  }
+
+  async function save() {
+    if (!selectedCandidate || !name.trim()) return;
+    const timestamp = now();
+    await onSave({ id: icon?.id ?? uid(), projectId, name: name.trim(), dataUrl: selectedCandidate, sourceModel: model, sourcePrompt: prompt.trim(), createdAt: icon?.createdAt ?? timestamp, updatedAt: timestamp });
+  }
+
+  const availableIcons = [...new Set([...(icon ? [icon.dataUrl] : []), ...recentIcons])];
+
+  return (
+    <div className="modal-backdrop delta-icon-editor-backdrop" onClick={onClose}>
+      <section className="delta-icon-editor" onClick={(event) => event.stopPropagation()}>
+        <div className="section-title"><h2>{icon ? "Edit icon" : "Add new icon"}</h2><button className="icon-button" onClick={onClose} aria-label="Close"><X size={18} /></button></div>
+        <label>Model<select value={model} onChange={(event) => setModel(event.target.value)}>{models.map((row) => <option value={row.id} key={row.id}>{row.name}</option>)}</select></label>
+        <label>Prompt<textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="Describe one simple status icon" /></label>
+        <button onClick={generate} disabled={generating || !prompt.trim()}>{generating ? "Thinking..." : "Generate icon"}</button>
+        {status && <p className="save-status">{status}</p>}
+        <div className="delta-icon-candidates">{availableIcons.length > 0 && <small>Temporary recent icons</small>}<div>{availableIcons.map((candidate, index) => <button className={selectedCandidate === candidate ? "picked" : ""} key={`${candidate.slice(-20)}-${index}`} onClick={() => setSelectedCandidate(candidate)}><img src={candidate} alt={`Recent generated icon ${index + 1}`} /></button>)}</div>{selectedCandidate && <div className="delta-icon-actual-preview"><span>Actual size</span><img src={selectedCandidate} alt="Selected icon at actual size" /></div>}</div>
+        <label>Name icon<input value={name} onChange={(event) => setName(event.target.value)} placeholder="Icon name" /></label>
+        <div className="split-actions"><button onClick={save} disabled={!selectedCandidate || !name.trim()}><Save size={17} /> Save icon</button><button onClick={onClose}>Cancel</button></div>
+      </section>
+    </div>
   );
 }
 
@@ -5717,13 +7634,12 @@ function DeltaPrefixEditor({ value, onChange }: { value: DeltaPrefixTemplate[]; 
       {value.length === 0 && <p className="notice">No PREFIX templates are set up for this project.</p>}
       {value.map((item, index) => (
         <section className="delta-template-row" key={item.id || index}>
-          <div className="form-row">
+          <div className="form-row delta-template-fields delta-prefix-fields">
             <label>ID<input value={item.id} onChange={(event) => update(index, { id: event.target.value })} /></label>
             <label>Label<input value={item.label} onChange={(event) => update(index, { label: event.target.value.toUpperCase() })} placeholder="PREFIX" /></label>
-            <button className="danger" onClick={() => onChange(value.filter((_, itemIndex) => itemIndex !== index))}><Trash2 size={16} /> Remove</button>
+            <button className="icon-button delta-template-delete" onClick={() => onChange(value.filter((_, itemIndex) => itemIndex !== index))} aria-label={`Delete ${item.label || "PREFIX"}`} title="Delete PREFIX"><Trash2 size={15} /></button>
           </div>
           <AbilityModifierEditor value={item.statModifiers} onChange={(statModifiers) => update(index, { statModifiers })} />
-          <label>Notes<textarea value={item.notes ?? ""} onChange={(event) => update(index, { notes: event.target.value })} /></label>
         </section>
       ))}
     </div>
@@ -5739,14 +7655,13 @@ function DeltaBaseEditor({ value, onChange }: { value: DeltaBaseTemplate[]; onCh
       {value.length === 0 && <p className="notice">No BASE templates are set up for this project.</p>}
       {value.map((item, index) => (
         <section className="delta-template-row" key={item.id || index}>
-          <div className="form-row">
+          <div className="form-row delta-template-fields delta-base-fields">
             <label>ID<input value={item.id} onChange={(event) => update(index, { id: event.target.value })} /></label>
             <label>Label<input value={item.label} onChange={(event) => update(index, { label: event.target.value.toUpperCase() })} placeholder="BASE" /></label>
             <label>HP bonus<input type="number" value={item.hpBonus ?? 0} onChange={(event) => update(index, { hpBonus: Number(event.target.value) })} /></label>
-            <button className="danger" onClick={() => onChange(value.filter((_, itemIndex) => itemIndex !== index))}><Trash2 size={16} /> Remove</button>
+            <button className="icon-button delta-template-delete" onClick={() => onChange(value.filter((_, itemIndex) => itemIndex !== index))} aria-label={`Delete ${item.label || "BASE"}`} title="Delete BASE"><Trash2 size={15} /></button>
           </div>
           <AbilityModifierEditor value={item.statModifiers} onChange={(statModifiers) => update(index, { statModifiers })} />
-          <label>Notes<textarea value={item.notes ?? ""} onChange={(event) => update(index, { notes: event.target.value })} /></label>
         </section>
       ))}
     </div>
@@ -5766,9 +7681,23 @@ function DeltaJobImport({ value, onChange }: { value: DeltaJobTemplate[]; onChan
     if (!confirm(`Delete JOB category "${category}" from this draft?`)) return;
     onChange(value.filter((job) => job.category !== category));
   }
+  function downloadCategory(category: string) {
+    const rows = value
+      .filter((job) => job.category.trim() === category)
+      .map((job) => `${job.label.trim()} ${abilities.map((ability) => Number(job.statModifiers[ability] ?? 0)).join(" ")}`);
+    const blob = new Blob([`${rows.join("\n")}\n`], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${category.replace(/[<>:"/\\|?*\x00-\x1f]/g, "-") || "jobs"}.txt`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  }
   const categories = jobCategories(value);
   return (
-    <div className="delta-template-list">
+    <div className="delta-template-list delta-job-import">
       <label className="file-pick"><Upload size={18} /> Import JOB .txt files<input type="file" accept=".txt,text/plain" multiple onChange={(event) => void importFiles(event.target.files)} /></label>
       {errors.length > 0 && (
         <div className="import-errors">
@@ -5778,9 +7707,10 @@ function DeltaJobImport({ value, onChange }: { value: DeltaJobTemplate[]; onChan
       {categories.length === 0 && <p className="notice">No JOB categories are set up for this project.</p>}
       {categories.map(([category, count]) => (
         <section className="delta-category-row" key={category}>
+          <button className="icon-button delta-category-download" onClick={() => downloadCategory(category)} aria-label={`Download ${category} category`} title={`Download ${category}.txt`}><Download size={15} /></button>
           <span>{category}</span>
           <small>{count} JOB{count === 1 ? "" : "S"}</small>
-          <button className="danger" onClick={() => deleteCategory(category)}><Trash2 size={16} /> Delete category</button>
+          <button className="icon-button delta-category-delete" onClick={() => deleteCategory(category)} aria-label={`Delete ${category} category`} title={`Delete ${category} category`}><Trash2 size={15} /></button>
         </section>
       ))}
     </div>
@@ -6768,6 +8698,15 @@ function StarsPage({ project }: { project?: Project }) {
 
 function DataSettingsContent() {
   const [importStatus, setImportStatus] = useState("");
+  const [auditStorage, setAuditStorage] = useState({ bytes: 0, messages: 0 });
+  const [auditClearStep, setAuditClearStep] = useState<1 | 2>();
+  const [auditStatus, setAuditStatus] = useState("");
+  async function loadAuditStorage() {
+    const messages = await db.messages.filter((message) => Boolean(message.requestInfo?.audit)).toArray();
+    const bytes = messages.reduce((total, message) => total + new Blob([JSON.stringify(message.requestInfo?.audit)]).size, 0);
+    setAuditStorage({ bytes, messages: messages.length });
+  }
+  useEffect(() => { void loadAuditStorage(); }, []);
   async function backupAll() {
     if (!confirm("Generate a backup of all app data except API keys?")) return;
     const data = {
@@ -6793,6 +8732,8 @@ function DataSettingsContent() {
       deltaMessages: await db.deltaMessages.toArray(),
       deltaEntities: await db.deltaEntities.toArray(),
       deltaAllyCache: await db.deltaAllyCache.toArray(),
+      deltaEffects: await db.deltaEffects.toArray(),
+      deltaIcons: await db.deltaIcons.toArray(),
       characterActionSlots: await db.characterActionSlots.toArray(),
       characterActionMacros: await db.characterActionMacros.toArray()
     };
@@ -6806,11 +8747,11 @@ function DataSettingsContent() {
         setImportStatus("Invalid import file.");
         return;
       }
-      const counts = ["projects", "chats", "branches", "messages", "stars", "archives", "archiveEntries", "memories", "characters", "characterGearSlots", "characterActionSlots", "characterActionMacros", "modelLibrary", "sourceFiles", "inventoryItems", "inventoryLogs", "deltaSessions", "deltaMessages", "deltaEntities", "deltaAllyCache"]
+      const counts = ["projects", "chats", "branches", "messages", "stars", "archives", "archiveEntries", "memories", "characters", "characterGearSlots", "characterActionSlots", "characterActionMacros", "modelLibrary", "sourceFiles", "inventoryItems", "inventoryLogs", "deltaSessions", "deltaMessages", "deltaEntities", "deltaAllyCache", "deltaEffects", "deltaIcons"]
         .map((key) => `${key}: ${Array.isArray(parsed[key]) ? parsed[key].length : 0}`)
         .join(", ");
       if (!confirm(`Import this backup?\n${counts}`)) return;
-      await db.transaction("rw", [db.settings, db.projects, db.chats, db.branches, db.messages, db.stars, db.archives, db.archiveEntries, db.memories, db.characters, db.characterGearSlots, db.characterActionSlots, db.characterActionMacros, db.modelLibrary, db.sourceFiles, db.inventoryItems, db.inventoryLogs, db.deltaSessions, db.deltaMessages, db.deltaEntities, db.deltaAllyCache, db.deltaActionMacros], async () => {
+      await db.transaction("rw", [db.settings, db.projects, db.chats, db.branches, db.messages, db.stars, db.archives, db.archiveEntries, db.memories, db.characters, db.characterGearSlots, db.characterActionSlots, db.characterActionMacros, db.modelLibrary, db.sourceFiles, db.inventoryItems, db.inventoryLogs, db.deltaSessions, db.deltaMessages, db.deltaEntities, db.deltaAllyCache, db.deltaActionMacros, db.deltaEffects, db.deltaIcons], async () => {
         if (parsed.settings && typeof parsed.settings === "object") await db.settings.put(parsed.settings as AppSettings);
         if (Array.isArray(parsed.projects)) await db.projects.bulkPut(parsed.projects as Project[]);
         if (Array.isArray(parsed.chats)) await db.chats.bulkPut(parsed.chats as Chat[]);
@@ -6835,6 +8776,8 @@ function DataSettingsContent() {
         if (Array.isArray(parsed.deltaEntities)) await db.deltaEntities.bulkPut(parsed.deltaEntities as DeltaEntity[]);
         if (Array.isArray(parsed.deltaAllyCache)) await db.deltaAllyCache.bulkPut(parsed.deltaAllyCache as DeltaAllyCacheEntry[]);
         if (Array.isArray(parsed.deltaActionMacros)) await db.deltaActionMacros.bulkPut(parsed.deltaActionMacros as never[]);
+        if (Array.isArray(parsed.deltaEffects)) await db.deltaEffects.bulkPut(parsed.deltaEffects as DeltaEffectDefinition[]);
+        if (Array.isArray(parsed.deltaIcons)) await db.deltaIcons.bulkPut(parsed.deltaIcons as DeltaIconAsset[]);
       });
       setImportStatus("Import complete.");
     } catch {
@@ -6847,7 +8790,25 @@ function DataSettingsContent() {
     await db.delete();
     location.reload();
   }
-  return <><button onClick={backupAll}><Download size={18} /> Backup All</button><button onClick={backupAll}><Download size={18} /> Backup Memories Only</button><label className="file-pick"><Upload size={18} /> Import backup<input type="file" accept="application/json" onChange={(event) => importBackup(event.target.files?.[0])} /></label>{importStatus && <p className="save-status">{importStatus}</p>}<button className="danger separated" onClick={clearAll}><Trash2 size={18} /> Clear All</button></>;
+  async function clearAudits() {
+    await db.messages.filter((message) => Boolean(message.requestInfo?.audit)).modify((message) => {
+      if (!message.requestInfo) return;
+      const { audit: _audit, ...requestInfo } = message.requestInfo;
+      message.requestInfo = requestInfo;
+    });
+    setAuditClearStep(undefined);
+    setAuditStatus("Response audits cleared.");
+    await loadAuditStorage();
+  }
+  return <>
+    <section className="panel stack audit-storage-panel">
+      <div className="section-title"><h2>Response Audit Storage</h2><span>{formatByteSize(auditStorage.bytes)}</span></div>
+      <p className="notice">{auditStorage.messages ? `${auditStorage.messages} assistant response${auditStorage.messages === 1 ? "" : "s"} currently retain an audit.` : "No response audits are stored yet."}</p>
+      <div className="split-actions"><button className="danger" disabled={!auditStorage.messages} onClick={() => setAuditClearStep(1)}><Trash2 size={17} /> Clear response audits</button>{auditStatus && <span className="save-status">{auditStatus}</span>}</div>
+    </section>
+    <button onClick={backupAll}><Download size={18} /> Backup All</button><button onClick={backupAll}><Download size={18} /> Backup Memories Only</button><label className="file-pick"><Upload size={18} /> Import backup<input type="file" accept="application/json" onChange={(event) => importBackup(event.target.files?.[0])} /></label>{importStatus && <p className="save-status">{importStatus}</p>}<button className="danger separated" onClick={clearAll}><Trash2 size={18} /> Clear All</button>
+    {auditClearStep && <div className="modal-backdrop confirm-backdrop" onClick={() => setAuditClearStep(undefined)}><section className="confirm-modal" onClick={(event) => event.stopPropagation()}><div className="section-title"><h2>{auditClearStep === 1 ? "Clear response audits?" : "Clear them permanently?"}</h2><button className="icon-button" onClick={() => setAuditClearStep(undefined)} aria-label="Cancel"><X size={18} /></button></div>{auditClearStep === 1 ? <p>This removes {formatByteSize(auditStorage.bytes)} of stored audit snapshots from {auditStorage.messages} assistant response{auditStorage.messages === 1 ? "" : "s"}. Messages, tool results, memories, inventory updates, and all other data stay intact.</p> : <p>This is the final confirmation. The audit details cannot be recovered unless they exist in a backup.</p>}<div className="split-actions">{auditClearStep === 1 ? <button className="danger" onClick={() => setAuditClearStep(2)}>Continue</button> : <button className="danger" onClick={() => void clearAudits()}><Trash2 size={17} /> Clear audits</button>}<button onClick={() => setAuditClearStep(undefined)}>Cancel</button></div></section></div>}
+  </>;
 }
 
 function downloadJson(filename: string, data: unknown) {

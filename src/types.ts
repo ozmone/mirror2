@@ -109,6 +109,8 @@ export interface Project extends Timestamped {
   deltaBases?: DeltaBaseTemplate[];
   deltaJobs?: DeltaJobTemplate[];
   deltaSystemPrompt?: string;
+  deltaRevealText?: boolean;
+  deltaRevealSpeed?: number;
 }
 
 export interface Chat extends Timestamped {
@@ -119,8 +121,14 @@ export interface Chat extends Timestamped {
   activeBranchId: string;
   archived: boolean;
   compactionMemory: string;
+  compactedThroughSequence?: number;
+  compactionNeedsRebuild?: boolean;
+  compactionHistoryLimit?: number;
+  infiniteHistoryLocked?: boolean;
   currencyAmount?: number;
   deltaPlayerCharacterId?: string;
+  deltaRevealText?: boolean;
+  deltaRevealSpeed?: number;
 }
 
 export interface Branch extends Timestamped {
@@ -136,6 +144,8 @@ export interface Message extends Timestamped {
   sequence: number;
   role: "user" | "assistant" | "system";
   body: string;
+  contextCondensation?: string;
+  contextCondensationSourceUpdatedAt?: number;
   attachmentContext?: string;
   modelId?: string;
   inputTokens?: number;
@@ -149,6 +159,7 @@ export interface Message extends Timestamped {
     toggles: string[];
     toolCalls: string[];
     inventoryUpdates?: InventoryUpdateRequest[];
+    audit?: MainChatRequestAudit;
   };
   deltaBrief?: {
     status: "pending" | "started";
@@ -156,11 +167,77 @@ export interface Message extends Timestamped {
     handoffContext?: string;
     playerCharacterId?: string;
     playerCharacterName?: string;
+    roster?: DeltaBriefRoster;
     mapSize?: DeltaMapSize;
     avoidLabel?: string;
     avoidPrompt?: string;
     startedAt?: number;
   };
+}
+
+export interface MainChatAuditMemoryHit {
+  id: string;
+  text: string;
+  tags: string[];
+  relevance: number;
+}
+
+export interface MainChatAuditToolEvent {
+  round: number;
+  callId: string;
+  name: string;
+  arguments: string;
+  result: string;
+}
+
+export interface MainChatMemoryReviewAudit {
+  status: "skipped" | "completed" | "failed";
+  reason?: string;
+  error?: string;
+  requestPayload?: Record<string, unknown>;
+  rawResponse?: string;
+  condensationMessageIds: string[];
+  candidates: Array<{
+    text: string;
+    tags: string[];
+    action: "saved" | "pending approval" | "duplicate" | "not saved";
+  }>;
+}
+
+export interface MainChatRequestAudit {
+  version: 1;
+  capturedAt: number;
+  requestKind: "send" | "resend";
+  projectId: string;
+  projectName: string;
+  chatId: string;
+  userMessageId?: string;
+  selectedHistory: Array<{
+    id: string;
+    sequence: number;
+    role: Message["role"];
+    usedCondensation: boolean;
+  }>;
+  contextSources: Array<{
+    name: string;
+    included: boolean;
+    detail?: string;
+  }>;
+  memoryRetrieval: {
+    mode: MemoryMode;
+    query: string;
+    concepts: string[];
+    hits: MainChatAuditMemoryHit[];
+  };
+  requestPayload: Record<string, unknown>;
+  toolEvents: MainChatAuditToolEvent[];
+  postResponseMemory?: MainChatMemoryReviewAudit;
+}
+
+export interface DeltaBriefRoster {
+  team: string[];
+  neutral: string[];
+  enemies: string[];
 }
 
 export type DeltaMapSize = "S" | "M" | "L" | "XL" | "XXL";
@@ -183,6 +260,8 @@ export interface DeltaModeSettings {
   maxTokens?: number;
   maxHistoryMessages?: number;
   playerEntityId?: string;
+  revealText?: boolean;
+  revealSpeed?: number;
 }
 
 export interface DeltaSession extends Timestamped {
@@ -201,11 +280,51 @@ export interface DeltaSession extends Timestamped {
   requiredRollDie?: number;
   requiredRollCount?: number;
   requiredRollResults?: number[];
-  requiredRollKind?: "initiative" | "check";
+  requiredRollKind?: "initiative" | "check" | "reaction";
   requiredRollLabel?: string;
   requiredRollerName?: string;
+  requiredRollAbility?: "STR" | "DEX" | "CON" | "INT" | "WIS" | "CHA";
+  requiredRollModifier?: number;
+  requiredRollTurnNumber?: number;
+  requiredRollRawValues?: number[];
   actionPrompt?: string;
+  reactionUsedEntityIds?: string[];
+  reactionState?: "checking" | "available" | "resolving";
+  reactionSourceActorId?: string;
+  reactionTargetEntityId?: string;
+  reactionTrigger?: string;
+  reactionTurnNumber?: number;
+  continuedTurnNumber?: number;
   settings: DeltaModeSettings;
+}
+
+export interface DeltaRollReceipt {
+  id: string;
+  source: "client-web-crypto";
+  generator: "crypto.getRandomValues";
+  algorithm: "uint32-rejection-sampling-v1";
+  toolName: "request_delta_roll" | "player_delta_roll";
+  rollerName: string;
+  label: string;
+  ability?: "STR" | "DEX" | "CON" | "INT" | "WIS" | "CHA";
+  modifier?: number;
+  die: number;
+  count: number;
+  rawValues: number[];
+  results: number[];
+  total?: number;
+  generatedAt: number;
+  hpApplications?: DeltaHpApplication[];
+}
+
+export interface DeltaHpApplication {
+  entityId: string;
+  entityName: string;
+  kind: "damage";
+  amount: number;
+  beforeHp: number;
+  afterHp: number;
+  appliedAt: number;
 }
 
 export interface DeltaMessage extends Timestamped {
@@ -215,6 +334,9 @@ export interface DeltaMessage extends Timestamped {
   body: string;
   status: "complete" | "pending" | "failed";
   modelId?: string;
+  turnNumber?: number;
+  eventType?: "narrative" | "roll";
+  rollReceipt?: DeltaRollReceipt;
 }
 
 export interface DeltaLootItem {
@@ -236,8 +358,10 @@ export interface DeltaEntity extends Timestamped {
   characterId?: string;
   name: string;
   side: "ally" | "neutral" | "hostile";
+  engagementState?: "active" | "ko" | "dead" | "escaped";
   currentHp?: number;
   maxHp?: number;
+  appliedDamageReceiptIds?: string[];
   initiative?: number;
   statusText?: string;
   distanceFromPlayer?: string;
@@ -437,6 +561,48 @@ export interface DeltaJobTemplate {
   category: string;
   statModifiers: AbilityModifiers;
   notes?: string;
+}
+
+export type DeltaEffectPolarity = "positive" | "negative";
+export type DeltaEffectEndBehavior = "remove" | "retain";
+export type DeltaEffectTargetMode = "single" | "multiple";
+export type DeltaSavingThrowTiming = "inflict" | "turn-start" | "turn-end" | "every-turn";
+
+export interface DeltaEffectDefinition extends Timestamped {
+  projectId: string;
+  name: string;
+  polarity: DeltaEffectPolarity;
+  iconId?: string;
+  turns?: number;
+  effectText: string;
+  curable: boolean;
+  cureText: string;
+  cureEndBehavior: DeltaEffectEndBehavior;
+  ko: boolean;
+  koText: string;
+  koEndBehavior: DeltaEffectEndBehavior;
+  targetSelf: boolean;
+  targetOthers: boolean;
+  targetAllies: boolean;
+  targetNeutral: boolean;
+  targetEnemies: boolean;
+  targetMode: DeltaEffectTargetMode;
+  maxTargets?: number;
+  savingThrowEnabled: boolean;
+  savingThrowStat?: Ability;
+  savingThrowMinimum?: number;
+  savingThrowTiming: DeltaSavingThrowTiming;
+  cancelledByStatus: boolean;
+  cancellationPolarity: DeltaEffectPolarity;
+  cancelledByEffectIds: string[];
+}
+
+export interface DeltaIconAsset extends Timestamped {
+  projectId: string;
+  name: string;
+  dataUrl: string;
+  sourceModel?: string;
+  sourcePrompt?: string;
 }
 
 export interface Memory extends Timestamped {
