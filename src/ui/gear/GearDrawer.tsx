@@ -278,7 +278,7 @@ function GearSlotEditor({ slot, value, carry, onSave, onClear, onClose }: { slot
       )}
       <label>Traits<textarea value={draft.traits} onChange={(event) => setDraft({ ...draft, traits: event.target.value })} placeholder="structured notes or special gear traits" /></label>
       <div className="split-actions">
-        <button type="button" onClick={save}>Save</button>
+        <button type="button" className="save-button" onClick={save}>Save</button>
         <button type="button" onClick={onClose}>Cancel</button>
       </div>
       {hasDraftContent() && <button type="button" className="gear-slot-trash" onClick={() => setClearPromptOpen(true)} aria-label="Clear gear slot" title="Clear gear slot"><Trash2 size={13} /></button>}
@@ -292,7 +292,7 @@ function GearSlotEditor({ slot, value, carry, onSave, onClear, onClose }: { slot
       {savePromptOpen && (
         <div className="gear-save-prompt">
           <span>Save changes?</span>
-          <button type="button" onClick={save}>Save</button>
+          <button type="button" className="save-button" onClick={save}>Save</button>
           <button type="button" onClick={onClose}>Discard</button>
           <button type="button" onClick={() => setSavePromptOpen(false)}>Keep editing</button>
         </div>

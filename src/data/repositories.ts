@@ -240,7 +240,6 @@ export async function createProject(name: string) {
     worldSetting: "",
     memoryMode: "approval",
     memoryInstruction: defaultMemoryInstruction,
-    locked: false,
     inventoryEnabled: false,
     currencyName: "money",
     gearEnabled: false,
@@ -266,6 +265,7 @@ export async function createChat(projectId: string, firstMessage: string) {
       id: chatId,
       projectId,
       title: fallbackChatTitle(firstMessage),
+      pinned: false,
       titleState: "fallback",
       activeBranchId: branchId,
       createdAt: timestamp,
@@ -473,12 +473,14 @@ export async function toggleStar(projectId: string, message: Message) {
 }
 
 export async function createMemory(projectId: string, text: string, tags: string[], sourceType: Memory["sourceType"] = "manual", sourceMessageIds?: string[]) {
+  const cleanText = text.trim();
+  if (!cleanText) throw new Error("A memory needs text.");
   const timestamp = now();
   const normalisedTags = Array.from(new Set(tags.map(normaliseTag).filter(Boolean)));
   const memory: Memory = {
     id: uid(),
     projectId,
-    text,
+    text: cleanText,
     normalisedTags,
     visibleTags: tags.filter(Boolean),
     sourceType,

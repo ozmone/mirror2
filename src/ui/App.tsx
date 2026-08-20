@@ -1,5 +1,6 @@
 ﻿import type React from "react";
 import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import Dexie from "dexie";
 import {
   Archive,
@@ -20,6 +21,7 @@ import {
   MessageSquare,
   Pencil,
   Paperclip,
+  Pin,
   Plus,
   RefreshCw,
   Share2,
@@ -37,6 +39,7 @@ import {
   X
 } from "lucide-react";
 import { db, ensureSeedData } from "../data/db";
+import { createFullBackup, createRecoverySnapshot, installAutomaticRecoverySnapshots, listRecoverySnapshots, mergeFullBackup, parseAndValidateBackup, replaceWithFullBackup, restoreRecoverySnapshot, type RecoverySlot, type RecoverySnapshot } from "../data/backup";
 import {
   abilities,
   addMessage,
@@ -65,7 +68,7 @@ import {
   upsertDeltaAllyCache,
   validatePointBuy
 } from "../data/repositories";
-import { defaultDeltaBases, defaultDeltaJobs, defaultDeltaNpcStats, defaultDeltaPrefixes, defaultDeltaSystemPrompt, defaultMemoryInstruction, defaultSettings } from "../data/defaults";
+import { defaultDeltaBases, defaultDeltaJobs, defaultDeltaNpcStats, defaultDeltaPrefixes, defaultDeltaSystemPrompt, effectiveDeltaSystemPrompt, defaultMemoryInstruction, defaultSettings } from "../data/defaults";
 import { Ability, AbilityModifiers, AbilityScores, AppSettings, Character, CharacterActionMacro, CharacterActionSlot, CharacterBonus, CharacterGearSlot, Chat, DeltaAllyCacheEntry, DeltaBaseTemplate, DeltaBriefRoster, DeltaEffectDefinition, DeltaEffectPolarity, DeltaEntity, DeltaFinishPacket, DeltaIconAsset, DeltaJobTemplate, DeltaLootItem, DeltaMapSize, DeltaMapTile, DeltaMapTileKind, DeltaMessage, DeltaPrefixTemplate, DeltaRollReceipt, DeltaSavingThrowTiming, DeltaSession, GearBodyType, InventoryKind, InventoryItem, InventoryLog, InventoryUpdateRequest, MainChatAuditToolEvent, MainChatMemoryReviewAudit, MainChatRequestAudit, Memory, Message, PendingMemory, Project, RouteName } from "../types";
 import { estimateTokens, formatDate, normaliseTag, now, splitTags, uid } from "../utils";
 import { ProjectIcon, projectIcons } from "./icons";
@@ -933,7 +936,7 @@ const MarkdownText = memo(function MarkdownText({ text, emptyText, inventoryMark
 });
 
 function LoadingSignal() {
-  return <span className="loading-signal" aria-label="Thinking" role="status" />;
+  return <div className="lds-ellipsis" aria-label="Thinking" role="status"><div /><div /><div /><div /></div>;
 }
 
 const deltaRevealSpeedsMs = [1400, 1200, 1000, 850, 720, 600, 480, 360, 260, 180] as const;
@@ -1572,6 +1575,7 @@ export function App() {
 
   useEffect(() => {
     ensureSeedData().then(async () => {
+      installAutomaticRecoverySnapshots();
       const first = await db.projects.orderBy("orderIndex").first();
       setSelectedProjectId(first?.id);
       setReady(true);
@@ -1669,6 +1673,20 @@ export function App() {
       setSelectedChatId(undefined);
       setMessages([]);
     }
+    await refresh();
+  }
+
+  async function toggleProjectPin(id: string) {
+    const project = await db.projects.get(id);
+    if (!project) return;
+    await db.projects.update(id, { pinned: !project.pinned, updatedAt: now() });
+    await refresh();
+  }
+
+  async function toggleChatPin(id: string) {
+    const chat = await db.chats.get(id);
+    if (!chat) return;
+    await db.chats.update(id, { pinned: !chat.pinned, updatedAt: now() });
     await refresh();
   }
 
@@ -1859,7 +1877,10 @@ export function App() {
         selectedChatId={selectedChatId}
         onClose={() => setDrawerOpen(false)}
         onRoute={(nextRoute) => {
-          if (nextRoute === "projectEdit") setProjectEditInitialTab("general");
+          if (nextRoute === "projectEdit") {
+            setEditingProjectId(selectedProjectId);
+            setProjectEditInitialTab("general");
+          }
           setRoute(nextRoute);
           setDrawerOpen(false);
         }}
@@ -1876,6 +1897,8 @@ export function App() {
         }}
         onRenameChat={renameChat}
         onDeleteChat={deleteChat}
+        onToggleProjectPin={toggleProjectPin}
+        onToggleChatPin={toggleChatPin}
       />
       <main className="screen">
         {route === "chat" && (
@@ -3026,7 +3049,7 @@ function DeltaModeWorkspace({
     await db.deltaMessages.add({ id: replyId, sessionId: session.id, sequence: replySequence, role: "assistant", body: "...", status: "pending", modelId: model, turnNumber, eventType: "narrative", createdAt: timestamp, updatedAt: timestamp });
     await onRefresh();
     const allCharacters = await db.characters.where("projectId").equals(project.id).toArray();
-    const deltaPrompt = project.deltaSystemPrompt?.trim() || defaultDeltaSystemPrompt;
+    const deltaPrompt = effectiveDeltaSystemPrompt(project.deltaSystemPrompt);
     const currentEntities = (await db.deltaEntities.where("sessionId").equals(session.id).toArray()).sort((a, b) => a.orderIndex - b.orderIndex);
     const [inventoryRows, activeChat] = project.inventoryEnabled
       ? await Promise.all([
@@ -3064,20 +3087,7 @@ function DeltaModeWorkspace({
       `Available PREFIX labels: ${effectiveDeltaPrefixes(project.deltaPrefixes).map((item) => item.label).join(", ") || "(none)"}`,
       `Available BASE labels: ${effectiveDeltaBases(project.deltaBases).map((item) => item.label).join(", ") || "(none)"}`,
       `Available JOB categories: ${jobCategories(project.deltaJobs ?? []).map(([category, count]) => `${category} (${count})`).join(", ") || "(none)"}`,
-      "Continuity anchor rule: if the handoff contains DELTA CONTINUITY ANCHORS, preserve those exact item codes, location names, faction names, character names, current objective, and physical situation. Do not rename or replace them with similar invented details.",
-      "Generated entity rule: for every unlinked entity, choose a suitable PREFIX and BASE from the available labels when they exist. If JOB categories exist, call list_delta_job_categories, then get_delta_jobs_for_category for the best category, and choose a JOB from that category. Pass prefix, base, job, and jobCategory to create_delta_entity so the entity receives generated stats. For saved linked characters, use characterId and do not use generated tags.",
-      "Player roll rule: when the player declares an action with uncertain success, do not resolve success or failure yet. Call request_delta_roll with the required die/count/label and governing ability, then stop. The client reads the player entity's actual stat and applies its modifier. Use NONE only for a roll that genuinely has no governing stat. Only resolve the action after the client provides the modified authoritative total.",
-      "NPC roll rule: when an NPC, hostile, ally, hazard, resistance, detection, damage, or contest needs a roll, call request_delta_roll with rollerName and the governing ability instead of inventing the number. The client reads that entity's actual stat, applies its modifier, immediately displays a separate verified roll row, and returns the authoritative total. Use NONE only when no stat applies. Resolve from the returned total, but do not repeat or rewrite the dice-result line in narrative text. Do not announce tool use with lines such as 'Requesting roll', 'Calling for damage roll', or 'Rolling attack for X'.",
-      "Roll enforcement: the client rejects every dice result or dice equation written in assistant prose before it reaches the Delta log. New rolls must come from request_delta_roll. Existing verified rolls must be resolved without repeating their numbers in prose.",
-      "Attack sequence: an attack roll never supplies damage. After a verified attack roll, determine hit or miss. On a miss, resolve without damage. On a hit, call request_delta_roll for damage and stop; after that verified damage roll, call apply_delta_damage with its receipt before writing aftermath. Never describe an entity taking damage until the client confirms the HP update.",
-      "Attack sequence: an attack roll never supplies damage. After a verified attack roll, determine hit or miss. On a miss, resolve without damage. On a hit, call request_delta_roll for damage and stop; after that verified damage roll, call apply_delta_damage with its receipt before writing aftermath. Never describe an entity taking damage until the client confirms the HP update.",
-      "Reaction rule: when an active entity is directly threatened outside its own turn and a physically meaningful reaction could affect the outcome, do not ask that entity to act automatically and do not resolve damage yet. After the initiating attack/check roll is known, call request_delta_reaction with the target entityId and immediate trigger. The client authoritatively rolls 1d8 + the target's DEX modifier against 6 and enforces one reaction attempt per entity per initiative round. A failed check grants no reaction. A successful player check pauses the same attacker's turn for one brief player reaction; a successful non-player check may be resolved immediately. A reaction is never a new numbered turn and never changes initiative order by itself.",
-      "HP rule: after a verified damage roll, call apply_delta_damage with the target entityId, final positive damage amount, exact roll receipt ID, and zeroHpOutcome of ko or dead. The client owns subtraction, clamps HP at zero, applies KO/DEAD at zero HP, and prevents duplicate application. KO, DEAD, and ESCAPED entities cannot take turns. When an entity escapes, immediately set engagementState to escaped with update_delta_entity. Never send currentHp through update_delta_entity and never merely narrate HP loss without applying it.",
-      "Contested check rule: opposed control actions require both sides. Use contested checks for disarm, grapple, shove, restrain, escape, hold position, resist movement, stealth versus detection, deception versus insight, hacking versus active defense, and any action where another entity actively resists. Request rolls through the client, compare totals, and resolve from that comparison.",
-      "Turn text format: never write labels such as 'Turn resolved:', 'Result:', or 'Outcome:'. Write the action and consequence directly. A turn may use multiple short lines when useful.",
-      "Delta prose style: compact but not sterile. Add one or two precise sensory, emotional, or character-flavor details when they make the turn feel alive. Keep it lean; do not expand into main-chat story prose.",
-      "Cinematic injection: default to no separate cinematic cut-in. Use a cut-in only for a major emotional, relationship, reveal, near-death, reversal, or scene-pivot beat, and only if several ordinary turns have passed since the last cut-in. Do not use cut-ins for ordinary attacks, movement, failed rolls, simple reactions, or routine enemy turns.",
-      "Dialogue inside a turn: direct in-character speech addressed to another involved entity must produce one brief cinematic reply or immediate nonverbal response. If the entry also contains a turn-consuming action, put that cut-in first and begin it with 🎞️. If the entire entry is only speech, signalling, or communication with no movement, attack, item use, physical interaction, roll-worthy influence attempt, or other turn-consuming action, do not write a separate assistant reply: call continue_delta_player_turn with the concise reply in cinematicReply so the client posts it and retains the same numbered turn. Do not advance initiative for free dialogue.",
+      "Runtime enforcement: use the client for every new roll and never write dice results in prose. Apply HP damage only through apply_delta_damage after a verified damage roll. Keep reactions inside the triggering actor's turn, and use contested rolls for active opposition. Persist entity state rather than merely describing it. The Delta system prompt defines the prose, cut-in, dialogue, continuity, entity, and opening-engagement behavior; do not restate or override it here.",
       options.allowDialogueReply
         ? "Dialogue scope for this request: respond only to direct speech in the latest player entry currently being processed. Once posted, that dialogue is answered and must not be answered again on later turns."
         : "Dialogue scope for this request: do not answer, paraphrase, continue, or add another cinematic response to player dialogue from any earlier message. That dialogue has already been handled. Resolve only the current roll, action, or current entity turn.",
@@ -4828,13 +4838,39 @@ function Drawer(props: {
   onChat: (id: string) => void;
   onRenameChat: (id: string) => Promise<void>;
   onDeleteChat: (id: string) => Promise<void>;
+  onToggleProjectPin: (id: string) => Promise<void>;
+  onToggleChatPin: (id: string) => Promise<void>;
 }) {
-  const visibleProjects = props.projects.slice(0, 4);
-  const [pressTimer, setPressTimer] = useState<number>();
+  const [showAllProjects, setShowAllProjects] = useState(false);
   const [activeChatId, setActiveChatId] = useState<string>();
+  const [activeProjectId, setActiveProjectId] = useState<string>();
+  const pressTimer = useRef<number>();
+  const longPressedItem = useRef<string>();
+  const orderedProjects = [...props.projects].sort((a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)) || a.orderIndex - b.orderIndex);
+  const visibleProjects = showAllProjects ? orderedProjects : orderedProjects.slice(0, 3);
+  const hiddenProjectCount = Math.max(0, orderedProjects.length - 3);
+  const selectedProject = props.projects.find((project) => project.id === props.selectedProjectId);
+  const orderedChats = [...props.chats].sort((a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)) || b.updatedAt - a.updatedAt);
+
   function clearPressTimer() {
-    if (pressTimer) window.clearTimeout(pressTimer);
-    setPressTimer(undefined);
+    if (pressTimer.current) window.clearTimeout(pressTimer.current);
+    pressTimer.current = undefined;
+  }
+
+  function beginPress(itemId: string, onLongPress: () => void) {
+    clearPressTimer();
+    pressTimer.current = window.setTimeout(() => {
+      longPressedItem.current = itemId;
+      onLongPress();
+    }, 520);
+  }
+
+  function runClick(itemId: string, action: () => void) {
+    if (longPressedItem.current === itemId) {
+      longPressedItem.current = undefined;
+      return;
+    }
+    action();
   }
   return (
     <>
@@ -4850,39 +4886,60 @@ function Drawer(props: {
             <X size={20} />
           </button>
         </div>
-        <DrawerSection title="Projects" action={<button className="link-button" onClick={() => props.onRoute("projects")}>View All</button>}>
-          <ProjectList projects={visibleProjects} selectedProjectId={props.selectedProjectId} onProject={props.onProject} />
+        <DrawerSection title="Projects">
+          {visibleProjects.map((project) => (
+            <div className="nav-project" key={project.id}>
+              <button
+                className={`nav-row ${project.id === props.selectedProjectId ? "active" : ""}`}
+                onClick={() => runClick(`project:${project.id}`, () => props.onProject(project.id))}
+                onPointerDown={() => beginPress(`project:${project.id}`, () => setActiveProjectId(project.id))}
+                onPointerUp={clearPressTimer}
+                onPointerLeave={clearPressTimer}
+                onPointerCancel={clearPressTimer}
+                onContextMenu={(event) => { event.preventDefault(); setActiveProjectId(project.id); }}
+              >
+                <ProjectIcon name={project.iconName} color={project.iconColor} /> <span>{project.name}</span>{project.pinned && <Pin className="nav-pin" size={13} fill="currentColor" aria-label="Pinned" />}
+              </button>
+              {activeProjectId === project.id && <div className="row-context-menu"><button onClick={async () => { await props.onToggleProjectPin(project.id); setActiveProjectId(undefined); }}><Pin size={15} /> {project.pinned ? "Unpin" : "Pin"}</button><button onClick={() => setActiveProjectId(undefined)}><X size={15} /> Close</button></div>}
+            </div>
+          ))}
+          {hiddenProjectCount > 0 && <div className="drawer-project-more-row"><button className="drawer-expand-link" onClick={() => setShowAllProjects((current) => !current)}>{showAllProjects ? "Show fewer projects" : `… and ${hiddenProjectCount} other project${hiddenProjectCount === 1 ? "" : "s"}`}</button><button className="icon-button drawer-manage-button" onClick={() => props.onRoute("projects")} aria-label="Manage projects" title="Manage projects"><Settings size={15} /></button></div>}
         </DrawerSection>
-        {props.selectedProjectId ? (
-          <DrawerSection title={`Project Tools - ${props.projects.find((project) => project.id === props.selectedProjectId)?.name ?? "Project"}`}>
-            {(["stars", "characters", "archives", "memories", "sourceFiles", "projectEdit"] as RouteName[]).map((route) => (
+        {selectedProject ? (
+          <DrawerSection title="Selected project">
+            <div className="selected-project-row"><div className="selected-project-display"><ProjectIcon name={selectedProject.iconName} color={selectedProject.iconColor} /> <span>{selectedProject.name}</span></div><button className="icon-button" onClick={() => props.onRoute("projectEdit")} aria-label={`Open ${selectedProject.name} settings`} title="Project settings"><Settings size={18} /></button></div>
+            <div className="drawer-project-tools">
+            {(["stars", "characters", "archives", "memories"] as RouteName[]).map((route) => (
               <button className="nav-row" key={route} onClick={() => props.onRoute(route)}>
                 {routeIcon(route)} {routeLabels[route]}
               </button>
             ))}
+            </div>
           </DrawerSection>
         ) : (
           <p className="muted-pad">Choose a project before starting a chat.</p>
         )}
         <DrawerSection title="Chats">
           {props.chats.length === 0 && <p className="muted-pad">No chats yet.</p>}
-          {props.chats.map((chat) => (
+          {orderedChats.map((chat) => (
             <div className="nav-chat" key={chat.id}>
               <button
                 className={`nav-row ${chat.id === props.selectedChatId ? "active" : ""}`}
-                onClick={() => props.onChat(chat.id)}
-                onPointerDown={() => setPressTimer(window.setTimeout(() => setActiveChatId(chat.id), 520))}
+                onClick={() => runClick(`chat:${chat.id}`, () => props.onChat(chat.id))}
+                onPointerDown={() => beginPress(`chat:${chat.id}`, () => setActiveChatId(chat.id))}
                 onPointerUp={clearPressTimer}
                 onPointerLeave={clearPressTimer}
+                onPointerCancel={clearPressTimer}
                 onContextMenu={(event) => {
                   event.preventDefault();
                   setActiveChatId(chat.id);
                 }}
               >
-                <MessageSquare size={18} /> {chat.title}
+                <MessageSquare size={18} /> <span>{chat.title}</span>{chat.pinned && <Pin className="nav-pin" size={13} fill="currentColor" aria-label="Pinned" />}
               </button>
               {activeChatId === chat.id && (
                 <div className="row-context-menu">
+                  <button onClick={async () => { await props.onToggleChatPin(chat.id); setActiveChatId(undefined); }}><Pin size={15} /> {chat.pinned ? "Unpin" : "Pin"}</button>
                   <button onClick={async () => { await props.onRenameChat(chat.id); setActiveChatId(undefined); }}><Edit3 size={15} /> Rename</button>
                   <button className="danger" onClick={async () => { await props.onDeleteChat(chat.id); setActiveChatId(undefined); }}><Trash2 size={15} /> Delete</button>
                   <button onClick={() => setActiveChatId(undefined)}><X size={15} /> Close</button>
@@ -4902,28 +4959,12 @@ function Drawer(props: {
 }
 
 function DrawerSection({ title, action, children }: { title: string; action?: React.ReactNode; children: React.ReactNode }) {
+  const [collapsed, setCollapsed] = useState(false);
   return (
     <section className="drawer-section">
-      <div className="section-title"><h2>{title}</h2>{action}</div>
-      {children}
+      <div className="section-title"><button className="drawer-section-toggle" onClick={() => setCollapsed((current) => !current)} aria-expanded={!collapsed}><h2>{title}</h2><ChevronRight className={collapsed ? "" : "expanded"} size={15} /></button>{action}</div>
+      {!collapsed && children}
     </section>
-  );
-}
-
-function ProjectList({ projects, selectedProjectId, onProject }: { projects: Project[]; selectedProjectId?: string; onProject: (id: string) => void }) {
-  return (
-    <>
-      {projects.map((project) => (
-        <div className="nav-project" key={project.id}>
-          <button
-            className={`nav-row ${project.id === selectedProjectId ? "active" : ""}`}
-            onClick={() => onProject(project.id)}
-          >
-            <ProjectIcon name={project.iconName} color={project.iconColor} /> {project.name}
-          </button>
-        </div>
-      ))}
-    </>
   );
 }
 
@@ -4971,6 +5012,8 @@ function ChatScreen({
   const [contextOpen, setContextOpen] = useState(false);
   const [chatSettingsOpen, setChatSettingsOpen] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const [modelSaving, setModelSaving] = useState(false);
+  const [modelSaveError, setModelSaveError] = useState("");
   const [draftModelId, setDraftModelId] = useState(selectedModelId);
   const [includeWorld, setIncludeWorld] = useState(settings.includeWorld ?? true);
   const [includeInstructions, setIncludeInstructions] = useState(settings.includeInstructions ?? true);
@@ -4983,7 +5026,7 @@ function ChatScreen({
   const [historyNoLimit, setHistoryNoLimit] = useState(!settings.maxHistoryMessages);
   const [infiniteWarningOpen, setInfiniteWarningOpen] = useState(false);
   const [compactionEnabled, setCompactionEnabled] = useState(settings.compactionEnabled ?? false);
-  const [streamingEnabled, setStreamingEnabled] = useState(settings.streamingEnabled ?? false);
+  const [streamingEnabled, setStreamingEnabled] = useState(settings.streamingEnabled ?? true);
   const [autoManageInventory, setAutoManageInventory] = useState(settings.autoManageInventory ?? false);
   const [confirmInventoryUpdates, setConfirmInventoryUpdates] = useState(settings.confirmInventoryUpdates ?? true);
   const [autoManageGear, setAutoManageGear] = useState(settings.autoManageGear ?? false);
@@ -5013,7 +5056,7 @@ function ChatScreen({
     setMaxHistory(settings.maxHistoryMessages?.toString() ?? "");
     setHistoryNoLimit(Boolean(chat?.infiniteHistoryLocked) || !settings.maxHistoryMessages);
     setCompactionEnabled(settings.compactionEnabled ?? false);
-    setStreamingEnabled(settings.streamingEnabled ?? false);
+    setStreamingEnabled(settings.streamingEnabled ?? true);
     setAutoManageInventory(settings.autoManageInventory ?? false);
     setConfirmInventoryUpdates(settings.confirmInventoryUpdates ?? true);
     setAutoManageGear(settings.autoManageGear ?? false);
@@ -5042,6 +5085,24 @@ function ChatScreen({
       window.visualViewport?.removeEventListener("scroll", handleViewportChange);
     };
   }, []);
+  useEffect(() => {
+    if (!chatSettingsOpen) return;
+    const closeFromHistory = (event: PopStateEvent) => {
+      if (!(event.state as { mirrorChatSettings?: boolean } | null)?.mirrorChatSettings) {
+        setChatSettingsOpen(false);
+        setModelMenuOpen(false);
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeChatSettings();
+    };
+    window.addEventListener("popstate", closeFromHistory);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("popstate", closeFromHistory);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [chatSettingsOpen]);
   const infiniteHistoryLocked = Boolean(chat?.infiniteHistoryLocked);
   const effectiveHistoryNoLimit = infiniteHistoryLocked || historyNoLimit;
   async function persistChatSettings(lockInfiniteHistory = false) {
@@ -5077,6 +5138,34 @@ function ChatScreen({
     }
     await persistChatSettings();
   }
+  function openChatSettings() {
+    setContextOpen(false);
+    setModelMenuOpen(false);
+    setChatSettingsOpen(true);
+    window.history.pushState({ ...window.history.state, mirrorChatSettings: true }, "", window.location.href);
+  }
+  function closeChatSettings() {
+    setModelMenuOpen(false);
+    if (window.history.state?.mirrorChatSettings) window.history.back();
+    else setChatSettingsOpen(false);
+  }
+  async function chooseChatModel(modelId: string) {
+    if (modelSaving) return;
+    setModelSaving(true);
+    setModelSaveError("");
+    try {
+      const updated = await db.settings.update("settings", { defaultModelId: modelId, updatedAt: now() });
+      if (!updated) throw new Error("Chat settings were unavailable.");
+      setDraftModelId(modelId);
+      setModelMenuOpen(false);
+      showSaved();
+      await onSettingsSaved(modelId);
+    } catch (error) {
+      setModelSaveError(error instanceof Error ? `Couldn't save model: ${error.message}` : "Couldn't save model. Please try again.");
+    } finally {
+      setModelSaving(false);
+    }
+  }
 
   function openRouterPayload(messagesToSend: OpenRouterMessage[], stream: boolean, imageContextMessageId?: string, forceImageContextTool = false) {
     const payload: Record<string, unknown> = {
@@ -5093,8 +5182,7 @@ function ChatScreen({
     const deltaAvailable = deltaEngagementEnabled();
     const activeTools = [
       ...(deltaAvailable ? [...deltaImminentTools] : []),
-      ...characterTools,
-      ...(project && project.memoryMode !== "manual" ? [...memoryTools] : []),
+      ...(includeCharacters ? [...characterTools] : []),
       ...(project?.inventoryEnabled && autoManageInventory ? [...inventoryTools] : []),
       ...(imageContextMessageId ? [...imageContextTools] : [])
     ];
@@ -5391,7 +5479,12 @@ function ChatScreen({
   }
 
   function toolsEnabled(imageContextMessageId?: string) {
-    return true;
+    return Boolean(
+      imageContextMessageId
+      || includeCharacters
+      || deltaEngagementEnabled()
+      || (project?.inventoryEnabled && autoManageInventory)
+    );
   }
 
   function createMainChatAudit(options: {
@@ -5459,16 +5552,27 @@ function ChatScreen({
 
 
   async function openRouterRequest(payload: Record<string, unknown>) {
-    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${(settings.apiKey ?? "").trim()}`,
-        "Content-Type": "application/json",
-        "HTTP-Referer": location.origin,
-        "X-Title": "Mirror 2.0"
-      },
-      body: JSON.stringify(payload)
-    });
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 90_000);
+    let response: Response;
+    try {
+      response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${(settings.apiKey ?? "").trim()}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": location.origin,
+          "X-Title": "Mirror 2.0"
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+    } catch (error) {
+      if (controller.signal.aborted) throw new Error("The AI provider did not start responding within 90 seconds. Please resend the message.");
+      throw error;
+    } finally {
+      window.clearTimeout(timeout);
+    }
     if (!response.ok) {
       const errorText = await response.text();
       throw new Error(errorText || `OpenRouter request failed (${response.status})`);
@@ -5896,7 +6000,9 @@ function ChatScreen({
         : activeChat?.compactionMemory ?? "";
       const selectedHistory = historyLimit ? contextHistory.slice(-historyLimit) : contextHistory;
       const memoryDetails = await memoryContext(text, selectedHistory);
-      const preparedHistory = await ensureContextCondensations(selectedHistory, userMessageId);
+      // Condensation is handled after a reply. Keeping it out of the send path avoids
+      // an extra full model request before the user sees any response.
+      const preparedHistory = selectedHistory;
       const deltaAvailable = deltaEngagementEnabled();
       const systemParts = [
         `Project: ${project.name}`,
@@ -6101,7 +6207,7 @@ function ChatScreen({
     const limitedHistory = historyLimit ? orderedHistory.slice(-historyLimit) : orderedHistory;
     const selectedHistory = limitedHistory.some((row) => row.id === promptMessage.id) ? limitedHistory : [...limitedHistory, promptMessage].sort((a, b) => a.sequence - b.sequence);
     const memoryDetails = await memoryContext(promptMessage.body, selectedHistory);
-    const preparedHistory = await ensureContextCondensations(selectedHistory, promptMessage.id);
+    const preparedHistory = selectedHistory;
     const resendImages = promptMessage.attachmentContext ? [] : await storedMessageImages(promptMessage.id);
     const deltaAvailable = deltaEngagementEnabled();
     const systemParts = [
@@ -6438,8 +6544,7 @@ function ChatScreen({
   const avoidDeltaBriefStable = useCallback((message: Message, attempt: string) => avoidDeltaBriefRef.current(message, attempt), []);
   const onRefreshStable = useCallback(() => onRefreshRef.current(), []);
   const openChatSettingsStable = useCallback(() => {
-    setContextOpen(true);
-    setChatSettingsOpen(true);
+    openChatSettings();
   }, []);
 
   if (!project) {
@@ -6487,54 +6592,42 @@ function ChatScreen({
         {deltaLocked && <div className="composer-lock">Resolve engagement to unlock chat.</div>}
         {contextOpen && (
           <div className="context-popover">
-            <button className="drawer-action-row" type="button" onClick={() => setChatSettingsOpen(!chatSettingsOpen)}>
+            <button className="model-row" type="button" onClick={() => setModelMenuOpen(!modelMenuOpen)}>
+              <span>Current model</span>
+              <strong>{models.find((model) => model.modelId === draftModelId)?.cosmeticName || draftModelId || "Choose model"}</strong>
+            </button>
+            {modelMenuOpen && <div className="model-menu">
+              {models.length === 0 && <p className="muted-pad">Add models in API settings first.</p>}
+              {models.map((model) => <button key={model.modelId} className={model.modelId === draftModelId ? "picked" : ""} type="button" disabled={modelSaving} onClick={() => void chooseChatModel(model.modelId)}><span>{model.cosmeticName}</span><small>{model.modelId}</small></button>)}
+            </div>}
+            {modelSaveError && <small className="error">{modelSaveError}</small>}
+            <button className="drawer-action-row" type="button" onClick={openChatSettings}>
               <Settings size={18} /> Chat settings
             </button>
-            {chatSettingsOpen && (
-              <div className="chat-settings-panel">
-                <button className="model-row" type="button" onClick={() => setModelMenuOpen(!modelMenuOpen)}>
-                  <span>Current model</span>
-                  <strong>{models.find((model) => model.modelId === draftModelId)?.cosmeticName || draftModelId || "Choose model"}</strong>
-                </button>
-                {modelMenuOpen && (
-                  <div className="model-menu">
-                    {models.length === 0 && <p className="muted-pad">Add models in API settings first.</p>}
-                    {models.map((model) => (
-                      <button
-                        key={model.modelId}
-                        className={model.modelId === draftModelId ? "picked" : ""}
-                        type="button"
-                        onClick={() => {
-                          setDraftModelId(model.modelId);
-                          setModelMenuOpen(false);
-                        }}
-                      >
-                        <span>{model.cosmeticName}</span>
-                        <small>{model.modelId}</small>
-                      </button>
-                    ))}
-                  </div>
-                )}
+            <button className="drawer-action-row" type="button" onClick={() => imagePickerRef.current?.click()}><ImageIcon size={18} /> Attach Image</button>
+            <button className="drawer-action-row" type="button" onClick={() => filePickerRef.current?.click()}><Paperclip size={18} /> Attach File</button>
+            <input ref={filePickerRef} className="visually-hidden" type="file" multiple onChange={(event) => { chooseFiles(event.target.files); event.currentTarget.value = ""; }} />
+            <input ref={imagePickerRef} className="visually-hidden" type="file" accept="image/*" multiple onChange={(event) => { chooseImages(event.target.files); event.currentTarget.value = ""; }} />
+          </div>
+        )}
+        {chatSettingsOpen && createPortal(
+          <div className="modal-backdrop chat-settings-backdrop" onClick={closeChatSettings}>
+            <section className="modal chat-settings-modal" role="dialog" aria-modal="true" aria-labelledby="chat-settings-title" onClick={(event) => event.stopPropagation()}>
+              <div className="section-title">
+                <h2 id="chat-settings-title">Chat settings</h2>
+                <button type="button" className="icon-button" onClick={closeChatSettings} aria-label="Close chat settings"><X size={18} /></button>
+              </div>
+              <div className="chat-settings-content">
                 <label className="compact-check"><input type="checkbox" checked={includeWorld} onChange={(event) => setIncludeWorld(event.target.checked)} /> World Setting</label>
                 <label className="compact-check"><input type="checkbox" checked={includeInstructions} onChange={(event) => setIncludeInstructions(event.target.checked)} /> Instructions</label>
                 <label className="compact-check"><input type="checkbox" checked={includeCharacters} onChange={(event) => setIncludeCharacters(event.target.checked)} /> Characters</label>
                 <label className="compact-check"><input type="checkbox" checked={includeSourceFiles} onChange={(event) => setIncludeSourceFiles(event.target.checked)} /> Source files</label>
                 <label className="compact-check"><input type="checkbox" checked={inventoryEnabled} onChange={(event) => setInventoryEnabled(event.target.checked)} /> Enable inventory</label>
-                {inventoryEnabled && (
-                  <div className="inline-setting-pair">
-                    <label className="compact-check"><input type="checkbox" checked={autoManageInventory} onChange={(event) => setAutoManageInventory(event.target.checked)} /> Auto manage Inventory</label>
-                    <label className="compact-check"><input type="checkbox" checked={confirmInventoryUpdates} onChange={(event) => setConfirmInventoryUpdates(event.target.checked)} /> Use confirmation</label>
-                  </div>
-                )}
+                {inventoryEnabled && <div className="inline-setting-pair"><label className="compact-check"><input type="checkbox" checked={autoManageInventory} onChange={(event) => setAutoManageInventory(event.target.checked)} /> Auto manage Inventory</label><label className="compact-check"><input type="checkbox" checked={confirmInventoryUpdates} onChange={(event) => setConfirmInventoryUpdates(event.target.checked)} /> Use confirmation</label></div>}
                 <label className="compact-check"><input type="checkbox" checked={gearEnabled} onChange={(event) => setGearEnabled(event.target.checked)} /> Enable gear</label>
-                {gearEnabled && (
-                  <div className="inline-setting-pair">
-                    <label className="compact-check"><input type="checkbox" checked={autoManageGear} onChange={(event) => setAutoManageGear(event.target.checked)} /> Auto manage Gear</label>
-                    <label className="compact-check"><input type="checkbox" checked={confirmGearUpdates} onChange={(event) => setConfirmGearUpdates(event.target.checked)} /> Use confirmation</label>
-                  </div>
-                )}
+                {gearEnabled && <div className="inline-setting-pair"><label className="compact-check"><input type="checkbox" checked={autoManageGear} onChange={(event) => setAutoManageGear(event.target.checked)} /> Auto manage Gear</label><label className="compact-check"><input type="checkbox" checked={confirmGearUpdates} onChange={(event) => setConfirmGearUpdates(event.target.checked)} /> Use confirmation</label></div>}
                 <label className="compact-check"><input type="checkbox" checked={compactionEnabled} onChange={(event) => setCompactionEnabled(event.target.checked)} /> Compaction memory</label>
-                <button onClick={() => onRoute("compaction")}><BookOpen size={18} /> Open compaction memory</button>
+                <button type="button" onClick={() => { closeChatSettings(); onRoute("compaction"); }}><BookOpen size={18} /> Open compaction memory</button>
                 <label className="compact-check"><input type="checkbox" checked={streamingEnabled} onChange={(event) => setStreamingEnabled(event.target.checked)} /> Streaming</label>
                 <label className="range-row"><span>Temperature <b>{temperature || "0"}</b></span><input type="range" min={0} max={2} step={0.05} value={temperature || "0"} onChange={(event) => setTemperature(event.target.value)} /></label>
                 <label className="range-row"><span>Top P <b>{topP || "0"}</b></span><input type="range" min={0} max={1} step={0.05} value={topP || "0"} onChange={(event) => setTopP(event.target.value)} /></label>
@@ -6542,17 +6635,15 @@ function ChatScreen({
                 <label className="compact-check"><input type="checkbox" checked={effectiveHistoryNoLimit} disabled={infiniteHistoryLocked} onChange={(event) => setHistoryNoLimit(event.target.checked)} /> No message history limit</label>
                 {infiniteHistoryLocked && <small className="setting-lock-note">This chat is permanently set to infinite context.</small>}
                 {!effectiveHistoryNoLimit && <label>Message history limit<input type="number" min={10} max={500} value={maxHistory} onChange={(event) => setMaxHistory(event.target.value)} /></label>}
-                <div className="split-actions">
-                  <button onClick={saveChatSettings}><Save size={18} /> Save chat settings</button>
-                  {saved && <span className="save-status">Saved</span>}
-                </div>
               </div>
-            )}
-            <button className="drawer-action-row" type="button" onClick={() => imagePickerRef.current?.click()}><ImageIcon size={18} /> Attach Image</button>
-            <button className="drawer-action-row" type="button" onClick={() => filePickerRef.current?.click()}><Paperclip size={18} /> Attach File</button>
-            <input ref={filePickerRef} className="visually-hidden" type="file" multiple onChange={(event) => { chooseFiles(event.target.files); event.currentTarget.value = ""; }} />
-            <input ref={imagePickerRef} className="visually-hidden" type="file" accept="image/*" multiple onChange={(event) => { chooseImages(event.target.files); event.currentTarget.value = ""; }} />
-          </div>
+              <div className="split-actions chat-settings-actions">
+                <button type="button" onClick={() => void saveChatSettings()}><Save size={18} /> Save</button>
+                {saved && <span className="save-status">Saved</span>}
+                <button type="button" className="done-button" onClick={closeChatSettings}>Done</button>
+              </div>
+            </section>
+          </div>,
+          document.body
         )}
         {(imagePreviewUrls.length > 0 || attachedFiles.length > 0 || attachmentError) && (
           <div className="composer-attachments">
@@ -6574,7 +6665,7 @@ function ChatScreen({
               <div className="section-title"><h2>Use infinite context?</h2></div>
               <p>This chat cannot be changed back to a limited message history after you save it as infinite.</p>
               <div className="split-actions">
-                <button type="button" onClick={() => void persistChatSettings(true)}>Save as infinite</button>
+                <button type="button" className="save-button" onClick={() => void persistChatSettings(true)}>Save as infinite</button>
                 <button type="button" onClick={() => setInfiniteWarningOpen(false)}>Cancel</button>
               </div>
             </section>
@@ -7032,7 +7123,6 @@ function ProjectCard({ project, active, index, total, onSelect, onEdit, projects
     await onRefresh();
   }
   async function remove() {
-    if (project.locked) return;
     const count = await db.messages.where("chatId").anyOf((await db.chats.where("projectId").equals(project.id).primaryKeys()) as string[]).count();
     const ok = count > 0 ? prompt(`Deleting this project removes chats, messages, stars, archives, characters, and memories. Type DELETE ${project.name} to continue.`) === `DELETE ${project.name}` : confirm("Delete this project and its associated records?");
     if (!ok) return;
@@ -7080,13 +7170,13 @@ function ProjectCard({ project, active, index, total, onSelect, onEdit, projects
     <section className={`item-card ${active ? "selected" : ""}`}>
       <button className="item-main" onClick={() => onSelect(project.id)}>
         <ProjectIcon name={project.iconName} color={project.iconColor} size={28} />
-        <span>{project.name}</span>{project.locked && <small>Locked</small>}
+        <span>{project.name}</span>
       </button>
       <div className="card-actions">
         <button onClick={() => onEdit(project.id)}><Edit3 size={18} /> Edit</button>
         <button disabled={index === 0} onClick={() => move(-1)}>Move Up</button>
         <button disabled={index === total - 1} onClick={() => move(1)}>Move Down</button>
-        {!project.locked && <button className="danger" onClick={remove}><Trash2 size={18} /> Delete</button>}
+        <button className="danger" onClick={remove}><Trash2 size={18} /> Delete</button>
       </div>
     </section>
   );
@@ -7100,10 +7190,11 @@ function ProjectEditPage({ project, initialTab = "general", onRefresh, onDone }:
   const [deltaPrefixes, setDeltaPrefixes] = useState<DeltaPrefixTemplate[]>(effectiveDeltaPrefixes(project.deltaPrefixes));
   const [deltaBases, setDeltaBases] = useState<DeltaBaseTemplate[]>(deltaBaseDraft(project.deltaBases));
   const [deltaJobs, setDeltaJobs] = useState<DeltaJobTemplate[]>(project.deltaJobs ?? defaultDeltaJobs());
-  const [deltaSystemPrompt, setDeltaSystemPrompt] = useState(project.deltaSystemPrompt ?? defaultDeltaSystemPrompt);
+  const [deltaSystemPrompt, setDeltaSystemPrompt] = useState(effectiveDeltaSystemPrompt(project.deltaSystemPrompt));
   const [deltaRevealText, setDeltaRevealText] = useState(project.deltaRevealText ?? true);
   const [deltaRevealSpeed, setDeltaRevealSpeed] = useState(project.deltaRevealSpeed ?? 5);
   const [showIconPicker, setShowIconPicker] = useState(false);
+  const [editingProjectName, setEditingProjectName] = useState(false);
   const [saved, showSaved] = useSavedNotice();
   const [deltaSaved, showDeltaSaved] = useSavedNotice();
   useEffect(() => {
@@ -7112,9 +7203,10 @@ function ProjectEditPage({ project, initialTab = "general", onRefresh, onDone }:
     setDeltaPrefixes(effectiveDeltaPrefixes(project.deltaPrefixes));
     setDeltaBases(deltaBaseDraft(project.deltaBases));
     setDeltaJobs(project.deltaJobs ?? defaultDeltaJobs());
-    setDeltaSystemPrompt(project.deltaSystemPrompt ?? defaultDeltaSystemPrompt);
+    setDeltaSystemPrompt(effectiveDeltaSystemPrompt(project.deltaSystemPrompt));
     setDeltaRevealText(project.deltaRevealText ?? true);
     setDeltaRevealSpeed(project.deltaRevealSpeed ?? 5);
+    setEditingProjectName(false);
   }, [project.id]);
   async function save() {
     const nextDraft = { ...draft, deltaEnabled: Boolean(draft.deltaEnabled && draft.inventoryEnabled && draft.gearEnabled) };
@@ -7140,38 +7232,38 @@ function ProjectEditPage({ project, initialTab = "general", onRefresh, onDone }:
       </div>
       {tab === "general" && (
       <section className="item-card stack">
-        <button className="project-icon-edit" onClick={() => setShowIconPicker(!showIconPicker)} aria-label="Change project icon">
-          <ProjectIcon name={draft.iconName} color={draft.iconColor} size={36} />
-          <span>{draft.name}</span>
-        </button>
+        <div className="project-identity-editor">
+          <button className="project-icon-edit" onClick={() => setShowIconPicker(true)} aria-label="Change project icon" title="Change project icon"><ProjectIcon name={draft.iconName} color={draft.iconColor} size={36} /></button>
+          {editingProjectName ? (
+            <input className="project-name-input" autoFocus value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} onBlur={() => setEditingProjectName(false)} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} aria-label="Project name" />
+          ) : (
+            <button className="project-name-edit" onClick={() => setEditingProjectName(true)} title="Rename project">{draft.name || "Untitled project"}</button>
+          )}
+        </div>
         {showIconPicker && (
-          <>
-            <div className="icon-grid">
+          <div className="modal-backdrop project-icon-picker-backdrop" onClick={() => setShowIconPicker(false)}>
+            <section className="project-icon-picker" role="dialog" aria-modal="true" aria-label="Choose project icon" onClick={(event) => event.stopPropagation()}>
+              <div className="section-title"><h2>Choose an icon</h2><button className="icon-button" onClick={() => setShowIconPicker(false)} aria-label="Close icon picker"><X size={18} /></button></div>
+              <div className="icon-grid project-icon-grid">
               {projectIcons.map(({ name, label }) => (
-                <button key={name} className={draft.iconName === name ? "picked" : ""} onClick={() => setDraft({ ...draft, iconName: name })} aria-label={label}>
+                  <button key={name} className={draft.iconName === name ? "picked" : ""} onClick={() => { setDraft({ ...draft, iconName: name }); setShowIconPicker(false); }} aria-label={label} title={label}>
                   <ProjectIcon name={name} color={draft.iconColor} />
                 </button>
               ))}
-            </div>
-            <ColorSwatches value={draft.iconColor} onChange={(iconColor) => setDraft({ ...draft, iconColor })} />
-          </>
+              </div>
+              <div className="project-icon-colors"><span>Colour</span><ColorSwatches value={draft.iconColor} onChange={(iconColor) => setDraft({ ...draft, iconColor })} /></div>
+            </section>
+          </div>
         )}
-        <label>Name<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} /></label>
-        <label className="compact-check"><input type="checkbox" checked={draft.locked} onChange={(event) => setDraft({ ...draft, locked: event.target.checked })} /> Lock project editing</label>
-        <label className="compact-check"><input type="checkbox" checked={draft.inventoryEnabled} onChange={(event) => setDraft({ ...draft, inventoryEnabled: event.target.checked })} /> Enable inventory</label>
-        {draft.inventoryEnabled && (
-          <>
-            <label>Currency name<input value={draft.currencyName ?? ""} onChange={(event) => setDraft({ ...draft, currencyName: event.target.value })} placeholder="currency name" /></label>
-          </>
-        )}
+        <div className="inventory-setting-row"><label className="compact-check"><input type="checkbox" checked={draft.inventoryEnabled} onChange={(event) => setDraft({ ...draft, inventoryEnabled: event.target.checked })} /> Enable inventory</label>{draft.inventoryEnabled && <label className="inventory-currency-name">Currency name<input value={draft.currencyName ?? ""} onChange={(event) => setDraft({ ...draft, currencyName: event.target.value })} placeholder="currency name" /></label>}</div>
         <label className="compact-check"><input type="checkbox" checked={draft.gearEnabled} onChange={(event) => setDraft({ ...draft, gearEnabled: event.target.checked })} /> Enable gear</label>
-        <label className="compact-check"><input type="checkbox" checked={Boolean(draft.deltaEnabled && draft.inventoryEnabled && draft.gearEnabled)} disabled={!draft.inventoryEnabled || !draft.gearEnabled} onChange={(event) => setDraft({ ...draft, deltaEnabled: event.target.checked })} /> Enable Delta Mode</label>
-        {(!draft.inventoryEnabled || !draft.gearEnabled) && <p className="error">Delta Mode requires inventory and gear to be enabled first.</p>}
+        <div className="delta-mode-setting-row"><label className="compact-check"><input type="checkbox" checked={Boolean(draft.deltaEnabled && draft.inventoryEnabled && draft.gearEnabled)} disabled={!draft.inventoryEnabled || !draft.gearEnabled} onChange={(event) => setDraft({ ...draft, deltaEnabled: event.target.checked })} /> Enable Delta Mode</label>{(!draft.inventoryEnabled || !draft.gearEnabled) && <small>Requires inventory and gear enabled</small>}</div>
         <textarea value={draft.instructions} onChange={(event) => setDraft({ ...draft, instructions: event.target.value })} placeholder="Project Instructions" />
         <textarea value={draft.worldSetting} onChange={(event) => setDraft({ ...draft, worldSetting: event.target.value })} placeholder="World Setting" />
         <label>Memory mode <select value={draft.memoryMode} onChange={(event) => setDraft({ ...draft, memoryMode: event.target.value as Project["memoryMode"] })}><option value="manual">Manual</option><option value="automatic">Automatic</option><option value="approval">Automatic with Approval</option></select></label>
         <textarea value={draft.memoryInstruction} onChange={(event) => setDraft({ ...draft, memoryInstruction: event.target.value })} />
-        <div className="split-actions"><button onClick={save}><Save size={18} /> Save</button><button onClick={onDone}>Done</button>{saved && <span className="save-status">Saved</span>}</div>
+        <SourceFilesSection project={project} />
+        <div className="split-actions persistent-actions"><button onClick={save}><Save size={18} /> Save</button><button className="done-button" onClick={onDone}>Done</button>{saved && <span className="save-status">Saved</span>}</div>
       </section>
       )}
       {tab === "delta" && (
@@ -7189,16 +7281,17 @@ function ProjectEditPage({ project, initialTab = "general", onRefresh, onDone }:
           <section className="panel stack">
             <div className="section-title"><h2>System Prompt</h2></div>
             <p className="notice">This is the full Delta Mode system prompt for this project. Revert restores Mirror's default Delta behavior.</p>
+            <p className="delta-prompt-warning">Warning: Only change this prompt if you know what you are doing.</p>
             <textarea className="large-entry" value={deltaSystemPrompt} onChange={(event) => setDeltaSystemPrompt(event.target.value)} />
             <div className="delta-stream-setting-row">
               <label className="compact-check"><input type="checkbox" checked={deltaRevealText} onChange={(event) => setDeltaRevealText(event.target.checked)} /> Stream text</label>
               {deltaRevealText && <label className="delta-stream-speed"><span>Speed <b>{deltaRevealSpeed}</b></span><input type="range" min={1} max={10} step={1} value={deltaRevealSpeed} onChange={(event) => setDeltaRevealSpeed(Number(event.target.value))} /></label>}
             </div>
-            <div className="split-actions">
+            <div className="split-actions persistent-actions">
               <button onClick={() => saveDeltaPatch({ deltaSystemPrompt: deltaSystemPrompt.trim() || defaultDeltaSystemPrompt, deltaRevealText, deltaRevealSpeed })}><Save size={18} /> Save SYSTEM</button>
               <button onClick={revertDeltaSystemPrompt}>Revert to default</button>
               {deltaSaved && <span className="save-status">Saved</span>}
-              <button className="delta-settings-done" onClick={onDone}>Done</button>
+              <button className="delta-settings-done done-button" onClick={onDone}>Done</button>
             </div>
           </section>
           )}
@@ -7208,7 +7301,7 @@ function ProjectEditPage({ project, initialTab = "general", onRefresh, onDone }:
             <div className="section-title"><h2>Default NPC Values</h2></div>
             <p className="notice">Starting stats for generated Delta characters that do not have saved character stats.</p>
             <AbilityScoreEditor value={deltaStats} onChange={setDeltaStats} />
-            <div className="split-actions"><button onClick={() => saveDeltaPatch({ deltaDefaultNpcStats: cleanAbilityScores(deltaStats) })}><Save size={18} /> Save Default NPC Values</button>{deltaSaved && <span className="save-status">Saved</span>}<button className="delta-settings-done" onClick={onDone}>Done</button></div>
+            <div className="split-actions persistent-actions"><button onClick={() => saveDeltaPatch({ deltaDefaultNpcStats: cleanAbilityScores(deltaStats) })}><Save size={18} /> Save Default NPC Values</button>{deltaSaved && <span className="save-status">Saved</span>}<button className="delta-settings-done done-button" onClick={onDone}>Done</button></div>
           </section>
           )}
 
@@ -7217,11 +7310,11 @@ function ProjectEditPage({ project, initialTab = "general", onRefresh, onDone }:
             <div className="section-title"><h2>PREFIXES</h2></div>
             <p className="notice">PREFIX templates are the first part of [PREFIX]-[BASE] [JOB].</p>
             <DeltaPrefixEditor value={deltaPrefixes} onChange={setDeltaPrefixes} />
-            <div className="split-actions">
+            <div className="split-actions persistent-actions">
               <button onClick={() => setDeltaPrefixes([...deltaPrefixes, { id: uid(), label: "", statModifiers: {} }])}><Plus size={18} /> Add PREFIX</button>
               <button onClick={() => saveDeltaPatch({ deltaPrefixes: cleanDeltaPrefixes(deltaPrefixes) })}><Save size={18} /> Save PREFIXES</button>
               {deltaSaved && <span className="save-status">Saved</span>}
-              <button className="delta-settings-done" onClick={onDone}>Done</button>
+              <button className="delta-settings-done done-button" onClick={onDone}>Done</button>
             </div>
           </section>
           )}
@@ -7231,11 +7324,11 @@ function ProjectEditPage({ project, initialTab = "general", onRefresh, onDone }:
             <div className="section-title"><h2>BASES</h2></div>
             <p className="notice">BASE templates are modifiers applied on top of Default NPC Values, not full repeated stat blocks.</p>
             <DeltaBaseEditor value={deltaBases} onChange={setDeltaBases} />
-            <div className="split-actions">
+            <div className="split-actions persistent-actions">
               <button onClick={() => setDeltaBases([...deltaBases, { id: uid(), label: "", statModifiers: {} }])}><Plus size={18} /> Add BASE</button>
               <button onClick={() => saveDeltaPatch({ deltaBases: cleanDeltaBases(deltaBases) })}><Save size={18} /> Save BASES</button>
               {deltaSaved && <span className="save-status">Saved</span>}
-              <button className="delta-settings-done" onClick={onDone}>Done</button>
+              <button className="delta-settings-done done-button" onClick={onDone}>Done</button>
             </div>
           </section>
           )}
@@ -7248,7 +7341,7 @@ function ProjectEditPage({ project, initialTab = "general", onRefresh, onDone }:
               <small>Use dashes instead of spaces in filenames, for example street-lowlife.txt.</small>
             </div>
             <DeltaJobImport value={deltaJobs} onChange={setDeltaJobs} />
-            <div className="split-actions"><button onClick={() => saveDeltaPatch({ deltaJobs: cleanDeltaJobs(deltaJobs) })}><Save size={18} /> Save JOBS</button>{deltaSaved && <span className="save-status">Saved</span>}<button className="delta-settings-done" onClick={onDone}>Done</button></div>
+            <div className="split-actions persistent-actions"><button onClick={() => saveDeltaPatch({ deltaJobs: cleanDeltaJobs(deltaJobs) })}><Save size={18} /> Save JOBS</button>{deltaSaved && <span className="save-status">Saved</span>}<button className="delta-settings-done done-button" onClick={onDone}>Done</button></div>
           </section>
           )}
 
@@ -7372,7 +7465,7 @@ function DeltaEffectsEditor({ project, onDone }: { project: Project; onDone: () 
       <p className="notice">Create reusable buffs and debuffs for this project's Delta system. Runtime effect application will plug into these definitions later.</p>
       {renderGroup("positive", "Positive (buffs)")}
       {renderGroup("negative", "Negative (debuffs)")}
-      <div className="split-actions"><button onClick={saveEffects}><Save size={18} /> Save EFFECTS</button>{saved && <span className="save-status">Saved</span>}<button className="delta-settings-done" onClick={onDone}>Done</button></div>
+      <div className="split-actions persistent-actions"><button onClick={saveEffects}><Save size={18} /> Save EFFECTS</button>{saved && <span className="save-status">Saved</span>}<button className="delta-settings-done done-button" onClick={onDone}>Done</button></div>
 
       {editing && (
         <div className="modal-backdrop delta-effect-modal-backdrop" onClick={() => setEditing(undefined)}>
@@ -7514,12 +7607,12 @@ function DeltaIconLibrary({ projectId, icons, onIconsChange, onSelect, onClose }
   return (
     <div className="modal-backdrop delta-icon-library-backdrop" onClick={onClose}>
       <section className="delta-icon-library" onClick={(event) => event.stopPropagation()}>
-        <div className="section-title"><h2>Icon library</h2><button className="icon-button" onClick={onClose} aria-label="Close"><X size={18} /></button></div>
+        <div className="section-title"><div><h2>Icon library</h2><p className="delta-icon-library-description">Reusable icons for this project’s effects.</p></div><button className="icon-button" onClick={onClose} aria-label="Close"><X size={18} /></button></div>
         <div className="delta-icon-grid">
           {icons.map((icon) => <div className="delta-icon-cell" key={icon.id}><button onClick={() => onSelect ? onSelect(icon) : setEditing(icon)} title={onSelect ? `Use ${icon.name}` : `Edit ${icon.name}`}><img src={icon.dataUrl} alt="" /><span>{icon.name}</span></button><button className="icon-button" onClick={() => setEditing(icon)} aria-label={`Edit ${icon.name}`}><Pencil size={14} /></button><button className="icon-button danger-icon" onClick={() => setDeleteIcon(icon)} aria-label={`Delete ${icon.name}`}><Trash2 size={14} /></button></div>)}
           {icons.length === 0 && <p className="delta-effect-empty">No saved icons.</p>}
         </div>
-        <button onClick={() => setCreating(true)}><Plus size={17} /> Add new icon</button>
+        <button className="delta-icon-library-create" onClick={() => setCreating(true)}><Zap size={17} /> Create icon with FLUX</button>
       </section>
       {(creating || editing) && <DeltaIconEditor projectId={projectId} icon={editing} recentIcons={recentIcons} onGenerated={(dataUrl) => setRecentIcons((current) => [dataUrl, ...current.filter((item) => item !== dataUrl)].slice(0, 3))} onSave={saveIcon} onClose={() => { setCreating(false); setEditing(undefined); }} />}
       {deleteIcon && <div className="modal-backdrop nested-confirm" onClick={() => setDeleteIcon(undefined)}><section className="confirm-modal" onClick={(event) => event.stopPropagation()}><h2>Delete icon?</h2><p>The saved icon will be removed from this project. Effects using it will keep their other settings.</p><div className="split-actions"><button className="danger" onClick={confirmDelete}>Delete</button><button onClick={() => setDeleteIcon(undefined)}>Cancel</button></div></section></div>}
@@ -7592,7 +7685,7 @@ function DeltaIconEditor({ projectId, icon, recentIcons, onGenerated, onSave, on
   return (
     <div className="modal-backdrop delta-icon-editor-backdrop" onClick={onClose}>
       <section className="delta-icon-editor" onClick={(event) => event.stopPropagation()}>
-        <div className="section-title"><h2>{icon ? "Edit icon" : "Add new icon"}</h2><button className="icon-button" onClick={onClose} aria-label="Close"><X size={18} /></button></div>
+        <div className="section-title"><div><h2>{icon ? "Edit icon" : "Create icon with FLUX"}</h2><p className="delta-icon-library-description">Describe one clear symbol; it will be prepared for use at 32 × 32 pixels.</p></div><button className="icon-button" onClick={onClose} aria-label="Close"><X size={18} /></button></div>
         <label>Model<select value={model} onChange={(event) => setModel(event.target.value)}>{models.map((row) => <option value={row.id} key={row.id}>{row.name}</option>)}</select></label>
         <label>Prompt<textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="Describe one simple status icon" /></label>
         <button onClick={generate} disabled={generating || !prompt.trim()}>{generating ? "Thinking..." : "Generate icon"}</button>
@@ -7747,7 +7840,7 @@ function SettingsPage({ settings, onRefresh }: { settings: AppSettings; onRefres
         <>
           <Segment label="Theme" value={draft.theme} options={["onyx", "ivory", "blue", "green"]} onChange={(theme) => setDraft({ ...draft, theme })} />
           <label>Accent</label>
-          <div className="swatches">{accents.map((accent) => <button key={accent.name} className={draft.accent === accent.name ? "picked" : ""} style={{ background: accent.value }} onClick={() => setDraft({ ...draft, accent: accent.name })} />)}</div>
+          <div className="swatches">{accents.map((accent) => <button key={accent.name} className={draft.accent === accent.name ? "picked" : ""} style={{ background: accent.value }} aria-label={`${accent.name} accent${draft.accent === accent.name ? " (selected)" : ""}`} aria-pressed={draft.accent === accent.name} onClick={() => setDraft({ ...draft, accent: accent.name })} />)}</div>
           <Segment label="Font" value={draft.font} options={["system", "inter", "lora", "nunito"]} onChange={(font) => setDraft({ ...draft, font })} />
           <label>Font size: {fontSizeLabel(draft.fontScale ?? 16)} ({draft.fontScale ?? 16}px)
             <input type="range" min={12} max={24} step={1} value={draft.fontScale ?? 16} onChange={(event) => setDraft({ ...draft, fontScale: Number(event.target.value) })} />
@@ -7758,7 +7851,7 @@ function SettingsPage({ settings, onRefresh }: { settings: AppSettings; onRefres
           <label>Entry width {draft.entryWidth}%<input type="range" min={60} max={100} value={draft.entryWidth} onChange={(event) => setDraft({ ...draft, entryWidth: Number(event.target.value) })} /></label>
           <label>Message spacing {draft.messageSpacing}px<input type="range" min={4} max={28} value={draft.messageSpacing} onChange={(event) => setDraft({ ...draft, messageSpacing: Number(event.target.value) })} /></label>
           <label>Paragraph spacing {draft.paragraphSpacing ?? 4}px<input type="range" min={0} max={18} value={draft.paragraphSpacing ?? 4} onChange={(event) => setDraft({ ...draft, paragraphSpacing: Number(event.target.value) })} /></label>
-          <div className="split-actions"><button onClick={save}><Save size={18} /> Save settings</button>{saved && <span className="save-status">Saved</span>}</div>
+          <div className="split-actions persistent-actions"><button onClick={save}><Save size={18} /> Save settings</button>{saved && <span className="save-status">Saved</span>}</div>
         </>
       )}
       {tab === "api" && <ApiSettingsContent settings={settings} onRefresh={onRefresh} />}
@@ -7786,7 +7879,7 @@ function ApiSettingsContent({ settings, onRefresh }: { settings: AppSettings; on
     <>
       <p className="notice">This static app stores the key in this browser only. Browser-only storage cannot protect a key as strongly as a private server.</p>
       <label>OpenRouter API key<input type={show ? "text" : "password"} value={key} onChange={(event) => setKey(event.target.value)} placeholder="sk-or-..." /></label>
-      <div className="split-actions"><button onClick={() => setShow(!show)}>{show ? "Hide" : "Show"}</button><button onClick={save}><Save size={18} /> Save</button><button className="danger" onClick={remove}>Remove</button>{saved && <span className="save-status">Saved</span>}</div>
+      <div className="split-actions persistent-actions"><button onClick={() => setShow(!show)}>{show ? "Hide" : "Show"}</button><button onClick={save}><Save size={18} /> Save</button><button className="danger" onClick={remove}>Remove</button>{saved && <span className="save-status">Saved</span>}</div>
       <label>Privacy preset<select value={settings.privacyPreset} onChange={async (event) => { await db.settings.update("settings", { privacyPreset: event.target.value as AppSettings["privacyPreset"], updatedAt: now() }); await onRefresh(); }}><option value="maximum">Maximum Privacy</option><option value="balanced">Balanced</option><option value="availability">Maximum Availability</option></select></label>
       <ModelLibrary />
     </>
@@ -7847,7 +7940,8 @@ function MemoriesPage({ project }: { project?: Project }) {
   if (!project) return <EmptyState title="No project selected" body="Choose a project to manage memories." />;
   const projectId = project.id;
   async function add() {
-    await createMemory(projectId, text, splitTags(tags));
+    if (!text.trim()) return;
+    await createMemory(projectId, text.trim(), splitTags(tags));
     setText(""); setTags(""); await load();
   }
   async function runSearch() {
@@ -7858,7 +7952,7 @@ function MemoriesPage({ project }: { project?: Project }) {
     <Page>
       <textarea value={text} onChange={(event) => setText(event.target.value)} placeholder="Memory text" />
       <input value={tags} onChange={(event) => setTags(event.target.value)} placeholder="tags, comma separated" />
-      <button onClick={add}><Plus size={18} /> Add memory</button>
+      <button disabled={!text.trim()} onClick={add}><Plus size={18} /> Add memory</button>
       <div className="form-row"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search by tag or text" /><button onClick={runSearch}><Search size={18} /></button></div>
       {pendingMemories.length > 0 && (
         <section className="panel stack">
@@ -7885,7 +7979,7 @@ function CompactionPage({ chat, onRefresh }: { chat: Chat; onRefresh: () => Prom
       <section className="item-card stack">
         <p className="notice">Keep this as a compact outline of major plot facts and continuity. Prefer lines like "Jaeger destroyed the company building" over minor moment-to-moment details.</p>
         <textarea className="large-entry" value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="- Major plot event&#10;- Important thread consequence&#10;- Current unresolved conflict" />
-        <div className="split-actions"><button onClick={save}><Save size={18} /> Save compaction memory</button>{saved && <span className="save-status">Saved</span>}</div>
+        <div className="split-actions persistent-actions"><button onClick={save}><Save size={18} /> Save compaction memory</button>{saved && <span className="save-status">Saved</span>}</div>
       </section>
     </Page>
   );
@@ -7922,7 +8016,7 @@ function PendingMemoryCard({ memory, onRefresh }: { memory: PendingMemory; onRef
       <small>Confidence: {Math.round((memory.confidence ?? 0) * 100)}%</small>
       <div className="split-actions">
         <button onClick={approve}><Save size={18} /> Approve</button>
-        <button onClick={saveDraft}>Save edit</button>
+        <button className="save-button" onClick={saveDraft}>Save edit</button>
         <button className="danger" onClick={reject}><Trash2 size={18} /> Reject</button>
         {saved && <span className="save-status">Saved</span>}
       </div>
@@ -7931,12 +8025,16 @@ function PendingMemoryCard({ memory, onRefresh }: { memory: PendingMemory; onRef
 }
 
 function SourceFilesPage({ project }: { project?: Project }) {
+  if (!project) return <EmptyState title="No project selected" body="Choose a project to manage source files." />;
+  return <Page><SourceFilesSection project={project} /></Page>;
+}
+
+function SourceFilesSection({ project }: { project: Project }) {
   const [files, setFiles] = useState<{ id: string; name: string; size: number; mimeType: string }[]>([]);
   async function load() {
-    if (project) setFiles(await db.sourceFiles.where("projectId").equals(project.id).reverse().sortBy("updatedAt"));
+    setFiles(await db.sourceFiles.where("projectId").equals(project.id).reverse().sortBy("updatedAt"));
   }
-  useEffect(() => { load(); }, [project?.id]);
-  if (!project) return <EmptyState title="No project selected" body="Choose a project to manage source files." />;
+  useEffect(() => { void load(); }, [project.id]);
   const projectId = project.id;
   async function add(filesToAdd: FileList | null) {
     if (!filesToAdd?.length) return;
@@ -7960,10 +8058,12 @@ function SourceFilesPage({ project }: { project?: Project }) {
     await load();
   }
   return (
-    <Page>
+    <section className="source-files-section stack">
+      <div className="section-title"><h2>Source files</h2></div>
       <label className="file-pick"><Upload size={18} /> Upload source files<input type="file" multiple onChange={(event) => add(event.target.files)} /></label>
+      {files.length === 0 && <p className="muted-pad">No source files yet.</p>}
       {files.map((file) => <section className="item-card mini-row" key={file.id}><span>{file.name}</span><small>{Math.ceil(file.size / 1024)} KB</small><button className="danger" onClick={() => remove(file.id)}><Trash2 size={16} /> Remove</button></section>)}
-    </Page>
+    </section>
   );
 }
 
@@ -8068,7 +8168,7 @@ function CharacterTile({ character, dragging, onDragStart, onDrop, onOpen }: { c
         onDrop();
       }}
     >
-      {imageUrl ? <img src={imageUrl} alt="" /> : <UserRound size={48} />}
+      {imageUrl ? <img src={imageUrl} alt="" /> : <UserRound className="character-placeholder-icon" size={54} strokeWidth={1.55} />}
       <span>{character.name}</span>
     </button>
   );
@@ -8204,7 +8304,7 @@ function CharacterEditor({ project, character, onRefresh, onBack, onDeleted }: {
           {draft.statsEnabled && <PointBuyEditor project={project} draft={draft} bonuses={bonuses} onDraft={setDraft} />}
           <CharacterActionLibraryEditor character={character} />
           {!valid && <p className="error">{buildMode === "template" ? "Choose a JOB for template builds." : "Custom builds need a job name and must stay within 27 points, with base scores from 8 to 15."}</p>}
-          <div className="split-actions"><button disabled={!valid} onClick={save}><Save size={18} /> Save</button><button onClick={() => setEditing(false)}>Cancel</button>{saved && <span className="save-status">Saved</span>}</div>
+          <div className="split-actions persistent-actions"><button disabled={!valid} onClick={save}><Save size={18} /> Save</button><button onClick={() => setEditing(false)}>Cancel</button>{saved && <span className="save-status">Saved</span>}</div>
         </div>
       )}
       {viewerIndex !== undefined && <ImageViewer attachments={attachments} index={viewerIndex} onChange={setViewerIndex} onClose={() => setViewerIndex(undefined)} />}
@@ -8701,87 +8801,84 @@ function DataSettingsContent() {
   const [auditStorage, setAuditStorage] = useState({ bytes: 0, messages: 0 });
   const [auditClearStep, setAuditClearStep] = useState<1 | 2>();
   const [auditStatus, setAuditStatus] = useState("");
+  const [recoverySnapshots, setRecoverySnapshots] = useState<RecoverySnapshot[]>([]);
+  const [recoveryStatus, setRecoveryStatus] = useState("");
   async function loadAuditStorage() {
     const messages = await db.messages.filter((message) => Boolean(message.requestInfo?.audit)).toArray();
     const bytes = messages.reduce((total, message) => total + new Blob([JSON.stringify(message.requestInfo?.audit)]).size, 0);
     setAuditStorage({ bytes, messages: messages.length });
   }
-  useEffect(() => { void loadAuditStorage(); }, []);
-  async function backupAll() {
-    if (!confirm("Generate a backup of all app data except API keys?")) return;
-    const data = {
-      schemaVersion: 1,
-      appVersion: "0.1.0",
-      exportedAt: new Date().toISOString(),
-      settings: { ...(await db.settings.get("settings")), apiKey: undefined },
-      projects: await db.projects.toArray(),
-      chats: await db.chats.toArray(),
-      branches: await db.branches.toArray(),
-      messages: await db.messages.toArray(),
-      stars: await db.stars.toArray(),
-      archives: await db.archives.toArray(),
-      archiveEntries: await db.archiveEntries.toArray(),
-      memories: await db.memories.toArray(),
-      characters: await db.characters.toArray(),
-      characterGearSlots: await db.characterGearSlots.toArray(),
-      modelLibrary: await db.modelLibrary.toArray(),
-      sourceFiles: await db.sourceFiles.toArray(),
-      inventoryItems: await db.inventoryItems.toArray(),
-      inventoryLogs: await db.inventoryLogs.toArray(),
-      deltaSessions: await db.deltaSessions.toArray(),
-      deltaMessages: await db.deltaMessages.toArray(),
-      deltaEntities: await db.deltaEntities.toArray(),
-      deltaAllyCache: await db.deltaAllyCache.toArray(),
-      deltaEffects: await db.deltaEffects.toArray(),
-      deltaIcons: await db.deltaIcons.toArray(),
-      characterActionSlots: await db.characterActionSlots.toArray(),
-      characterActionMacros: await db.characterActionMacros.toArray()
-    };
-    downloadJson("mirror-backup.json", data);
+  async function loadRecoverySnapshots() {
+    setRecoverySnapshots(await listRecoverySnapshots());
   }
-  async function importBackup(file: File | undefined) {
+  useEffect(() => {
+    void loadAuditStorage();
+    void loadRecoverySnapshots();
+    window.addEventListener("mirror:recovery-snapshot", loadRecoverySnapshots);
+    return () => window.removeEventListener("mirror:recovery-snapshot", loadRecoverySnapshots);
+  }, []);
+  async function downloadFullBackup() {
+    if (!confirm("Generate a complete portable backup of all Mirror data except the API key?")) return;
+    try {
+      downloadJson("mirror-full-backup.json", await createFullBackup());
+      setImportStatus("Full backup downloaded.");
+    } catch (error) {
+      setImportStatus(error instanceof Error ? error.message : "Backup failed.");
+    }
+  }
+  async function readBackup(file: File | undefined) {
     if (!file) return;
     try {
-      const parsed = JSON.parse(await file.text()) as Record<string, unknown>;
-      if (parsed.schemaVersion !== 1 || !Array.isArray(parsed.projects)) {
-        setImportStatus("Invalid import file.");
-        return;
-      }
-      const counts = ["projects", "chats", "branches", "messages", "stars", "archives", "archiveEntries", "memories", "characters", "characterGearSlots", "characterActionSlots", "characterActionMacros", "modelLibrary", "sourceFiles", "inventoryItems", "inventoryLogs", "deltaSessions", "deltaMessages", "deltaEntities", "deltaAllyCache", "deltaEffects", "deltaIcons"]
-        .map((key) => `${key}: ${Array.isArray(parsed[key]) ? parsed[key].length : 0}`)
-        .join(", ");
-      if (!confirm(`Import this backup?\n${counts}`)) return;
-      await db.transaction("rw", [db.settings, db.projects, db.chats, db.branches, db.messages, db.stars, db.archives, db.archiveEntries, db.memories, db.characters, db.characterGearSlots, db.characterActionSlots, db.characterActionMacros, db.modelLibrary, db.sourceFiles, db.inventoryItems, db.inventoryLogs, db.deltaSessions, db.deltaMessages, db.deltaEntities, db.deltaAllyCache, db.deltaActionMacros, db.deltaEffects, db.deltaIcons], async () => {
-        if (parsed.settings && typeof parsed.settings === "object") await db.settings.put(parsed.settings as AppSettings);
-        if (Array.isArray(parsed.projects)) await db.projects.bulkPut(parsed.projects as Project[]);
-        if (Array.isArray(parsed.chats)) await db.chats.bulkPut(parsed.chats as Chat[]);
-        if (Array.isArray(parsed.branches)) await db.branches.bulkPut(parsed.branches as never[]);
-        if (Array.isArray(parsed.messages)) await db.messages.bulkPut(parsed.messages as Message[]);
-        if (Array.isArray(parsed.stars)) await db.stars.bulkPut(parsed.stars as never[]);
-        if (Array.isArray(parsed.archives)) await db.archives.bulkPut(parsed.archives as never[]);
-        if (Array.isArray(parsed.archiveEntries)) await db.archiveEntries.bulkPut(parsed.archiveEntries as never[]);
-        if (Array.isArray(parsed.memories)) await db.memories.bulkPut(parsed.memories as Memory[]);
-        if (Array.isArray(parsed.characters)) await db.characters.bulkPut(parsed.characters as Character[]);
-        if (Array.isArray(parsed.characterGearSlots)) await db.characterGearSlots.bulkPut(parsed.characterGearSlots as CharacterGearSlot[]);
-        if (Array.isArray(parsed.characterActionSlots)) await db.characterActionSlots.bulkPut(parsed.characterActionSlots as CharacterActionSlot[]);
-        if (Array.isArray(parsed.characterActionMacros)) await db.characterActionMacros.bulkPut(parsed.characterActionMacros as CharacterActionMacro[]);
-        if (Array.isArray(parsed.modelLibrary)) await db.modelLibrary.bulkPut(parsed.modelLibrary as never[]);
-        if (Array.isArray(parsed.sourceFiles)) await db.sourceFiles.bulkPut(parsed.sourceFiles as never[]);
-        if (Array.isArray(parsed.inventoryItems)) {
-          await db.inventoryItems.bulkPut((parsed.inventoryItems as InventoryItem[]).filter((item) => item.kind !== "gear"));
-        }
-        if (Array.isArray(parsed.inventoryLogs)) await db.inventoryLogs.bulkPut(parsed.inventoryLogs as never[]);
-        if (Array.isArray(parsed.deltaSessions)) await db.deltaSessions.bulkPut(parsed.deltaSessions as DeltaSession[]);
-        if (Array.isArray(parsed.deltaMessages)) await db.deltaMessages.bulkPut(parsed.deltaMessages as DeltaMessage[]);
-        if (Array.isArray(parsed.deltaEntities)) await db.deltaEntities.bulkPut(parsed.deltaEntities as DeltaEntity[]);
-        if (Array.isArray(parsed.deltaAllyCache)) await db.deltaAllyCache.bulkPut(parsed.deltaAllyCache as DeltaAllyCacheEntry[]);
-        if (Array.isArray(parsed.deltaActionMacros)) await db.deltaActionMacros.bulkPut(parsed.deltaActionMacros as never[]);
-        if (Array.isArray(parsed.deltaEffects)) await db.deltaEffects.bulkPut(parsed.deltaEffects as DeltaEffectDefinition[]);
-        if (Array.isArray(parsed.deltaIcons)) await db.deltaIcons.bulkPut(parsed.deltaIcons as DeltaIconAsset[]);
-      });
-      setImportStatus("Import complete.");
-    } catch {
-      setImportStatus("Import failed.");
+      return await parseAndValidateBackup(await file.text());
+    } catch (error) {
+      setImportStatus(error instanceof Error ? error.message : "Import failed.");
+      return undefined;
+    }
+  }
+  function backupSummary(backup: { createdAt: string; tableCounts: Record<string, number> }) {
+    const total = Object.values(backup.tableCounts).reduce((sum, count) => sum + count, 0);
+    return `${formatDate(new Date(backup.createdAt).getTime())}; ${total} records across ${Object.keys(backup.tableCounts).length} tables.`;
+  }
+  async function mergeImport(file: File | undefined) {
+    const backup = await readBackup(file);
+    if (!backup) return;
+    if (!confirm(`Merge this full backup into the current data? Existing records with matching IDs will be updated; records not in the backup will remain.\n\n${backupSummary(backup)}`)) return;
+    try {
+      await mergeFullBackup(backup);
+      setImportStatus("Merge import complete.");
+    } catch (error) {
+      setImportStatus(error instanceof Error ? error.message : "Merge import failed.");
+    }
+  }
+  async function fullRestore(file: File | undefined) {
+    const backup = await readBackup(file);
+    if (!backup) return;
+    if (!confirm(`FULL RESTORE replaces all current Mirror data with this backup. The API key is not included in backups and will be removed. Continue?\n\n${backupSummary(backup)}`)) return;
+    try {
+      await replaceWithFullBackup(backup);
+      setImportStatus("Full restore verified. Reloading…");
+      location.reload();
+    } catch (error) {
+      setImportStatus(error instanceof Error ? error.message : "Full restore failed; current data was left unchanged.");
+    }
+  }
+  async function createRecovery() {
+    try {
+      const snapshot = await createRecoverySnapshot();
+      setRecoveryStatus(`Backup ${snapshot.slot} created and verified.`);
+      await loadRecoverySnapshots();
+    } catch (error) {
+      setRecoveryStatus(error instanceof Error ? error.message : "Recovery backup failed.");
+    }
+  }
+  async function restoreRecovery(slot: RecoverySlot) {
+    if (!confirm(`Restore Backup ${slot}? This replaces all current Mirror data. The API key is not part of recovery snapshots and will be removed.`)) return;
+    try {
+      await restoreRecoverySnapshot(slot);
+      setRecoveryStatus(`Backup ${slot} restored and verified. Reloading…`);
+      location.reload();
+    } catch (error) {
+      setRecoveryStatus(error instanceof Error ? error.message : "Recovery restore failed; current data was left unchanged.");
     }
   }
   async function clearAll() {
@@ -8806,7 +8903,23 @@ function DataSettingsContent() {
       <p className="notice">{auditStorage.messages ? `${auditStorage.messages} assistant response${auditStorage.messages === 1 ? "" : "s"} currently retain an audit.` : "No response audits are stored yet."}</p>
       <div className="split-actions"><button className="danger" disabled={!auditStorage.messages} onClick={() => setAuditClearStep(1)}><Trash2 size={17} /> Clear response audits</button>{auditStatus && <span className="save-status">{auditStatus}</span>}</div>
     </section>
-    <button onClick={backupAll}><Download size={18} /> Backup All</button><button onClick={backupAll}><Download size={18} /> Backup Memories Only</button><label className="file-pick"><Upload size={18} /> Import backup<input type="file" accept="application/json" onChange={(event) => importBackup(event.target.files?.[0])} /></label>{importStatus && <p className="save-status">{importStatus}</p>}<button className="danger separated" onClick={clearAll}><Trash2 size={18} /> Clear All</button>
+    <section className="panel stack">
+      <div className="section-title"><h2>Portable Full Backup</h2></div>
+      <p className="notice">Exports every current Mirror table, including attachments, but excludes the API key. Keep the downloaded file outside Chrome for protection against browser storage loss.</p>
+      <div className="split-actions"><button onClick={downloadFullBackup}><Download size={18} /> Download Full Backup</button><label className="file-pick"><Upload size={18} /> Merge Import<input type="file" accept="application/json" onChange={(event) => void mergeImport(event.target.files?.[0])} /></label><label className="file-pick danger"><Upload size={18} /> Full Restore<input type="file" accept="application/json" onChange={(event) => void fullRestore(event.target.files?.[0])} /></label></div>
+      {importStatus && <p className="save-status">{importStatus}</p>}
+    </section>
+    <section className="panel stack">
+      <div className="section-title"><h2>Local Recovery Backups</h2><button onClick={() => void createRecovery()}><Save size={18} /> Create snapshot</button></div>
+      <p className="notice">Mirror keeps only Backup A and Backup B in a separate local database. They protect against app-level data damage, not Chrome clearing this site’s storage.</p>
+      {(["A", "B"] as RecoverySlot[]).map((slot) => {
+        const snapshot = recoverySnapshots.find((item) => item.slot === slot);
+        const newest = snapshot && recoverySnapshots.every((item) => item.slot === slot || item.createdAt <= snapshot.createdAt);
+        return <div className="mini-row" key={slot}><strong>Backup {slot}</strong><small>{snapshot ? `${formatDate(new Date(snapshot.createdAt).getTime())}${newest ? " — newest" : ""}` : "Not created yet"}</small>{snapshot && <button className="danger" onClick={() => void restoreRecovery(slot)}>Restore {slot}</button>}</div>;
+      })}
+      {recoveryStatus && <p className="save-status">{recoveryStatus}</p>}
+    </section>
+    <button className="danger separated" onClick={clearAll}><Trash2 size={18} /> Clear All</button>
     {auditClearStep && <div className="modal-backdrop confirm-backdrop" onClick={() => setAuditClearStep(undefined)}><section className="confirm-modal" onClick={(event) => event.stopPropagation()}><div className="section-title"><h2>{auditClearStep === 1 ? "Clear response audits?" : "Clear them permanently?"}</h2><button className="icon-button" onClick={() => setAuditClearStep(undefined)} aria-label="Cancel"><X size={18} /></button></div>{auditClearStep === 1 ? <p>This removes {formatByteSize(auditStorage.bytes)} of stored audit snapshots from {auditStorage.messages} assistant response{auditStorage.messages === 1 ? "" : "s"}. Messages, tool results, memories, inventory updates, and all other data stay intact.</p> : <p>This is the final confirmation. The audit details cannot be recovered unless they exist in a backup.</p>}<div className="split-actions">{auditClearStep === 1 ? <button className="danger" onClick={() => setAuditClearStep(2)}>Continue</button> : <button className="danger" onClick={() => void clearAudits()}><Trash2 size={17} /> Clear audits</button>}<button onClick={() => setAuditClearStep(undefined)}>Cancel</button></div></section></div>}
   </>;
 }

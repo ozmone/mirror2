@@ -99,7 +99,6 @@ export interface Project extends Timestamped {
   memoryMode: MemoryMode;
   memoryInstruction: string;
   selectedModelId?: string;
-  locked: boolean;
   inventoryEnabled: boolean;
   gearEnabled: boolean;
   deltaEnabled?: boolean;
@@ -116,6 +115,7 @@ export interface Project extends Timestamped {
 export interface Chat extends Timestamped {
   projectId: string;
   title: string;
+  pinned?: boolean;
   titleState: "manual" | "pending" | "generated" | "fallback";
   modelId?: string;
   activeBranchId: string;

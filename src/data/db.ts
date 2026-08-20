@@ -379,6 +379,70 @@ export class MirrorDatabase extends Dexie {
       deltaEffects: "id, [projectId+polarity], projectId, polarity, updatedAt",
       deltaIcons: "id, [projectId+name], projectId, name, updatedAt"
     });
+    this.version(14).stores({
+      settings: "id",
+      projects: "id, orderIndex, pinned, locked, updatedAt",
+      chats: "id, [projectId+updatedAt], projectId, activeBranchId, archived, pinned",
+      branches: "id, chatId, rootMessageId",
+      messages: "id, [chatId+branchId+sequence], chatId, branchId, parentMessageId, sequence, starred",
+      stars: "id, [projectId+updatedAt], messageId, chatId",
+      archives: "id, [projectId+updatedAt], projectId",
+      archiveEntries: "id, [archiveId+orderIndex], archiveId",
+      attachments: "id, [ownerType+ownerId]",
+      characters: "id, [projectId+normalisedName], [projectId+orderIndex], projectId",
+      characterBonuses: "id, characterId, stat",
+      characterGearSlots: "id, [characterId+slot], characterId, slot",
+      characterActionSlots: "id, [characterId+orderIndex], characterId, orderIndex",
+      characterActionMacros: "id, [slotId+parentId+orderIndex], slotId, parentId, orderIndex",
+      memories: "id, [projectId+updatedAt], projectId, *normalisedTags, archived",
+      pendingMemories: "id, projectId, updatedAt",
+      modelLibrary: "id, modelId, orderIndex",
+      migrationMetadata: "id, schemaVersion",
+      sourceFiles: "id, [projectId+updatedAt], projectId",
+      inventoryItems: "id, [chatId+kind+normalisedName], chatId, projectId, kind, updatedAt",
+      inventoryLogs: "id, [chatId+updatedAt], chatId, projectId",
+      deltaSessions: "id, [chatId+updatedAt], chatId, projectId, active",
+      deltaMessages: "id, [sessionId+sequence], sessionId, sequence",
+      deltaEntities: "id, [sessionId+orderIndex], sessionId, orderIndex",
+      deltaAllyCache: "id, [chatId+updatedAt], chatId, name",
+      deltaActionMacros: "id, [chatId+parentId+orderIndex], chatId, parentId, orderIndex",
+      deltaEffects: "id, [projectId+polarity], projectId, polarity, updatedAt",
+      deltaIcons: "id, [projectId+name], projectId, name, updatedAt"
+    });
+    this.version(15).stores({
+      settings: "id",
+      projects: "id, orderIndex, pinned, locked, updatedAt",
+      chats: "id, [projectId+updatedAt], projectId, activeBranchId, archived, pinned",
+      branches: "id, chatId, rootMessageId",
+      messages: "id, [chatId+branchId+sequence], chatId, branchId, parentMessageId, sequence, starred",
+      stars: "id, [projectId+updatedAt], messageId, chatId",
+      archives: "id, [projectId+updatedAt], projectId",
+      archiveEntries: "id, [archiveId+orderIndex], archiveId",
+      attachments: "id, [ownerType+ownerId]",
+      characters: "id, [projectId+normalisedName], [projectId+orderIndex], projectId",
+      characterBonuses: "id, characterId, stat",
+      characterGearSlots: "id, [characterId+slot], characterId, slot",
+      characterActionSlots: "id, [characterId+orderIndex], characterId, orderIndex",
+      characterActionMacros: "id, [slotId+parentId+orderIndex], slotId, parentId, orderIndex",
+      memories: "id, [projectId+updatedAt], projectId, *normalisedTags, archived",
+      pendingMemories: "id, projectId, updatedAt",
+      modelLibrary: "id, modelId, orderIndex",
+      migrationMetadata: "id, schemaVersion",
+      sourceFiles: "id, [projectId+updatedAt], projectId",
+      inventoryItems: "id, [chatId+kind+normalisedName], chatId, projectId, kind, updatedAt",
+      inventoryLogs: "id, [chatId+updatedAt], chatId, projectId",
+      deltaSessions: "id, [chatId+updatedAt], chatId, projectId, active",
+      deltaMessages: "id, [sessionId+sequence], sessionId, sequence",
+      deltaEntities: "id, [sessionId+orderIndex], sessionId, orderIndex",
+      deltaAllyCache: "id, [chatId+updatedAt], chatId, name",
+      deltaActionMacros: "id, [chatId+parentId+orderIndex], chatId, parentId, orderIndex",
+      deltaEffects: "id, [projectId+polarity], projectId, polarity, updatedAt",
+      deltaIcons: "id, [projectId+name], projectId, name, updatedAt"
+    }).upgrade(async (transaction) => {
+      // Existing installs predate live replies being the default. Promote them so a
+      // provider's full completion never has to finish before the UI can update.
+      await transaction.table("settings").update("settings", { streamingEnabled: true, updatedAt: Date.now() });
+    });
   }
 }
 
