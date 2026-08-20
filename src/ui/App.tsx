@@ -3471,9 +3471,17 @@ function VirtualMessageList({
   const listRef = useRef<VariableSizeList<VirtualMessageListData>>(null);
   const listOuterRef = useRef<HTMLDivElement>(null);
   const rowHeights = useRef(new Map<string, number>());
+  const pendingResetIndex = useRef<number>();
+  const resizeFrame = useRef<number>();
   const [height, setHeight] = useState(0);
   const staysAtBottom = useRef(true);
   const lastMessage = messages[messages.length - 1];
+
+  useEffect(() => {
+    return () => {
+      if (resizeFrame.current !== undefined) window.cancelAnimationFrame(resizeFrame.current);
+    };
+  }, []);
 
   useLayoutEffect(() => {
     const element = hostRef.current;
@@ -3486,6 +3494,9 @@ function VirtualMessageList({
   }, []);
 
   useEffect(() => {
+    if (resizeFrame.current !== undefined) window.cancelAnimationFrame(resizeFrame.current);
+    resizeFrame.current = undefined;
+    pendingResetIndex.current = undefined;
     rowHeights.current.clear();
     listRef.current?.resetAfterIndex(0, true);
     staysAtBottom.current = true;
@@ -3504,7 +3515,14 @@ function VirtualMessageList({
     if (roundedHeight <= 0) return;
     if (rowHeights.current.get(messageId) === roundedHeight) return;
     rowHeights.current.set(messageId, roundedHeight);
-    listRef.current?.resetAfterIndex(index, true);
+    pendingResetIndex.current = pendingResetIndex.current === undefined ? index : Math.min(pendingResetIndex.current, index);
+    if (resizeFrame.current !== undefined) return;
+    resizeFrame.current = window.requestAnimationFrame(() => {
+      const resetIndex = pendingResetIndex.current;
+      resizeFrame.current = undefined;
+      pendingResetIndex.current = undefined;
+      if (resetIndex !== undefined) listRef.current?.resetAfterIndex(resetIndex, true);
+    });
   }, []);
   const itemData = useMemo<VirtualMessageListData>(() => ({
     projectId, messages, expandedMessageId, onExpand, onEdit, onResend, onInventoryUpdateAction,

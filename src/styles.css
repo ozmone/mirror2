@@ -904,6 +904,11 @@ button:has(.lucide-save):hover:not(:disabled),
   padding-bottom: var(--message-gap);
 }
 
+.message-list.virtualized .message-meta {
+  position: static;
+  margin-top: 8px;
+}
+
 .message {
   width: var(--entry-width);
   max-width: 100%;
