@@ -74,6 +74,14 @@ import { Ability, AbilityModifiers, AbilityScores, AppSettings, BubbleMode, Char
 import { estimateTokens, formatDate, normaliseTag, now, splitTags, uid } from "../utils";
 import { ProjectIcon, projectIcons } from "./icons";
 import { GearDrawer } from "./gear/GearDrawer";
+import { DeltaActionTree } from "./delta/DeltaActionTree";
+import { DeltaVerifiedRollRow } from "./delta/DeltaVerifiedRollRow";
+import { MarkdownText } from "./shared/MarkdownText";
+import { LoadingSignal } from "./shared/LoadingSignal";
+import { HpSquares } from "./shared/HpSquares";
+import { DeltaTurnText, cinematicMarker, cleanDeltaCinematic, deltaRevealLines, deltaRevealStepMs, splitDeltaCinematic } from "./delta/DeltaTurnText";
+import { deltaRelationshipLabel, deltaRelationships, entityDisplayNames, formatEntityNameList, normaliseDeltaRelationship, type DeltaRelationship } from "./delta/display";
+import { DeltaMapPrototype, deltaMapPreviewSizes } from "./delta/DeltaMapPrototype";
 
 const accents = [
   { name: "sage", value: "#8fbea8" },
@@ -433,33 +441,6 @@ function extractMemoryConcepts(parts: string[], limit = 16) {
     .map(([word]) => word);
 }
 
-function entityDisplayNames(entities: DeltaEntity[]) {
-  return new Map(entities.map((entity) => [entity.id, entity.name]));
-}
-
-function formatEntityNameList(names: string[]) {
-  if (names.length <= 1) return names[0] ?? "";
-  if (names.length === 2) return `${names[0]} and ${names[1]}`;
-  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
-}
-
-type DeltaRelationship = DeltaEntity["side"];
-
-const deltaRelationships: DeltaRelationship[] = ["ally", "neutral", "hostile"];
-
-function normaliseDeltaRelationship(value: string): DeltaRelationship {
-  if (value === "ally" || value === "neutral" || value === "hostile") return value;
-  if (value === "party") return "ally";
-  if (value === "opposition") return "hostile";
-  return "neutral";
-}
-
-function deltaRelationshipLabel(value: DeltaRelationship) {
-  if (value === "ally") return "Ally";
-  if (value === "hostile") return "Hostile";
-  return "Neutral";
-}
-
 function cleanDeltaToolCallText(text: string) {
   return text
     .split("\n")
@@ -539,16 +520,6 @@ function deltaRollResultText(die: number, results: number[], modifier: number) {
   return { text: `${diceLabel} = ${diceMath}${modifierMath} = ${total}`, total };
 }
 
-function HpSquares({ current, max, relationship, character = false }: { current: number; max: number; relationship?: DeltaRelationship; character?: boolean }) {
-  const total = Math.max(1, Math.floor(max));
-  const filled = Math.max(0, Math.min(total, Math.floor(current)));
-  return (
-    <span className={`hp-squares ${character ? "character" : relationship ?? "ally"}`} aria-label={`${filled} of ${total} HP`}>
-      {Array.from({ length: total }, (_, index) => <i className={index < filled ? "filled" : ""} key={index} />)}
-    </span>
-  );
-}
-
 function deltaEntityStats(entity: DeltaEntity) {
   return [
     ["STR", entity.str],
@@ -558,84 +529,6 @@ function deltaEntityStats(entity: DeltaEntity) {
     ["WIS", entity.wis],
     ["CHA", entity.cha]
   ] as const;
-}
-
-const deltaMapPreviewSizes = {
-  S: { metres: 30, cells: 6 },
-  M: { metres: 50, cells: 10 },
-  L: { metres: 80, cells: 16 },
-  XL: { metres: 100, cells: 20 },
-  XXL: { metres: 200, cells: 40 }
-} as const;
-
-function DeltaMapPrototype({ entities, tiles, size }: { entities: DeltaEntity[]; tiles: DeltaMapTile[]; size: DeltaMapSize }) {
-  const { metres, cells } = deltaMapPreviewSizes[size];
-  const mapGridWidth = 20 + cells * 22 + Math.max(0, cells - 1);
-  const [selectedCell, setSelectedCell] = useState<{ row: number; column: number }>();
-  const tilesByCoordinate = new Map(tiles.map((tile) => [`${tile.row}:${tile.column}`, tile]));
-  const entitiesByCoordinate = new Map(entities
-    .filter((entity) => Number.isInteger(entity.mapRow) && Number.isInteger(entity.mapColumn) && (entity.mapRow ?? 0) >= 1 && (entity.mapRow ?? 0) <= cells && (entity.mapColumn ?? 0) >= 1 && (entity.mapColumn ?? 0) <= cells)
-    .map((entity) => [`${entity.mapRow}:${entity.mapColumn}`, entity]));
-  const displayNames = entityDisplayNames(entities);
-  const selectedTile = selectedCell ? tilesByCoordinate.get(`${selectedCell.row}:${selectedCell.column}`) : undefined;
-  const columns = Array.from({ length: cells }, (_, index) => String.fromCharCode(65 + (index % 26)));
-  const selectedCoordinate = selectedCell ? `${columns[selectedCell.column - 1]}${selectedCell.row}` : "";
-  const selectedTitle = selectedTile
-    ? selectedTile.kind === "access"
-      ? `${selectedTile.accessState === "locked" ? "Locked" : selectedTile.accessState === "open" ? "Open" : "Closed"} access`
-      : selectedTile.kind === "special"
-        ? selectedTile.label || "Special terrain"
-        : selectedTile.kind === "half"
-          ? selectedTile.label || "Half terrain"
-          : selectedTile.label || "Solid terrain"
-    : "Open tile";
-  return (
-    <div className="delta-map-prototype" style={{ "--map-grid-width": `${mapGridWidth}px` } as React.CSSProperties}>
-      <div className="delta-map-header">
-        <div>
-          <h2>Map</h2>
-          <small>{size} / {metres}m</small>
-        </div>
-      </div>
-      <div className="delta-map-viewport">
-        <div className="delta-map-corner" />
-        <div className="delta-map-columns" style={{ gridTemplateColumns: `repeat(${cells}, var(--map-cell-size))` }}>
-          {columns.map((column) => <span key={column}>{column}</span>)}
-        </div>
-        <div className="delta-map-rows">
-          {Array.from({ length: cells }, (_, index) => <span key={index}>{index + 1}</span>)}
-        </div>
-        <div className="delta-map-grid" style={{ gridTemplateColumns: `repeat(${cells}, var(--map-cell-size))` }}>
-          {Array.from({ length: cells * cells }, (_, index) => {
-            const row = Math.floor(index / cells) + 1;
-            const column = (index % cells) + 1;
-            const tile = tilesByCoordinate.get(`${row}:${column}`);
-            const entity = entitiesByCoordinate.get(`${row}:${column}`);
-            const relationship = entity ? normaliseDeltaRelationship(entity.side) : "";
-            const className = `delta-map-cell ${tile?.kind ?? "open"} ${relationship}${tile?.kind === "access" ? ` ${tile.accessState ?? "closed"}` : ""}${selectedCell?.row === row && selectedCell.column === column ? " selected" : ""}`;
-            const style = tile?.kind === "special" && tile.color ? { "--terrain-color": tile.color } as React.CSSProperties : undefined;
-            const title = entity ? displayNames.get(entity.id) ?? entity.name : tile?.label || (tile?.kind === "access" ? `${tile.accessState ?? "closed"} access` : tile?.kind ?? "open");
-            return <button className={className} style={style} key={`${row}:${column}`} type="button" onClick={() => setSelectedCell({ row, column })} title={title}>{entity && <i>{(displayNames.get(entity.id) ?? entity.name).slice(0, 1).toUpperCase()}</i>}</button>;
-          })}
-        </div>
-      </div>
-      {selectedCell && <div className="delta-map-tile-detail">
-        <small>{selectedCoordinate}</small>
-        <strong>{selectedTitle}</strong>
-        {selectedTile?.label && selectedTile.kind !== "special" && <span>{selectedTile.label}</span>}
-        {selectedTile?.kind === "special" && <span>Special terrain{selectedTile.color ? ` - ${selectedTile.color}` : ""}</span>}
-      </div>}
-      <div className="delta-map-key" aria-label="Map preview key">
-        <span><i className="open" /> Open</span>
-        <span><i className="solid" /> Solid</span>
-        <span><i className="half" /> Half</span>
-        <span><i className="special" /> Special</span>
-        <span><i className="access closed" /> Closed access</span>
-        <span><i className="access open" /> Open access</span>
-        <span><i className="access locked" /> Locked access</span>
-      </div>
-    </div>
-  );
 }
 
 function fitComposerTextarea(textarea: HTMLTextAreaElement | null) {
@@ -884,127 +777,6 @@ async function chatFileContext(files: File[]) {
   if (oversized) throw new Error(`${oversized.name} is too large to include in one chat reply. Keep attached text files under 1 MB.`);
   const contents = await Promise.all(files.map(async (file) => `# Attached file: ${file.name}\n${await file.text()}`));
   return `Attached files for this reply:\n${contents.join("\n\n")}`;
-}
-
-function renderInlineMarkdown(text: string, inventoryMarkers = false) {
-  const nodes: React.ReactNode[] = [];
-  const pattern = /(\(\(.+?\)\)|\*\*\*.+?\*\*\*|\*\*.+?\*\*|\*[^*\n]+?\*|\[i\])/g;
-  let lastIndex = 0;
-  let match: RegExpExecArray | null;
-  while ((match = pattern.exec(text))) {
-    if (match.index > lastIndex) nodes.push(text.slice(lastIndex, match.index));
-    const token = match[0];
-    const key = `${match.index}-${token}`;
-    if (token.startsWith("((") && token.endsWith("))")) {
-      nodes.push(<span className="md-ooc" key={key}>{token.slice(2, -2)}</span>);
-    } else if (token === "[i]") {
-      nodes.push(inventoryMarkers ? <span className="md-inventory-marker" key={key}>[i]</span> : token);
-    } else if (token.startsWith("***") && token.endsWith("***")) {
-      nodes.push(<strong key={key}><em>{token.slice(3, -3)}</em></strong>);
-    } else if (token.startsWith("**") && token.endsWith("**")) {
-      nodes.push(<strong key={key}>{token.slice(2, -2)}</strong>);
-    } else if (token.startsWith("*") && token.endsWith("*")) {
-      nodes.push(<em key={key}>{token.slice(1, -1)}</em>);
-    }
-    lastIndex = pattern.lastIndex;
-  }
-  if (lastIndex < text.length) nodes.push(text.slice(lastIndex));
-  return nodes;
-}
-
-const MarkdownText = memo(function MarkdownText({ text, emptyText, inventoryMarkers }: { text: string; emptyText?: string; inventoryMarkers?: boolean }) {
-  const source = text || emptyText || "";
-  if (!source) return null;
-  return (
-    <div className="markdown-text">
-      {source.split(/\r?\n/).map((line, index) => {
-        if (/^\s*---\s*$/.test(line)) return <hr key={index} />;
-        const quote = /^(>{1,3})\s*(.*)$/.exec(line);
-        if (quote) {
-          const depth = quote[1].length;
-          return <blockquote className={`md-quote depth-${depth}`} key={index}>{quote[2] ? renderInlineMarkdown(quote[2], inventoryMarkers) : "\u00a0"}</blockquote>;
-        }
-        const header = /^(#{1,3})\s+(.+)$/.exec(line);
-        if (header) {
-          const level = header[1].length;
-          const Tag = (`h${level}` as "h1" | "h2" | "h3");
-          return <Tag key={index}>{renderInlineMarkdown(header[2], inventoryMarkers)}</Tag>;
-        }
-        return <p key={index}>{line ? renderInlineMarkdown(line, inventoryMarkers) : "\u00a0"}</p>;
-      })}
-    </div>
-  );
-});
-
-function LoadingSignal() {
-  return <div className="lds-ellipsis" aria-label="Thinking" role="status"><div /><div /><div /><div /></div>;
-}
-
-const deltaRevealSpeedsMs = [1400, 1200, 1000, 850, 720, 600, 480, 360, 260, 180] as const;
-
-function deltaRevealStepMs(speed?: number) {
-  const index = Math.max(0, Math.min(deltaRevealSpeedsMs.length - 1, Math.round(speed ?? 5) - 1));
-  return deltaRevealSpeedsMs[index];
-}
-
-function deltaRevealLines(text: string) {
-  return text
-    .split(/\r?\n/)
-    .flatMap((line) => line.trim().split(/(?<=[.!?])\s+(?=["'“‘(*A-Z0-9])/))
-    .filter((line) => line.trim().length > 0 && !/^---+$/.test(line.trim()));
-}
-
-function DeltaTurnText({
-  text,
-  animate = false,
-  startDelayMs = 0,
-  stepMs = deltaRevealStepMs(),
-  onReveal
-}: {
-  text: string;
-  animate?: boolean;
-  startDelayMs?: number;
-  stepMs?: number;
-  onReveal?: () => void;
-}) {
-  const lines = deltaRevealLines(text);
-  const [visibleLineCount, setVisibleLineCount] = useState(animate ? 0 : lines.length);
-  useEffect(() => {
-    if (!animate) {
-      setVisibleLineCount(lines.length);
-      return;
-    }
-    setVisibleLineCount(0);
-    const timers = lines.map((_, index) => window.setTimeout(() => {
-      setVisibleLineCount(index + 1);
-      onReveal?.();
-    }, startDelayMs + index * stepMs));
-    return () => timers.forEach((timer) => window.clearTimeout(timer));
-  }, [text]);
-  return (
-    <div className="delta-turn-lines">
-      {lines.slice(0, visibleLineCount).map((line, index) => (
-        <div className="delta-turn-line" key={`${index}:${line}`}>
-          <MarkdownText text={line} emptyText=" " inventoryMarkers />
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function cinematicMarker() {
-  return "\ud83c\udf9e\ufe0f";
-}
-
-function cleanDeltaCinematic(text: string) {
-  return text.replace(/^\ud83c\udf9e\ufe0f\s*/, "");
-}
-
-function splitDeltaCinematic(text: string) {
-  const lines = text.split(/\r?\n/);
-  const cinematic: string[] = [];
-  while (lines[0]?.trim().startsWith(cinematicMarker())) cinematic.push(lines.shift() ?? "");
-  return { cinematic: cinematic.map(cleanDeltaCinematic).join("\n").trim(), turn: lines.join("\n").trim() };
 }
 
 type OpenRouterMessage = {
@@ -2083,82 +1855,6 @@ function InventoryItemRow({ item, onRefresh }: { item: InventoryItem; onRefresh:
         </div>
       )}
     </div>
-  );
-}
-
-function DeltaVerifiedRollRow({
-  message,
-  relationship,
-  expanded,
-  onToggle,
-  animate = false,
-  revealDelayMs = 0,
-  onReveal
-}: {
-  message: DeltaMessage;
-  relationship: "ally" | "neutral" | "hostile";
-  expanded: boolean;
-  onToggle: () => void;
-  animate?: boolean;
-  revealDelayMs?: number;
-  onReveal?: () => void;
-}) {
-  const receipt = message.rollReceipt;
-  const [visible, setVisible] = useState(!animate);
-  useEffect(() => {
-    if (!animate) {
-      setVisible(true);
-      return;
-    }
-    setVisible(false);
-    const timer = window.setTimeout(() => {
-      setVisible(true);
-      onReveal?.();
-    }, revealDelayMs);
-    return () => window.clearTimeout(timer);
-  }, [message.id]);
-  if (!receipt) return null;
-  if (!visible) return null;
-  const toolArguments = {
-    die: receipt.die,
-    count: receipt.count,
-    label: receipt.label,
-    rollerName: receipt.rollerName,
-    ability: receipt.ability ?? "NONE"
-  };
-  return (
-    <article className={`delta-log-row delta-roll-event ${relationship}`}>
-      <span className="delta-log-number delta-roll-marker" aria-label="App-generated dice roll">🎲</span>
-      <div className="delta-roll-event-content">
-        <button type="button" className="delta-roll-summary" onClick={onToggle} aria-expanded={expanded} aria-label={`${message.body}. Show client roll receipt`}>
-          <span>{message.body}</span>
-        </button>
-        {expanded && (
-          <div className="delta-roll-audit">
-            <div className="delta-roll-audit-heading"><strong>Client roll receipt</strong><span>{receipt.id}</span></div>
-            <dl>
-              <div><dt>Tool</dt><dd>{receipt.toolName}</dd></div>
-              <div><dt>Request</dt><dd><code>{JSON.stringify(toolArguments)}</code></dd></div>
-              <div><dt>Generator</dt><dd>{receipt.generator}</dd></div>
-              <div><dt>Method</dt><dd>{receipt.algorithm}</dd></div>
-              <div><dt>Accepted uint32</dt><dd>{receipt.rawValues.join(", ")}</dd></div>
-              <div><dt>Raw dice</dt><dd>{receipt.results.join(", ")}</dd></div>
-              {receipt.ability && <div><dt>Stat modifier</dt><dd>{receipt.ability} {receipt.modifier !== undefined && receipt.modifier >= 0 ? "+" : ""}{receipt.modifier ?? 0}</dd></div>}
-              {receipt.total !== undefined && <div><dt>Total</dt><dd>{receipt.total}</dd></div>}
-              <div><dt>Generated</dt><dd>{new Date(receipt.generatedAt).toLocaleString()}</dd></div>
-              {receipt.hpApplications?.map((application) => (
-                <div key={`${application.entityId}:${application.appliedAt}`}>
-                  <dt>HP applied</dt>
-                  <dd>{application.entityName}: {application.beforeHp} - {application.amount} = {application.afterHp}</dd>
-                </div>
-              ))}
-            </dl>
-            <pre>{`crypto.getRandomValues(uint32)\nlimit = 2^32 - (2^32 % ${receipt.die})\naccept only uint32 < limit\nresult = (uint32 % ${receipt.die}) + 1`}</pre>
-            <p>This receipt was created by the client at the same point the random values were generated. It was not parsed from AI-written text.</p>
-          </div>
-        )}
-      </div>
-    </article>
   );
 }
 
@@ -4695,74 +4391,6 @@ function DeltaModeWorkspace({
           </section>
         </div>
       )}
-    </div>
-  );
-}
-
-function DeltaActionTree({
-  macros,
-  parentId,
-  editMode,
-  onChoose,
-  onAdd,
-  onEdit,
-  onDelete
-}: {
-  macros: CharacterActionMacro[];
-  parentId?: string;
-  editMode: boolean;
-  onChoose: (macro: CharacterActionMacro) => void;
-  onAdd: (parentId: string | undefined, folder: boolean) => void;
-  onEdit: (macro: CharacterActionMacro) => void;
-  onDelete: (macro: CharacterActionMacro) => void;
-}) {
-  const [openIds, setOpenIds] = useState<Set<string>>(new Set());
-  const children = macros.filter((macro) => macro.parentId === parentId).sort((a, b) => a.orderIndex - b.orderIndex);
-  if (children.length === 0) return null;
-  return (
-    <div className="delta-action-tree">
-      {children.map((macro) => {
-        const isMenu = macro.template === undefined;
-        const open = openIds.has(macro.id);
-        return (
-          <div className="delta-action-node" key={macro.id}>
-            <div className="delta-action-row">
-              <button
-                type="button"
-                onClick={() => {
-                  if (!isMenu) {
-                    onChoose(macro);
-                    return;
-                  }
-                  setOpenIds((current) => {
-                    const next = new Set(current);
-                    if (next.has(macro.id)) next.delete(macro.id);
-                    else next.add(macro.id);
-                    return next;
-                  });
-                }}
-              >
-                {isMenu ? (open ? "v " : "> ") : ""}{macro.label}
-              </button>
-              {editMode && isMenu && <button type="button" onClick={() => onAdd(macro.id, true)}>+ Menu</button>}
-              {editMode && isMenu && <button type="button" onClick={() => onAdd(macro.id, false)}>+ Action</button>}
-              {editMode && <button type="button" onClick={() => onEdit(macro)}>Edit</button>}
-              {editMode && <button type="button" onClick={() => onDelete(macro)}>-</button>}
-            </div>
-            {isMenu && open && (
-              <DeltaActionTree
-                macros={macros}
-                parentId={macro.id}
-                editMode={editMode}
-                onChoose={onChoose}
-                onAdd={onAdd}
-                onEdit={onEdit}
-                onDelete={onDelete}
-              />
-            )}
-          </div>
-        );
-      })}
     </div>
   );
 }
