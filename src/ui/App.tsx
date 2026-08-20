@@ -1,6 +1,7 @@
 ﻿import type React from "react";
-import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { VariableSizeList, type ListChildComponentProps } from "react-window";
 import Dexie from "dexie";
 import {
   Archive,
@@ -69,7 +70,7 @@ import {
   validatePointBuy
 } from "../data/repositories";
 import { defaultDeltaBases, defaultDeltaJobs, defaultDeltaNpcStats, defaultDeltaPrefixes, defaultDeltaSystemPrompt, effectiveDeltaSystemPrompt, defaultMemoryInstruction, defaultSettings } from "../data/defaults";
-import { Ability, AbilityModifiers, AbilityScores, AppSettings, Character, CharacterActionMacro, CharacterActionSlot, CharacterBonus, CharacterGearSlot, Chat, DeltaAllyCacheEntry, DeltaBaseTemplate, DeltaBriefRoster, DeltaEffectDefinition, DeltaEffectPolarity, DeltaEntity, DeltaFinishPacket, DeltaIconAsset, DeltaJobTemplate, DeltaLootItem, DeltaMapSize, DeltaMapTile, DeltaMapTileKind, DeltaMessage, DeltaPrefixTemplate, DeltaRollReceipt, DeltaSavingThrowTiming, DeltaSession, GearBodyType, InventoryKind, InventoryItem, InventoryLog, InventoryUpdateRequest, MainChatAuditToolEvent, MainChatMemoryReviewAudit, MainChatRequestAudit, Memory, Message, PendingMemory, Project, RouteName } from "../types";
+import { Ability, AbilityModifiers, AbilityScores, AppSettings, BubbleMode, Character, CharacterActionMacro, CharacterActionSlot, CharacterBonus, CharacterGearSlot, Chat, DeltaAllyCacheEntry, DeltaBaseTemplate, DeltaBriefRoster, DeltaEffectDefinition, DeltaEffectPolarity, DeltaEntity, DeltaFinishPacket, DeltaIconAsset, DeltaJobTemplate, DeltaLootItem, DeltaMapSize, DeltaMapTile, DeltaMapTileKind, DeltaMessage, DeltaPrefixTemplate, DeltaRollReceipt, DeltaSavingThrowTiming, DeltaSession, GearBodyType, InventoryKind, InventoryItem, InventoryLog, InventoryUpdateRequest, MainChatAuditToolEvent, MainChatMemoryReviewAudit, MainChatRequestAudit, Memory, Message, PendingMemory, Project, RouteName } from "../types";
 import { estimateTokens, formatDate, normaliseTag, now, splitTags, uid } from "../utils";
 import { ProjectIcon, projectIcons } from "./icons";
 import { GearDrawer } from "./gear/GearDrawer";
@@ -6569,25 +6570,22 @@ function ChatScreen({
   return (
     <div className="chat-screen">
       {!chat && messages.length === 0 && <EmptyState title="Ready when you are" body="Start a new project chat from the composer." />}
-      <div className={`message-list ${settings.bubbleMode === "minimal" ? "minimal" : "bubbles"}`}>
-        {messages.map((message) => (
-          <MemoMessageRow
-            key={message.id}
-            projectId={project.id}
-            message={message}
-            expanded={expandedMessageId === message.id}
-            onExpand={toggleExpandedMessage}
-            onEdit={editMessageStable}
-            onResend={resendFromMessageStable}
-            onInventoryUpdateAction={inventoryUpdateActionStable}
-            onBeginDeltaBrief={beginDeltaBriefStable}
-            onAvoidDeltaBrief={avoidDeltaBriefStable}
-            deltaLocked={deltaLocked}
-            onOpenChatSettings={openChatSettingsStable}
-            onRefresh={onRefreshStable}
-          />
-        ))}
-      </div>
+      <VirtualMessageList
+        projectId={project.id}
+        messages={messages}
+        bubbleMode={settings.bubbleMode}
+        expandedMessageId={expandedMessageId}
+        onExpand={toggleExpandedMessage}
+        onEdit={editMessageStable}
+        onResend={resendFromMessageStable}
+        onInventoryUpdateAction={inventoryUpdateActionStable}
+        onBeginDeltaBrief={beginDeltaBriefStable}
+        onAvoidDeltaBrief={avoidDeltaBriefStable}
+        deltaLocked={deltaLocked}
+        onOpenChatSettings={openChatSettingsStable}
+        onRefresh={onRefreshStable}
+        chatId={chat?.id}
+      />
       <section className={`composer ${deltaLocked ? "locked" : ""}`}>
         {deltaLocked && <div className="composer-lock">Resolve engagement to unlock chat.</div>}
         {contextOpen && (
@@ -6982,6 +6980,137 @@ const MemoMessageRow = memo(MessageRow, (previous, next) => {
     a.updatedAt === b.updatedAt
   );
 });
+
+type VirtualMessageListData = {
+  projectId: string;
+  messages: Message[];
+  expandedMessageId?: string;
+  onExpand: (messageId: string) => void;
+  onEdit: (message: Message, nextBody: string) => Promise<Message>;
+  onResend: (message: Message) => Promise<void>;
+  onInventoryUpdateAction: (message: Message, action: "confirm" | "edit" | "reject") => Promise<void>;
+  onBeginDeltaBrief: (message: Message) => Promise<void>;
+  onAvoidDeltaBrief: (message: Message, attempt: string) => Promise<void>;
+  deltaLocked: boolean;
+  onOpenChatSettings: () => void;
+  onRefresh: () => Promise<void>;
+  onSize: (index: number, messageId: string, height: number) => void;
+};
+
+function VirtualMessageListRow({ index, style, data }: ListChildComponentProps<VirtualMessageListData>) {
+  const message = data.messages[index];
+  const rowRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const element = rowRef.current;
+    if (!element) return;
+    const reportSize = () => data.onSize(index, message.id, element.getBoundingClientRect().height);
+    reportSize();
+    const observer = new ResizeObserver(reportSize);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [data, index, message.id, message.updatedAt]);
+  return (
+    <div ref={rowRef} style={style} className="virtual-message-row">
+      <MemoMessageRow
+        projectId={data.projectId}
+        message={message}
+        expanded={data.expandedMessageId === message.id}
+        onExpand={data.onExpand}
+        onEdit={data.onEdit}
+        onResend={data.onResend}
+        onInventoryUpdateAction={data.onInventoryUpdateAction}
+        onBeginDeltaBrief={data.onBeginDeltaBrief}
+        onAvoidDeltaBrief={data.onAvoidDeltaBrief}
+        deltaLocked={data.deltaLocked}
+        onOpenChatSettings={data.onOpenChatSettings}
+        onRefresh={data.onRefresh}
+      />
+    </div>
+  );
+}
+
+function VirtualMessageList({
+  projectId,
+  messages,
+  bubbleMode,
+  expandedMessageId,
+  onExpand,
+  onEdit,
+  onResend,
+  onInventoryUpdateAction,
+  onBeginDeltaBrief,
+  onAvoidDeltaBrief,
+  deltaLocked,
+  onOpenChatSettings,
+  onRefresh,
+  chatId
+}: Omit<VirtualMessageListData, "onSize"> & { bubbleMode: BubbleMode; chatId?: string }) {
+  const hostRef = useRef<HTMLDivElement>(null);
+  const listRef = useRef<VariableSizeList<VirtualMessageListData>>(null);
+  const listOuterRef = useRef<HTMLDivElement>(null);
+  const rowHeights = useRef(new Map<string, number>());
+  const [height, setHeight] = useState(0);
+  const staysAtBottom = useRef(true);
+  const lastMessage = messages[messages.length - 1];
+
+  useLayoutEffect(() => {
+    const element = hostRef.current;
+    if (!element) return;
+    const updateHeight = () => setHeight(Math.floor(element.getBoundingClientRect().height));
+    updateHeight();
+    const observer = new ResizeObserver(updateHeight);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    rowHeights.current.clear();
+    listRef.current?.resetAfterIndex(0, true);
+    staysAtBottom.current = true;
+    const frame = window.requestAnimationFrame(() => listRef.current?.scrollToItem(Math.max(0, messages.length - 1), "end"));
+    return () => window.cancelAnimationFrame(frame);
+  }, [chatId]);
+
+  useEffect(() => {
+    if (!lastMessage || !staysAtBottom.current) return;
+    const frame = window.requestAnimationFrame(() => listRef.current?.scrollToItem(messages.length - 1, "end"));
+    return () => window.cancelAnimationFrame(frame);
+  }, [lastMessage?.id, lastMessage?.updatedAt, lastMessage?.body, messages.length]);
+
+  const onSize = useCallback((index: number, messageId: string, nextHeight: number) => {
+    const roundedHeight = Math.ceil(nextHeight);
+    if (rowHeights.current.get(messageId) === roundedHeight) return;
+    rowHeights.current.set(messageId, roundedHeight);
+    listRef.current?.resetAfterIndex(index);
+  }, []);
+  const itemData = useMemo<VirtualMessageListData>(() => ({
+    projectId, messages, expandedMessageId, onExpand, onEdit, onResend, onInventoryUpdateAction,
+    onBeginDeltaBrief, onAvoidDeltaBrief, deltaLocked, onOpenChatSettings, onRefresh, onSize
+  }), [projectId, messages, expandedMessageId, onExpand, onEdit, onResend, onInventoryUpdateAction, onBeginDeltaBrief, onAvoidDeltaBrief, deltaLocked, onOpenChatSettings, onRefresh, onSize]);
+
+  return (
+    <div ref={hostRef} className="virtual-message-list-host">
+      {height > 0 && <VariableSizeList
+        ref={listRef}
+        outerRef={listOuterRef}
+        className={`message-list virtualized ${bubbleMode === "minimal" ? "minimal" : "bubbles"}`}
+        height={height}
+        width="100%"
+        itemCount={messages.length}
+        itemData={itemData}
+        itemKey={(index) => messages[index].id}
+        itemSize={(index) => rowHeights.current.get(messages[index].id) ?? 280}
+        overscanCount={3}
+        onScroll={({ scrollOffset }) => {
+          const element = listOuterRef.current;
+          if (element) staysAtBottom.current = element.scrollHeight - element.clientHeight - scrollOffset < 80;
+        }}
+      >
+        {VirtualMessageListRow}
+      </VariableSizeList>}
+    </div>
+  );
+}
 
 function MessageImageAttachments({ messageId }: { messageId: string }) {
   const [attachments, setAttachments] = useState<{ id: string; url: string; mimeType: string }[]>([]);

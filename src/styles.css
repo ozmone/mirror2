@@ -872,8 +872,13 @@ button:has(.lucide-save):hover:not(:disabled),
 
 .chat-screen {
   height: 100%;
+  min-height: 0;
   display: grid;
   grid-template-rows: 1fr auto;
+}
+
+.virtual-message-list-host {
+  min-height: 0;
 }
 
 .message-list {
@@ -882,6 +887,16 @@ button:has(.lucide-save):hover:not(:disabled),
   display: flex;
   flex-direction: column;
   gap: var(--message-gap);
+}
+
+.message-list.virtualized {
+  display: block;
+  padding: 8px 10px 18px;
+}
+
+.virtual-message-row {
+  box-sizing: border-box;
+  padding-bottom: var(--message-gap);
 }
 
 .message {
