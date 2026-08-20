@@ -892,6 +892,11 @@ button:has(.lucide-save):hover:not(:disabled),
 .message-list.virtualized {
   display: block;
   padding: 8px 10px 18px;
+  overflow-anchor: none;
+}
+
+.virtual-message-slot {
+  box-sizing: border-box;
 }
 
 .virtual-message-row {

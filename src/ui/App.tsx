@@ -3419,32 +3419,34 @@ type VirtualMessageListData = {
 
 function VirtualMessageListRow({ index, style, data }: ListChildComponentProps<VirtualMessageListData>) {
   const message = data.messages[index];
-  const rowRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
-    const element = rowRef.current;
+    const element = contentRef.current;
     if (!element) return;
     const reportSize = () => data.onSize(index, message.id, element.getBoundingClientRect().height);
     reportSize();
     const observer = new ResizeObserver(reportSize);
     observer.observe(element);
     return () => observer.disconnect();
-  }, [data, index, message.id, message.updatedAt]);
+  }, [data.onSize, index, message.id]);
   return (
-    <div ref={rowRef} style={style} className="virtual-message-row">
-      <MemoMessageRow
-        projectId={data.projectId}
-        message={message}
-        expanded={data.expandedMessageId === message.id}
-        onExpand={data.onExpand}
-        onEdit={data.onEdit}
-        onResend={data.onResend}
-        onInventoryUpdateAction={data.onInventoryUpdateAction}
-        onBeginDeltaBrief={data.onBeginDeltaBrief}
-        onAvoidDeltaBrief={data.onAvoidDeltaBrief}
-        deltaLocked={data.deltaLocked}
-        onOpenChatSettings={data.onOpenChatSettings}
-        onRefresh={data.onRefresh}
-      />
+    <div style={style} className="virtual-message-slot">
+      <div ref={contentRef} className="virtual-message-row">
+        <MemoMessageRow
+          projectId={data.projectId}
+          message={message}
+          expanded={data.expandedMessageId === message.id}
+          onExpand={data.onExpand}
+          onEdit={data.onEdit}
+          onResend={data.onResend}
+          onInventoryUpdateAction={data.onInventoryUpdateAction}
+          onBeginDeltaBrief={data.onBeginDeltaBrief}
+          onAvoidDeltaBrief={data.onAvoidDeltaBrief}
+          deltaLocked={data.deltaLocked}
+          onOpenChatSettings={data.onOpenChatSettings}
+          onRefresh={data.onRefresh}
+        />
+      </div>
     </div>
   );
 }
@@ -3499,9 +3501,10 @@ function VirtualMessageList({
 
   const onSize = useCallback((index: number, messageId: string, nextHeight: number) => {
     const roundedHeight = Math.ceil(nextHeight);
+    if (roundedHeight <= 0) return;
     if (rowHeights.current.get(messageId) === roundedHeight) return;
     rowHeights.current.set(messageId, roundedHeight);
-    listRef.current?.resetAfterIndex(index);
+    listRef.current?.resetAfterIndex(index, true);
   }, []);
   const itemData = useMemo<VirtualMessageListData>(() => ({
     projectId, messages, expandedMessageId, onExpand, onEdit, onResend, onInventoryUpdateAction,
