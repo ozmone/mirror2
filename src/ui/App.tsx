@@ -82,6 +82,8 @@ import { HpSquares } from "./shared/HpSquares";
 import { DeltaTurnText, cinematicMarker, cleanDeltaCinematic, deltaRevealLines, deltaRevealStepMs, splitDeltaCinematic } from "./delta/DeltaTurnText";
 import { deltaRelationshipLabel, deltaRelationships, entityDisplayNames, formatEntityNameList, normaliseDeltaRelationship, type DeltaRelationship } from "./delta/display";
 import { DeltaMapPrototype, deltaMapPreviewSizes } from "./delta/DeltaMapPrototype";
+import { deltaEntityStats, deltaRollAbilities, deltaRollModifier, deltaRollResultText, type DeltaRollAbility, statModifier } from "./delta/stats";
+import { deltaDiceImages, isDeltaModeRequest, normaliseDeltaMapSize } from "./delta/config";
 
 const accents = [
   { name: "sage", value: "#8fbea8" },
@@ -285,21 +287,6 @@ function jobCategories(jobs: DeltaJobTemplate[]) {
   return Array.from(counts.entries()).sort((a, b) => a[0].localeCompare(b[0]));
 }
 
-function isDeltaModeRequest(text: string) {
-  const clean = text.toLowerCase();
-  return /\bdelta(?:\s+mode)?\b/.test(clean) && /\b(open|start|switch|enter|launch|run(?:ning)?|test(?:ing)?|try|use|begin|engage|engagement)\b/.test(clean);
-}
-
-const deltaDiceImages: Record<number, string> = {
-  4: "dice/d4.png",
-  6: "dice/d6.png",
-  8: "dice/d8.png",
-  9: "dice/d9.png",
-  12: "dice/d12.png",
-  20: "dice/d20.png",
-  100: "dice/d100.png"
-};
-
 function extractJsonObject(text: string) {
   const start = text.indexOf("{");
   const end = text.lastIndexOf("}");
@@ -333,11 +320,6 @@ function formatLootList(items: Array<{ name: string; quantity: number }>) {
   return items.length
     ? items.map((item) => `${item.name} x${item.quantity}`).join(", ")
     : "Nothing.";
-}
-
-function normaliseDeltaMapSize(value: unknown): DeltaMapSize {
-  const size = typeof value === "string" ? value.trim().toUpperCase() : "";
-  return size === "S" || size === "M" || size === "L" || size === "XL" || size === "XXL" ? size : "M";
 }
 
 function parseDeltaBriefPacket(text: string) {
@@ -493,42 +475,6 @@ function deltaLogTurnCount(messages: DeltaMessage[]) {
     legacyTurns += 1;
   }
   return Math.max(explicitTurnMax, legacyTurns);
-}
-
-function statModifier(value?: number) {
-  if (typeof value !== "number") return "";
-  const modifier = Math.floor((value - 10) / 2);
-  return modifier >= 0 ? `+${modifier}` : `${modifier}`;
-}
-
-const deltaRollAbilities = ["STR", "DEX", "CON", "INT", "WIS", "CHA"] as const;
-type DeltaRollAbility = typeof deltaRollAbilities[number];
-
-function deltaRollModifier(entity: DeltaEntity | undefined, ability: DeltaRollAbility | undefined) {
-  if (!entity || !ability) return 0;
-  const score = entity[ability.toLowerCase() as "str" | "dex" | "con" | "int" | "wis" | "cha"] ?? 10;
-  return Math.floor((score - 10) / 2);
-}
-
-function deltaRollResultText(die: number, results: number[], modifier: number) {
-  const diceLabel = results.length > 1 ? `${results.length}d${die}` : `d${die}`;
-  const diceMath = results.join(" + ");
-  const rawTotal = results.reduce((total, result) => total + result, 0);
-  const total = rawTotal + modifier;
-  if (modifier === 0) return { text: results.length > 1 ? `${diceLabel} = ${diceMath} = ${total}` : `${diceLabel} = ${diceMath}`, total };
-  const modifierMath = modifier > 0 ? ` + ${modifier}` : ` - ${Math.abs(modifier)}`;
-  return { text: `${diceLabel} = ${diceMath}${modifierMath} = ${total}`, total };
-}
-
-function deltaEntityStats(entity: DeltaEntity) {
-  return [
-    ["STR", entity.str],
-    ["DEX", entity.dex],
-    ["CON", entity.con],
-    ["INT", entity.int],
-    ["WIS", entity.wis],
-    ["CHA", entity.cha]
-  ] as const;
 }
 
 function fitComposerTextarea(textarea: HTMLTextAreaElement | null) {
