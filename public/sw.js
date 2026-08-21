@@ -1,4 +1,4 @@
-const VERSION = "2026-08-21-react-window-chat-1";
+const VERSION = "2026-08-21-message-overlays-2";
 const APP_CACHE = `mirror-2-app-${VERSION}`;
 const ASSET_CACHE = `mirror-2-assets-${VERSION}`;
 const CACHE_PREFIX = "mirror-2-";

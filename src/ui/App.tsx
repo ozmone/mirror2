@@ -1459,10 +1459,20 @@ function ChatScreen({
   const [attachmentError, setAttachmentError] = useState("");
   const [previewImageIndex, setPreviewImageIndex] = useState<number>();
   const [expandedMessageId, setExpandedMessageId] = useState<string>();
+  const [sendState, setSendState] = useState<"idle" | "sending" | "stopping">("idle");
   const [saved, showSaved] = useSavedNotice();
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const imagePickerRef = useRef<HTMLInputElement>(null);
   const filePickerRef = useRef<HTMLInputElement>(null);
+  const activeSendRef = useRef<{
+    controller: AbortController;
+    text: string;
+    chatId: string;
+    branchId: string;
+    userMessageId?: string;
+    replyId: string;
+    createdChatId?: string;
+  }>();
   const imagePreviewUrls = useMemo(() => attachedImages.map((file) => ({ file, url: URL.createObjectURL(file) })), [attachedImages]);
   useEffect(() => () => imagePreviewUrls.forEach((item) => URL.revokeObjectURL(item.url)), [imagePreviewUrls]);
   useEffect(() => {
@@ -1972,8 +1982,11 @@ function ChatScreen({
   }
 
 
-  async function openRouterRequest(payload: Record<string, unknown>) {
+  async function openRouterRequest(payload: Record<string, unknown>, externalSignal = activeSendRef.current?.controller.signal) {
     const controller = new AbortController();
+    const abortFromExternal = () => controller.abort(externalSignal?.reason);
+    if (externalSignal?.aborted) abortFromExternal();
+    else externalSignal?.addEventListener("abort", abortFromExternal, { once: true });
     const timeout = window.setTimeout(() => controller.abort(), 90_000);
     let response: Response;
     try {
@@ -1989,10 +2002,13 @@ function ChatScreen({
         signal: controller.signal
       });
     } catch (error) {
+      if (externalSignal?.aborted) throw error;
       if (controller.signal.aborted) throw new Error("The AI provider did not start responding within 90 seconds. Please resend the message.");
       throw error;
     } finally {
       window.clearTimeout(timeout);
+      // Keep the one-shot link alive while the caller consumes a streaming body.
+      // It is released with the request controller after the send finishes.
     }
     if (!response.ok) {
       const errorText = await response.text();
@@ -2276,45 +2292,113 @@ function ChatScreen({
       const json = await response.json() as OpenRouterResponse;
       const packet = parseDeltaBriefPacket(json.choices?.[0]?.message?.content ?? "");
       return { brief: packet.brief || fallbackBrief, handoffContext: packet.handoffContext || fallbackHandoff, playerCharacterName: packet.playerCharacterName, roster: packet.roster, mapSize: packet.mapSize, avoidLabel: packet.avoidLabel, avoidPrompt: packet.avoidPrompt };
-    } catch {
+    } catch (error) {
+      if (activeSendRef.current?.controller.signal.aborted) throw error;
       return { brief: fallbackBrief, handoffContext: fallbackHandoff, playerCharacterName: "", roster: deltaBriefRosterFromContext(fallbackHandoff), mapSize: "M" as DeltaMapSize };
     }
   }
+  function stopActiveSend() {
+    const active = activeSendRef.current;
+    if (!active || active.controller.signal.aborted) return;
+    setSendState("stopping");
+    active.controller.abort(new DOMException("Stopped by user", "AbortError"));
+  }
+
+  async function markSendStopped(active: NonNullable<typeof activeSendRef.current>) {
+    await db.transaction("rw", db.messages, db.chats, async () => {
+      await db.messages.update(active.replyId, {
+        body: "Response stopped.",
+        status: "cancelled",
+        deltaBrief: undefined,
+        error: undefined,
+        outputTokens: undefined,
+        estimatedTokens: undefined,
+        updatedAt: now()
+      });
+      await db.chats.update(active.chatId, { updatedAt: now() });
+    });
+  }
+
+  function finishActiveSend(controller: AbortController) {
+    if (activeSendRef.current?.controller !== controller) return;
+    activeSendRef.current = undefined;
+    setSendState("idle");
+  }
+
   async function send() {
+    if (activeSendRef.current) return;
     if (deltaLocked) return;
     if (!project || !body.trim()) return;
     const text = body.trim();
     if (isDeltaModeRequest(text)) {
       setBody("");
       let deltaChat = chat;
+      let createdDeltaChatId: string | undefined;
+      let deltaUserMessageId: string | undefined;
       if (!deltaChat) {
         const deltaChatId = await createChat(project.id, text);
+        createdDeltaChatId = deltaChatId;
         deltaChat = await db.chats.get(deltaChatId);
         if (!deltaChat) return;
+        deltaUserMessageId = (await db.messages
+          .where("[chatId+branchId+sequence]")
+          .between([deltaChat.id, deltaChat.activeBranchId, Dexie.minKey], [deltaChat.id, deltaChat.activeBranchId, Dexie.maxKey])
+          .last())?.id;
         await onChatCreated(deltaChatId);
       } else {
-        await addMessage(deltaChat.id, deltaChat.activeBranchId, "user", text);
+        deltaUserMessageId = (await addMessage(deltaChat.id, deltaChat.activeBranchId, "user", text)).id;
       }
       const pending = await addMessage(deltaChat.id, deltaChat.activeBranchId, "assistant", "...");
       await db.messages.update(pending.id, { status: "pending", updatedAt: now() });
+      const deltaController = new AbortController();
+      activeSendRef.current = {
+        controller: deltaController,
+        text,
+        chatId: deltaChat.id,
+        branchId: deltaChat.activeBranchId,
+        userMessageId: deltaUserMessageId,
+        replyId: pending.id,
+        createdChatId: createdDeltaChatId
+      };
+      setSendState("sending");
       await onRefresh();
-      const brief = await createDeltaBrief(text, deltaChat);
-      await db.messages.update(pending.id, {
-        body: `### Δ Delta mode imminent...\n\n${brief.brief}`,
-        status: "complete",
-        deltaBrief: {
-          status: "pending",
-          brief: brief.brief,
-          handoffContext: brief.handoffContext,
-          playerCharacterName: brief.playerCharacterName,
-          roster: brief.roster,
-          mapSize: brief.mapSize,
-          avoidLabel: brief.avoidLabel,
-          avoidPrompt: brief.avoidPrompt
-        },
-        updatedAt: now()
-      });
-      await onRefresh();
+      try {
+        const brief = await createDeltaBrief(text, deltaChat);
+        deltaController.signal.throwIfAborted();
+        await db.messages.update(pending.id, {
+          body: `### Δ Delta mode imminent...\n\n${brief.brief}`,
+          status: "complete",
+          deltaBrief: {
+            status: "pending",
+            brief: brief.brief,
+            handoffContext: brief.handoffContext,
+            playerCharacterName: brief.playerCharacterName,
+            roster: brief.roster,
+            mapSize: brief.mapSize,
+            avoidLabel: brief.avoidLabel,
+            avoidPrompt: brief.avoidPrompt
+          },
+          updatedAt: now()
+        });
+        await onRefresh();
+      } catch (error) {
+        if (deltaController.signal.aborted) {
+          await markSendStopped(activeSendRef.current ?? {
+            controller: deltaController,
+            text,
+            chatId: deltaChat.id,
+            branchId: deltaChat.activeBranchId,
+            userMessageId: deltaUserMessageId,
+            replyId: pending.id,
+            createdChatId: createdDeltaChatId
+          });
+          await onRefresh();
+        } else {
+          throw error;
+        }
+      } finally {
+        finishActiveSend(deltaController);
+      }
       return;
     }
     if (!settings.apiKey) {
@@ -2401,8 +2485,12 @@ function ChatScreen({
       const canStreamDirectly = streamingEnabled && !toolsEnabled(images.length ? userMessageId : undefined);
       const reply = await addMessage(chatId, branchId, "assistant", canStreamDirectly ? "" : "...");
       await db.messages.update(reply.id, { modelId: draftModelId, status: canStreamDirectly ? "streaming" : "pending", requestInfo });
+      const sendController = new AbortController();
+      activeSendRef.current = { controller: sendController, text, chatId, branchId, userMessageId, replyId: reply.id, createdChatId };
+      setSendState("sending");
       if (createdChatId) await onChatCreated(createdChatId);
       else await onRefresh();
+      try {
       const sourceFiles = includeSourceFiles
         ? await db.sourceFiles.where("projectId").equals(project.id).and((file) => Boolean(file.textContent)).toArray()
         : [];
@@ -2460,7 +2548,6 @@ function ChatScreen({
         toolEvents
       });
       await db.messages.update(reply.id, { requestInfo, updatedAt: now() });
-      try {
         if (toolsEnabled(images.length ? userMessageId : undefined)) {
           const completed = await completeWithTools(requestMessages, toolLog, toolEvents, inventoryUpdates, chatId, selectedHistory.map((message) => message.id), images.length ? userMessageId : undefined);
           const deltaProposal = completed.deltaImminentProposal;
@@ -2488,6 +2575,7 @@ function ChatScreen({
           setAttachedFiles([]);
           if (createdChatId) await onChatCreated(createdChatId);
           else await onRefresh();
+          finishActiveSend(sendController);
           const memoryReview = await reviewTurnForMemories(chatId, text, completedReplyText, [userMessageId, reply.id].filter((id): id is string => Boolean(id)));
           await storePostResponseMemoryAudit(reply.id, memoryReview);
           await onRefresh();
@@ -2538,10 +2626,18 @@ function ChatScreen({
           });
         }
         await onRefresh();
+        finishActiveSend(sendController);
         const memoryReview = await reviewTurnForMemories(chatId, text, completedReplyText, [userMessageId, reply.id].filter((id): id is string => Boolean(id)));
         await storePostResponseMemoryAudit(reply.id, memoryReview);
         await onRefresh();
       } catch (error) {
+        if (sendController.signal.aborted) {
+          requestFailed = true;
+          await markSendStopped(activeSendRef.current ?? { controller: sendController, text, chatId, branchId, userMessageId, replyId: reply.id, createdChatId });
+          setAttachedImages([]);
+          setAttachedFiles([]);
+          await onRefresh();
+        } else {
         const message = error instanceof Error ? error.message : "Unknown error";
         requestFailed = true;
         setAttachmentError(message.includes("\"code\":401") ? "OpenRouter rejected the saved API key for this request. Re-save your OpenRouter key in API Settings, then resend the attached message." : message);
@@ -2552,7 +2648,9 @@ function ChatScreen({
           requestInfo: { ...requestInfo, toolCalls: toolLog.length ? toolLog : ["None"], inventoryUpdates },
           updatedAt: now()
         });
+        }
       }
+      finishActiveSend(sendController);
     }
     if (!requestFailed) {
       setAttachedImages([]);
@@ -2566,7 +2664,7 @@ function ChatScreen({
     const clean = nextBody.trim();
     if (!clean) return message;
     const timestamp = now();
-    await db.transaction("rw", db.messages, db.stars, db.chats, async () => {
+    await db.transaction("rw", db.messages, db.stars, db.attachments, db.chats, async () => {
       await db.messages.update(message.id, {
         body: clean,
         contextCondensation: undefined,
@@ -2578,6 +2676,17 @@ function ChatScreen({
       });
       const star = await db.stars.where("messageId").equals(message.id).first();
       if (star) await db.stars.update(star.id, { bodyCopy: clean, updatedAt: timestamp });
+      if (message.role === "user") {
+        const nextMessage = await db.messages
+          .where("[chatId+branchId+sequence]")
+          .between([message.chatId, message.branchId, message.sequence + 1], [message.chatId, message.branchId, Dexie.maxKey])
+          .first();
+        if (nextMessage?.role === "assistant" && nextMessage.status === "cancelled") {
+          await db.stars.where("messageId").equals(nextMessage.id).delete();
+          await db.attachments.where("[ownerType+ownerId]").equals(["message", nextMessage.id]).delete();
+          await db.messages.delete(nextMessage.id);
+        }
+      }
       if (compactionEnabled) await db.chats.update(message.chatId, { compactionNeedsRebuild: true, updatedAt: timestamp });
     });
     await onRefresh();
@@ -3093,7 +3202,12 @@ function ChatScreen({
           <Plus size={20} />
         </button>
         <textarea ref={composerRef} className="composer-input" value={body} onChange={(event) => setBody(event.target.value)} onFocus={() => keepComposerVisible(composerRef.current)} onClick={() => keepComposerVisible(composerRef.current)} disabled={deltaLocked} placeholder={deltaLocked ? "Resolve engagement to unlock chat." : "Message this project"} rows={1} />
-        <button className="send-button" onClick={send} disabled={deltaLocked}>Send</button>
+        <button
+          className={`send-button ${sendState !== "idle" ? "stop" : ""}`}
+          onClick={sendState === "idle" ? send : stopActiveSend}
+          disabled={deltaLocked || sendState === "stopping"}
+          aria-label={sendState === "idle" ? "Send message" : "Stop response"}
+        >{sendState === "idle" ? "Send" : sendState === "stopping" ? "Stopping…" : "Stop"}</button>
       </section>
       {previewImageIndex !== undefined && imagePreviewUrls[previewImageIndex] && (
         <button className="composer-image-viewer" type="button" onClick={() => setPreviewImageIndex(undefined)} aria-label="Close image preview"><img src={imagePreviewUrls[previewImageIndex].url} alt="Attached preview" /></button>
@@ -3260,7 +3374,7 @@ function MessageRow({
   })();
   return (
     <>
-      <article className={`message ${message.role}`} onClick={() => onExpand(message.id)}>
+      <article className={`message ${message.role} ${message.status === "cancelled" ? "cancelled" : ""}`} onClick={() => onExpand(message.id)}>
         {expanded && message.role === "assistant" && message.modelId && <div className="message-model">{message.modelId}</div>}
         {message.role === "user" && <MessageImageAttachments messageId={message.id} />}
         <div className="message-body">{message.status === "pending" && message.body.trim() === "..." ? <LoadingSignal /> : <MarkdownText text={message.body} inventoryMarkers />}</div>
@@ -3312,9 +3426,9 @@ function MessageRow({
           <button className="resend" aria-label="Resend message" title={deltaLocked ? "Resolve engagement to unlock resend" : "Resend"} disabled={deltaLocked} onClick={(event) => { event.stopPropagation(); setResendConfirm("resend"); }}><RefreshCw size={16} /></button>
         </div>
       </article>
-      {infoOpen && <MessageInfoModal message={message} onClose={() => setInfoOpen(false)} />}
+      {infoOpen && createPortal(<MessageInfoModal message={message} onClose={() => setInfoOpen(false)} />, document.body)}
       {editOpen && (
-        <div className="modal-backdrop" onClick={() => setEditOpen(false)}>
+        createPortal(<div className="modal-backdrop" onClick={() => setEditOpen(false)}>
           <section className="star-modal message-info-modal" onClick={(event) => event.stopPropagation()}>
             <div className="section-title">
               <h2>Edit Message</h2>
@@ -3342,10 +3456,10 @@ function MessageRow({
               <button onClick={() => setEditOpen(false)}>Cancel</button>
             </div>
           </section>
-        </div>
+        </div>, document.body)
       )}
       {resendConfirm && (
-        <div className="modal-backdrop confirm-backdrop" onClick={() => setResendConfirm(undefined)}>
+        createPortal(<div className="modal-backdrop confirm-backdrop" onClick={() => setResendConfirm(undefined)}>
           <section className="confirm-modal" onClick={(event) => event.stopPropagation()}>
             <div className="section-title">
               <h2>{resendConfirm === "edit-resend" ? "Save & Resend" : "Resend Message"}</h2>
@@ -3357,11 +3471,11 @@ function MessageRow({
               <button onClick={() => setResendConfirm(undefined)}>Cancel</button>
             </div>
           </section>
-        </div>
+        </div>, document.body)
       )}
-      {editImageIndex !== undefined && <ImageViewer attachments={editAttachments.filter((attachment) => attachment.mimeType.startsWith("image/"))} index={editImageIndex} onChange={setEditImageIndex} onClose={() => setEditImageIndex(undefined)} />}
+      {editImageIndex !== undefined && createPortal(<ImageViewer attachments={editAttachments.filter((attachment) => attachment.mimeType.startsWith("image/"))} index={editImageIndex} onChange={setEditImageIndex} onClose={() => setEditImageIndex(undefined)} />, document.body)}
       {avoidOpen && (
-        <div className="modal-backdrop" onClick={() => setAvoidOpen(false)}>
+        createPortal(<div className="modal-backdrop" onClick={() => setAvoidOpen(false)}>
           <section className="star-modal message-info-modal" onClick={(event) => event.stopPropagation()}>
             <div className="section-title">
               <h2>{message.deltaBrief?.avoidPrompt || "What do you do?"}</h2>
@@ -3373,7 +3487,7 @@ function MessageRow({
               <button onClick={() => setAvoidOpen(false)} disabled={avoidSaving}>Cancel</button>
             </div>
           </section>
-        </div>
+        </div>, document.body)
       )}
     </>
   );
@@ -5351,8 +5465,25 @@ function StarsPage({ project }: { project?: Project }) {
   return (
     <Page>
       {stars.length === 0 && <EmptyState title="No stars yet" body="Star chat messages to collect them here." />}
-      {stars.map((star) => <button className="star-card" key={star.id} onClick={() => setOpenStar(star)}><small>{star.role} - {formatDate(star.updatedAt)}</small><p>{star.bodyCopy}</p></button>)}
-      {openStar && <div className="modal-backdrop" onClick={() => setOpenStar(undefined)}><section className="star-modal" onClick={(event) => event.stopPropagation()}><small>{openStar.role} - {formatDate(openStar.updatedAt)}</small><p>{openStar.bodyCopy}</p><div className="split-actions"><button onClick={() => setOpenStar(undefined)}>Close</button><button className="danger" onClick={() => removeStar(openStar.id)}><Trash2 size={18} /> Delete star</button></div></section></div>}
+      {stars.map((star) => (
+        <article
+          className="star-card"
+          key={star.id}
+          role="button"
+          tabIndex={0}
+          onClick={() => setOpenStar(star)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              setOpenStar(star);
+            }
+          }}
+        >
+          <small>{star.role} - {formatDate(star.updatedAt)}</small>
+          <div className="star-card-preview"><MarkdownText text={star.bodyCopy} /></div>
+        </article>
+      ))}
+      {openStar && <div className="modal-backdrop" onClick={() => setOpenStar(undefined)}><section className="star-modal" onClick={(event) => event.stopPropagation()}><small>{openStar.role} - {formatDate(openStar.updatedAt)}</small><div className="star-modal-body"><MarkdownText text={openStar.bodyCopy} /></div><div className="split-actions"><button onClick={() => setOpenStar(undefined)}>Close</button><button className="danger" onClick={() => removeStar(openStar.id)}><Trash2 size={18} /> Delete star</button></div></section></div>}
     </Page>
   );
 }
