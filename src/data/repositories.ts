@@ -6,6 +6,8 @@ import { estimateTokens, fallbackChatTitle, normaliseTag, now, uid } from "../ut
 
 export const abilities: Ability[] = ["STR", "DEX", "CON", "INT", "WIS", "CHA"];
 export const pointBuyCosts: Record<number, number> = { 8: 0, 9: 1, 10: 2, 11: 3, 12: 4, 13: 5, 14: 7, 15: 9 };
+export const defaultCarryKgPerStr = 6.8;
+export const defaultCombatLoadPercent = 50;
 
 export function totalPointCost(scores: Pick<Character, "str" | "dex" | "con" | "int" | "wis" | "cha">) {
   return pointBuyCosts[scores.str] + pointBuyCosts[scores.dex] + pointBuyCosts[scores.con] + pointBuyCosts[scores.int] + pointBuyCosts[scores.wis] + pointBuyCosts[scores.cha];
@@ -81,6 +83,19 @@ export function effectiveDeltaBases(value?: DeltaBaseTemplate[]) {
   });
 }
 
+export function deltaCarryProfile(project: Project, baseLabel: string | undefined, strength: number, currentLoadKg: number) {
+  const normalisedBase = normaliseTemplateValue(baseLabel);
+  const base = effectiveDeltaBases(project.deltaBases).find((item) => item.label.trim().toUpperCase() === normalisedBase);
+  const carryKgPerStr = Number.isFinite(base?.carryKgPerStr) && (base?.carryKgPerStr ?? 0) > 0 ? Number(base?.carryKgPerStr) : defaultCarryKgPerStr;
+  const combatLoadPercent = Number.isFinite(base?.combatLoadPercent)
+    ? Math.min(100, Math.max(1, Number(base?.combatLoadPercent)))
+    : defaultCombatLoadPercent;
+  const carryCapacityKg = Math.max(0, strength) * carryKgPerStr;
+  const combatLoadKg = carryCapacityKg * combatLoadPercent / 100;
+  const status = currentLoadKg > carryCapacityKg ? "overloaded" as const : currentLoadKg >= combatLoadKg ? "encumbered" as const : "normal" as const;
+  return { carryKgPerStr, combatLoadPercent, carryCapacityKg, combatLoadKg, status };
+}
+
 export function formatDeltaTemplateTag(prefix?: string, base?: string, job?: string) {
   const cleanPrefix = normaliseTemplateValue(prefix);
   const cleanBase = normaliseTemplateValue(base);
@@ -147,11 +162,17 @@ export async function characterTemplateStats(project: Project, character: Charac
     job: templateBuild ? character.job : undefined,
     jobCategory: templateBuild ? character.jobCategory : undefined
   });
-  const bonuses = await db.characterBonuses.where("characterId").equals(character.id).toArray();
+  const [bonuses, gearSlots] = await Promise.all([
+    db.characterBonuses.where("characterId").equals(character.id).toArray(),
+    db.characterGearSlots.where("characterId").equals(character.id).toArray()
+  ]);
   const total = (base: number, stat: Ability) => {
     const legacyBonus = bonuses.filter((bonus) => bonus.stat === stat).reduce((sum, bonus) => sum + bonus.value, 0);
+    const gearBonus = gearSlots
+      .filter((slot) => slot.itemName.trim())
+      .reduce((sum, slot) => sum + (slot.statBonuses?.[stat] ?? 0), 0);
     const baseScore = templateBuild ? defaultStats[stat] : base;
-    return baseScore + (generated.scores[stat] - defaultStats[stat]) + legacyBonus;
+    return baseScore + (generated.scores[stat] - defaultStats[stat]) + legacyBonus + gearBonus;
   };
   return {
     STR: total(character.str, "STR"),
@@ -166,6 +187,29 @@ export async function characterTemplateStats(project: Project, character: Charac
     base: generated.base,
     job: generated.job
   };
+}
+
+export async function refreshActiveDeltaCharacterStats(project: Project, character: Character) {
+  const stats = await characterTemplateStats(project, character);
+  const sessions = await db.deltaSessions.where("projectId").equals(project.id).and((session) => session.active).toArray();
+  await Promise.all(sessions.map(async (session) => {
+    const entities = await db.deltaEntities.where("sessionId").equals(session.id).toArray();
+    await Promise.all(entities.filter((entity) => entity.characterId === character.id).map((entity) => {
+      const previousMaxHp = entity.maxHp ?? stats.maxHp;
+      return db.deltaEntities.update(entity.id, {
+        str: stats.STR,
+        dex: stats.DEX,
+        con: stats.CON,
+        int: stats.INT,
+        wis: stats.WIS,
+        cha: stats.CHA,
+        maxHp: stats.maxHp,
+        currentHp: Math.max(0, (entity.currentHp ?? stats.maxHp) + stats.maxHp - previousMaxHp),
+        updatedAt: now()
+      });
+    }));
+  }));
+  return stats;
 }
 
 async function characterEntityPatch(project: Project, character: Character) {

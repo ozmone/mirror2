@@ -21,9 +21,9 @@ export const defaultDeltaPrefixes = (): DeltaPrefixTemplate[] =>
   }));
 
 export const defaultDeltaBases = (): DeltaBaseTemplate[] => [
-  { id: "light", label: "LIGHT", statModifiers: { STR: -1, DEX: 2, CON: -1 }, hpBonus: -5, notes: "" },
-  { id: "medium", label: "MEDIUM", statModifiers: { CON: 1 }, notes: "" },
-  { id: "heavy", label: "HEAVY", statModifiers: { STR: 1, DEX: -2, CON: 1 }, hpBonus: 8, notes: "" }
+  { id: "light", label: "LIGHT", statModifiers: { STR: -1, DEX: 2, CON: -1 }, hpBonus: -5, carryKgPerStr: 5, combatLoadPercent: 40, notes: "" },
+  { id: "medium", label: "MEDIUM", statModifiers: { CON: 1 }, carryKgPerStr: 6.8, combatLoadPercent: 50, notes: "" },
+  { id: "heavy", label: "HEAVY", statModifiers: { STR: 1, DEX: -2, CON: 1 }, hpBonus: 8, carryKgPerStr: 8.5, combatLoadPercent: 60, notes: "" }
 ];
 
 export const defaultDeltaJobs = (): DeltaJobTemplate[] => [];

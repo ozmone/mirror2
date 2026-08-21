@@ -46,6 +46,7 @@ import {
   createChat,
   createMemory,
   createProject,
+  deltaCarryProfile,
   findCharacters,
   getOrCreateDeltaSession,
   getCharacterBio,
@@ -57,20 +58,21 @@ import {
   generatedDeltaStats,
   formatDeltaTemplateTag,
   characterTemplateStats,
+  refreshActiveDeltaCharacterStats,
   effectiveDeltaPrefixes,
   effectiveDeltaBases,
   toggleStar,
   validatePointBuy
 } from "../data/repositories";
 import { defaultDeltaJobs, defaultDeltaNpcStats, defaultDeltaSystemPrompt, effectiveDeltaSystemPrompt, defaultMemoryInstruction, defaultSettings } from "../data/defaults";
-import { Ability, AbilityModifiers, AbilityScores, AppSettings, BubbleMode, Character, CharacterActionMacro, CharacterActionSlot, CharacterBonus, Chat, DeltaAllyCacheEntry, DeltaBaseTemplate, DeltaBriefRoster, DeltaEffectDefinition, DeltaEffectPolarity, DeltaEntity, DeltaIconAsset, DeltaJobTemplate, DeltaMapSize, DeltaMessage, DeltaPrefixTemplate, DeltaSavingThrowTiming, DeltaSession, GearBodyType, InventoryKind, InventoryItem, InventoryLog, InventoryUpdateRequest, MainChatAuditToolEvent, MainChatMemoryReviewAudit, MainChatRequestAudit, Memory, Message, PendingMemory, Project, RouteName } from "../types";
+import { Ability, AbilityModifiers, AbilityScores, AppSettings, BubbleMode, Character, CharacterActionMacro, CharacterActionSlot, CharacterBonus, CharacterGearSlot, Chat, DeltaAllyCacheEntry, DeltaBaseTemplate, DeltaBriefRoster, DeltaEffectDefinition, DeltaEffectPolarity, DeltaEntity, DeltaIconAsset, DeltaJobTemplate, DeltaMapSize, DeltaMessage, DeltaPrefixTemplate, DeltaSavingThrowTiming, DeltaSession, GearBodyType, GearSlotName, InventoryKind, InventoryItem, InventoryLog, InventoryUpdateRequest, MainChatAuditToolEvent, MainChatMemoryReviewAudit, MainChatRequestAudit, Memory, Message, PendingMemory, Project, RouteName } from "../types";
 import { estimateTokens, formatDate, normaliseTag, now, splitTags, uid } from "../utils";
 import { ProjectIcon, projectIcons } from "./icons";
 import { GearDrawer } from "./gear/GearDrawer";
 import { DeltaActionTree } from "./delta/DeltaActionTree";
 import { DeltaModeWorkspace } from "./delta/DeltaModeWorkspace";
 import { abstractDeltaRosterName, deltaRosterParticipants, downloadJson, extractJsonObject, fitComposerTextarea, formatInventoryKg, isInvalidDeltaEntityName, jobCategories, keepComposerVisible, useSavedNotice } from "./delta/workspaceSupport";
-import { characterTools, imageContextTools, inventoryTools, deltaImminentTools, type OpenRouterMessage, type OpenRouterResponse, type OpenRouterToolCall, type OpenRouterUsage } from "./openRouter";
+import { characterTools, imageContextTools, inventoryTools, memoryTools, deltaImminentTools, type OpenRouterMessage, type OpenRouterResponse, type OpenRouterToolCall, type OpenRouterUsage } from "./openRouter";
 import { MarkdownText } from "./shared/MarkdownText";
 import { LoadingSignal } from "./shared/LoadingSignal";
 import { HpSquares } from "./shared/HpSquares";
@@ -138,12 +140,6 @@ function formatByteSize(bytes: number) {
   const index = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
   const value = bytes / 1024 ** index;
   return `${value >= 10 || index === 0 ? Math.round(value) : value.toFixed(1)} ${units[index]}`;
-}
-
-function readUnitWeightKg(totalWeightKg: string, quantity: number) {
-  const parsed = Number(totalWeightKg);
-  if (!Number.isFinite(parsed) || parsed <= 0 || quantity <= 0) return 0;
-  return Math.max(0.01, Math.round((parsed / quantity) * 100) / 100);
 }
 
 function accentTokens(value: string) {
@@ -238,6 +234,8 @@ function cleanDeltaBases(value: DeltaBaseTemplate[]) {
       label: item.label.trim(),
       statModifiers: cleanAbilityModifiers(item.statModifiers),
       hpBonus: Number.isFinite(item.hpBonus) && item.hpBonus !== 0 ? Number(item.hpBonus) : undefined,
+      carryKgPerStr: Number.isFinite(item.carryKgPerStr) && (item.carryKgPerStr ?? 0) > 0 ? Number(item.carryKgPerStr) : undefined,
+      combatLoadPercent: Number.isFinite(item.combatLoadPercent) ? Math.min(100, Math.max(1, Number(item.combatLoadPercent))) : undefined,
       notes: item.notes?.trim() || undefined
     }))
     .filter((item) => item.label);
@@ -584,6 +582,7 @@ export function App() {
   const [inventoryOpen, setInventoryOpen] = useState(false);
   const [gearOpen, setGearOpen] = useState(false);
   const [gearEditingCharacterId, setGearEditingCharacterId] = useState<string>();
+  const [gearRefreshVersion, setGearRefreshVersion] = useState(0);
   const [deltaOpen, setDeltaOpen] = useState(false);
   const [deltaProjectSettingsOpen, setDeltaProjectSettingsOpen] = useState(false);
   const [deltaSession, setDeltaSession] = useState<DeltaSession>();
@@ -913,6 +912,7 @@ export function App() {
           open={gearOpen}
           project={selectedProject}
           chat={selectedChat}
+          refreshVersion={gearRefreshVersion}
           elevated={deltaOpen}
           onOpenCharacter={(id) => {
             setGearEditingCharacterId(id);
@@ -927,6 +927,8 @@ export function App() {
             <CharacterProfilePage
               project={selectedProject}
               characterId={gearEditingCharacterId}
+              chatId={selectedChat?.id}
+              onSaved={() => setGearRefreshVersion((current) => current + 1)}
               onBack={() => setGearEditingCharacterId(undefined)}
               onDeleted={() => setGearEditingCharacterId(undefined)}
             />
@@ -1027,7 +1029,7 @@ export function App() {
         {route === "stars" && <StarsPage project={selectedProject} />}
         {route === "archives" && <ArchivesPage project={selectedProject} />}
         {route === "characters" && <CharactersPage project={selectedProject} onOpenProfile={(id) => { setProfileCharacterId(id); setRoute("characterProfile"); }} />}
-        {route === "characterProfile" && selectedProject && profileCharacterId && <CharacterProfilePage project={selectedProject} characterId={profileCharacterId} onBack={() => setRoute("characters")} onDeleted={() => { setProfileCharacterId(undefined); setRoute("characters"); }} />}
+        {route === "characterProfile" && selectedProject && profileCharacterId && <CharacterProfilePage project={selectedProject} characterId={profileCharacterId} chatId={selectedChat?.id} onBack={() => setRoute("characters")} onDeleted={() => { setProfileCharacterId(undefined); setRoute("characters"); }} />}
         {route === "memories" && <MemoriesPage project={selectedProject} />}
         {route === "compaction" && selectedChat && <CompactionPage chat={selectedChat} onRefresh={refresh} />}
         {route === "sourceFiles" && <SourceFilesPage project={selectedProject} />}
@@ -1057,6 +1059,8 @@ function InventoryDrawer({ open, project, chat, elevated, onClose, onRefresh }: 
   const [items, setItems] = useState<InventoryItem[]>([]);
   const [logs, setLogs] = useState<InventoryLog[]>([]);
   const [currencyAmount, setCurrencyAmount] = useState(chat.currencyAmount?.toString() ?? "");
+  const [currencyAdjustment, setCurrencyAdjustment] = useState<"add" | "sub" | "edit">();
+  const [equipItem, setEquipItem] = useState<InventoryItem>();
   const [saved, showSaved] = useSavedNotice();
   useEffect(() => {
     setCurrencyAmount(chat.currencyAmount?.toString() ?? "");
@@ -1073,8 +1077,10 @@ function InventoryDrawer({ open, project, chat, elevated, onClose, onRefresh }: 
   useEffect(() => { if (open) load(); }, [open, chat.id]);
   if (!open) return null;
   const shownItems = items.filter((item) => item.kind === "inventory");
-  async function saveCurrency() {
-    await db.chats.update(chat.id, { currencyAmount: currencyAmount === "" ? undefined : Number(currencyAmount), updatedAt: now() });
+  async function persistCurrency(nextAmount: number | undefined) {
+    const value = nextAmount === undefined ? undefined : Math.max(0, nextAmount);
+    setCurrencyAmount(value?.toString() ?? "");
+    await db.chats.update(chat.id, { currencyAmount: value, updatedAt: now() });
     showSaved();
     await onRefresh();
   }
@@ -1097,27 +1103,131 @@ function InventoryDrawer({ open, project, chat, elevated, onClose, onRefresh }: 
         </div>
         {tab === "inventory" && project.inventoryEnabled && (
           <div className="stack">
-            {project.currencyName && <div className="currency-row"><input type="number" value={currencyAmount} onChange={(event) => setCurrencyAmount(event.target.value)} /><span>{project.currencyName}</span><button onClick={saveCurrency}><Save size={16} /></button>{saved && <span className="save-status">Saved</span>}</div>}
-            {shownItems.map((item) => <InventoryItemRow key={item.id} item={item} onRefresh={load} />)}
+            {project.currencyName && <div className="currency-row"><button type="button" className="currency-value-button" onClick={() => setCurrencyAdjustment("edit")} aria-label={`Edit ${project.currencyName}`}>{currencyAmount || "0"}</button><span>{project.currencyName}</span><button type="button" className="currency-adjust-button" onClick={() => setCurrencyAdjustment("add")}>Add</button><button type="button" className="currency-adjust-button" onClick={() => setCurrencyAdjustment("sub")}>Sub</button>{saved && <span className="save-status">Saved</span>}</div>}
+            {shownItems.map((item) => <InventoryItemRow key={item.id} item={item} onRefresh={load} onEquip={() => setEquipItem(item)} />)}
             <button onClick={() => addItem("inventory")}><Plus size={18} /> Add item</button>
           </div>
         )}
         {tab === "log" && <InventoryLogList logs={logs} onRefresh={load} />}
       </aside>
+      {equipItem && <EquipItemModal item={equipItem} project={project} chat={chat} onClose={() => setEquipItem(undefined)} onEquipped={async () => { setEquipItem(undefined); await load(); await onRefresh(); }} />}
+      {currencyAdjustment && <CurrencyAdjustmentModal kind={currencyAdjustment} currencyName={project.currencyName ?? "currency"} currentAmount={currencyAmount} onClose={() => setCurrencyAdjustment(undefined)} onApply={async (amount) => { const next = currencyAdjustment === "edit" ? amount : Math.max(0, (Number(currencyAmount) || 0) + (currencyAdjustment === "add" ? amount : -amount)); await persistCurrency(next); setCurrencyAdjustment(undefined); }} />}
     </>
   );
 }
 
-function InventoryItemRow({ item, onRefresh }: { item: InventoryItem; onRefresh: () => Promise<void> }) {
+function CurrencyAdjustmentModal({ kind, currencyName, currentAmount, onClose, onApply }: { kind: "add" | "sub" | "edit"; currencyName: string; currentAmount: string; onClose: () => void; onApply: (amount: number) => Promise<void> }) {
+  const [amount, setAmount] = useState(kind === "edit" ? currentAmount : "");
+  const [saving, setSaving] = useState(false);
+  const verb = kind === "add" ? "Add" : kind === "sub" ? "Subtract" : "Edit";
+  const numericAmount = Number(amount);
+  async function apply() {
+    if (!Number.isFinite(numericAmount) || numericAmount < 0) return;
+    setSaving(true);
+    try { await onApply(numericAmount); } finally { setSaving(false); }
+  }
+  return <div className="modal-backdrop inventory-confirm-backdrop" onClick={onClose}>
+    <section className="confirm-modal currency-adjust-modal" onClick={(event) => event.stopPropagation()}>
+      <h2>{kind === "edit" ? `Edit ${currencyName}` : `${verb} ${currencyName}`}</h2>
+      {kind !== "edit" && <p>Current amount: <strong>{currentAmount || "0"}</strong></p>}
+      <label>{kind === "edit" ? "New total" : "Amount"}<input autoFocus type="number" min={0} step="any" value={amount} onChange={(event) => setAmount(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void apply(); }} /></label>
+      <div className="split-actions"><button className="save-button" disabled={saving || !Number.isFinite(numericAmount) || (kind !== "edit" && numericAmount <= 0)} onClick={() => void apply()}>{saving ? "Saving…" : kind === "edit" ? "Save" : verb}</button><button disabled={saving} onClick={onClose}>Cancel</button></div>
+    </section>
+  </div>;
+}
+
+const equipSlotChoices: { slot: GearSlotName; label: string }[] = [
+  { slot: "head", label: "Head" }, { slot: "torso", label: "Torso" }, { slot: "hands", label: "Hands" }, { slot: "legs", label: "Legs" }, { slot: "feet", label: "Feet" }, { slot: "ear", label: "Ear" }, { slot: "neck", label: "Neck" }, { slot: "wrist", label: "Wrist" }, { slot: "ex1", label: "EX1" }, { slot: "ex2", label: "EX2" }, { slot: "belt", label: "Belt" }, { slot: "back", label: "Back" }
+];
+
+function EquipItemModal({ item, project, chat, onClose, onEquipped }: { item: InventoryItem; project: Project; chat: Chat; onClose: () => void; onEquipped: () => Promise<void> }) {
+  const [characters, setCharacters] = useState<Character[]>([]);
+  const [characterId, setCharacterId] = useState("");
+  const [slot, setSlot] = useState<GearSlotName>("head");
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const selectedCharacter = characters.find((character) => character.id === characterId);
+  const selectedSlot = equipSlotChoices.find((choice) => choice.slot === slot);
+
+  useEffect(() => {
+    void db.characters.where("projectId").equals(project.id).toArray().then((rows) => {
+      const sorted = rows.sort((a, b) => (a.orderIndex ?? Number.MAX_SAFE_INTEGER) - (b.orderIndex ?? Number.MAX_SAFE_INTEGER) || a.normalisedName.localeCompare(b.normalisedName));
+      setCharacters(sorted);
+      setCharacterId(sorted.some((character) => character.id === chat.deltaPlayerCharacterId) ? chat.deltaPlayerCharacterId! : sorted[0]?.id ?? "");
+    });
+  }, [project.id, chat.deltaPlayerCharacterId]);
+
+  async function equip() {
+    if (!characterId || !item.name.trim()) return;
+    setBusy(true);
+    try {
+      const timestamp = now();
+      await db.transaction("rw", [db.inventoryItems, db.characterGearSlots], async () => {
+        const freshItem = await db.inventoryItems.get(item.id);
+        if (!freshItem || freshItem.quantity < 1) return;
+        const existing = await db.characterGearSlots.where("[characterId+slot]").equals([characterId, slot]).first();
+        if (existing?.itemName.trim()) await returnGearToInventory(existing, project.id, chat.id, timestamp);
+        if (freshItem.quantity === 1) await db.inventoryItems.delete(freshItem.id);
+        else await db.inventoryItems.update(freshItem.id, { quantity: freshItem.quantity - 1, updatedAt: timestamp });
+        const gearPatch = inventoryItemAsGear(freshItem);
+        if (existing) await db.characterGearSlots.update(existing.id, { ...gearPatch, updatedAt: timestamp });
+        else await db.characterGearSlots.add({ id: uid(), characterId, slot, ...gearPatch, createdAt: timestamp, updatedAt: timestamp });
+      });
+      if (selectedCharacter) await refreshActiveDeltaCharacterStats(project, selectedCharacter);
+      await onEquipped();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return <div className="modal-backdrop inventory-confirm-backdrop" onClick={onClose}>
+    <section className="confirm-modal equip-modal" onClick={(event) => event.stopPropagation()}>
+      <h2>{confirming ? "Confirm Equipment" : "Equip Item"}</h2>
+      {!confirming ? <>
+        <p>Choose who will wear <strong>{item.name}</strong> and where it will go.</p>
+        <label>Character<select value={characterId} onChange={(event) => setCharacterId(event.target.value)}>{characters.map((character) => <option key={character.id} value={character.id}>{character.name}</option>)}</select></label>
+        <label>Gear slot<select value={slot} onChange={(event) => setSlot(event.target.value as GearSlotName)}>{equipSlotChoices.map((choice) => <option key={choice.slot} value={choice.slot}>{choice.label}</option>)}</select></label>
+        {!characters.length && <p className="error">Create a character before equipping an item.</p>}
+        <div className="split-actions"><button className="save-button" disabled={!characterId} onClick={() => setConfirming(true)}>Continue</button><button onClick={onClose}>Cancel</button></div>
+      </> : <EquipConfirmation item={item} characterId={characterId} slot={slot} slotLabel={selectedSlot?.label ?? slot} characterName={selectedCharacter?.name ?? "character"} onConfirm={equip} onBack={() => setConfirming(false)} busy={busy} />}
+    </section>
+  </div>;
+}
+
+function EquipConfirmation({ item, characterId, slot, slotLabel, characterName, onConfirm, onBack, busy }: { item: InventoryItem; characterId: string; slot: GearSlotName; slotLabel: string; characterName: string; onConfirm: () => Promise<void>; onBack: () => void; busy: boolean }) {
+  const [current, setCurrent] = useState<CharacterGearSlot>();
+  useEffect(() => { void db.characterGearSlots.where("[characterId+slot]").equals([characterId, slot]).first().then(setCurrent); }, [characterId, slot]);
+  return <>
+    <p>Equip <strong>{item.name}</strong> to {characterName}'s <strong>{slotLabel}</strong> slot?</p>
+    {current?.itemName.trim() && <p className="equip-swap-note"><strong>{current.itemName}</strong> is currently equipped and will return to inventory.</p>}
+    <div className="split-actions"><button className="save-button" disabled={busy} onClick={() => void onConfirm()}>{busy ? "Equipping…" : "Equip"}</button><button disabled={busy} onClick={onBack}>Back</button></div>
+  </>;
+}
+
+function inventoryItemAsGear(item: InventoryItem): Omit<CharacterGearSlot, "id" | "characterId" | "slot" | "createdAt" | "updatedAt"> {
+  return { itemName: item.name.trim(), dpBonus: item.dpBonus, apBonus: item.apBonus, hpBonus: item.hpBonus, carryWeightKg: item.unitWeightKg, combatLoadKg: item.combatLoadKg, carrySlots: item.carrySlots, carryReductionPercent: item.carryReductionPercent, statBonuses: item.statBonuses };
+}
+
+async function returnGearToInventory(gear: CharacterGearSlot, projectId: string, chatId: string, timestamp: number) {
+  const normalisedName = normaliseInventoryName(gear.itemName);
+  const existing = await db.inventoryItems.where("[chatId+kind+normalisedName]").equals([chatId, "inventory", normalisedName]).first();
+  const patch = { name: gear.itemName, normalisedName, unitWeightKg: gear.carryWeightKg, dpBonus: gear.dpBonus, apBonus: gear.apBonus, hpBonus: gear.hpBonus, combatLoadKg: gear.combatLoadKg, carrySlots: gear.carrySlots, carryReductionPercent: gear.carryReductionPercent, statBonuses: gear.statBonuses, updatedAt: timestamp };
+  if (existing) await db.inventoryItems.update(existing.id, { ...patch, quantity: existing.quantity + 1 });
+  else await db.inventoryItems.add({ id: uid(), projectId, chatId, kind: "inventory", quantity: 1, ...patch, createdAt: timestamp });
+}
+
+function InventoryItemRow({ item, onRefresh, onEquip }: { item: InventoryItem; onRefresh: () => Promise<void>; onEquip: () => void }) {
   const [name, setName] = useState(item.name);
   const [quantity, setQuantity] = useState(item.quantity);
-  const [totalWeightKg, setTotalWeightKg] = useState(formatInventoryKg((item.unitWeightKg ?? 0) * item.quantity));
+  const [unitWeightKg, setUnitWeightKg] = useState(item.unitWeightKg?.toString() ?? "");
+  const [editingWeight, setEditingWeight] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [pressTimer, setPressTimer] = useState<number>();
   useEffect(() => {
     setName(item.name);
     setQuantity(item.quantity);
-    setTotalWeightKg(formatInventoryKg((item.unitWeightKg ?? 0) * item.quantity));
+    setUnitWeightKg(item.unitWeightKg?.toString() ?? "");
+    setEditingWeight(false);
   }, [item.id, item.name, item.quantity, item.unitWeightKg]);
   function startPress() {
     window.clearTimeout(pressTimer);
@@ -1126,7 +1236,7 @@ function InventoryItemRow({ item, onRefresh }: { item: InventoryItem; onRefresh:
   function cancelPress() {
     window.clearTimeout(pressTimer);
   }
-  async function save(nextQuantity = quantity, nextTotalWeightKg = totalWeightKg) {
+  async function save(nextQuantity = quantity, nextUnitWeightKg = unitWeightKg) {
     const singular = normaliseInventoryName(name);
     if (Math.max(0, nextQuantity) === 0) {
       setQuantity(0);
@@ -1134,19 +1244,17 @@ function InventoryItemRow({ item, onRefresh }: { item: InventoryItem; onRefresh:
       return;
     }
     const safeQuantity = Math.max(0, nextQuantity);
-    const parsedWeight = Number(nextTotalWeightKg);
-    const unitWeightKg = Number.isFinite(parsedWeight) && parsedWeight > 0 && safeQuantity > 0
-      ? parsedWeight / safeQuantity
+    const parsedWeight = Number(nextUnitWeightKg);
+    const savedUnitWeightKg = Number.isFinite(parsedWeight) && parsedWeight > 0
+      ? parsedWeight
       : undefined;
-    await db.inventoryItems.update(item.id, { name: singular, normalisedName: singular, quantity: safeQuantity, unitWeightKg, updatedAt: now() });
+    await db.inventoryItems.update(item.id, { name: singular, normalisedName: singular, quantity: safeQuantity, unitWeightKg: savedUnitWeightKg, updatedAt: now() });
     await onRefresh();
   }
   async function changeQuantity(nextQuantity: number) {
     const next = Math.max(0, nextQuantity);
     setQuantity(next);
-    const nextTotal = formatInventoryKg((item.unitWeightKg ?? readUnitWeightKg(totalWeightKg, quantity)) * next);
-    setTotalWeightKg(nextTotal);
-    await save(next, nextTotal);
+    await save(next);
   }
   async function remove() {
     await db.inventoryItems.delete(item.id);
@@ -1165,11 +1273,11 @@ function InventoryItemRow({ item, onRefresh }: { item: InventoryItem; onRefresh:
           onPointerLeave={cancelPress}
           placeholder={item.kind === "gear" ? "gear name" : "item name"}
         />
-        <input className="inventory-weight-input" type="number" min={0.01} step={0.01} value={totalWeightKg} onChange={(event) => setTotalWeightKg(event.target.value)} onBlur={() => save()} aria-label={`${name || "item"} total KG`} />
-        <span className="inventory-kg-label">kg</span>
         <button onClick={() => void changeQuantity(quantity - 1)}>-</button>
         <input type="number" value={quantity} onChange={(event) => setQuantity(Number(event.target.value))} onBlur={() => void changeQuantity(quantity)} />
         <button onClick={() => void changeQuantity(quantity + 1)}>+</button>
+        {editingWeight ? <input className="inventory-unit-weight-input" autoFocus type="number" min={0.01} step={0.01} value={unitWeightKg} onChange={(event) => setUnitWeightKg(event.target.value)} onBlur={() => { setEditingWeight(false); void save(); }} aria-label={`${name || "item"} unit weight in kilograms`} /> : <button type="button" className="inventory-unit-weight" onClick={() => setEditingWeight(true)} aria-label={`Edit ${name || "item"} unit weight`}>{unitWeightKg ? `${formatInventoryKg(Number(unitWeightKg))} kg` : "— kg"}</button>}
+        <button type="button" className="inventory-equip-button" disabled={!item.name.trim() || item.quantity < 1} onClick={onEquip}>Equip</button>
       </div>
       {deleteOpen && (
         <div className="modal-backdrop inventory-confirm-backdrop" onClick={() => { setDeleteOpen(false); if (quantity === 0) setQuantity(item.quantity || 1); }}>
@@ -1615,6 +1723,7 @@ function ChatScreen({
       ...(deltaAvailable ? [...deltaImminentTools] : []),
       ...(includeCharacters ? [...characterTools] : []),
       ...(project?.inventoryEnabled && autoManageInventory ? [...inventoryTools] : []),
+      ...(project && project.memoryMode !== "manual" ? [...memoryTools] : []),
       ...(imageContextMessageId ? [...imageContextTools] : [])
     ];
     if (activeTools.length) payload.tools = activeTools;
@@ -1661,6 +1770,7 @@ function ChatScreen({
       project.inventoryEnabled && autoManageInventory ? "Inventory auto-management is enabled: use update_inventory_item for inventory or currency changes." : "",
       !autoManageInventory && project.inventoryEnabled ? "If auto-management is disabled, use the listed inventory as read-only context and do not claim you cannot access it." : "",
       "When using update_inventory_item, include the exact item or currency name, signed quantity delta, and a terse one-line log sentence that says where the item came from or went. Use kind currency for the listed currency amount.",
+      "For every newly added physical inventory item without a stored weight, unitWeightKg is required. Supply a sensible estimated per-unit weight even when the exact weight is not stated. Existing stack weights are reused for additions and removals.",
       "The user's [i] marker means they are explicitly flagging that the nearby action should be treated as an inventory action. It is only a signal; do not echo it back unless quoting."
     ].filter(Boolean);
     const parts = [
@@ -1764,7 +1874,7 @@ function ChatScreen({
     }
   }
 
-  async function reviewTurnForMemories(chatId: string, userText: string, assistantText: string, sourceMessageIds: string[]): Promise<MainChatMemoryReviewAudit> {
+  async function reviewTurnForMemories(chatId: string, userText: string, assistantText: string, sourceMessageIds: string[], memoryHandledByTool = false): Promise<MainChatMemoryReviewAudit> {
     const skipped = (reason: string): MainChatMemoryReviewAudit => ({ status: "skipped", reason, condensationMessageIds: [], candidates: [] });
     if (!project) return skipped("No active project.");
     if (!settings.apiKey?.trim() || !draftModelId) return skipped("No API key or model was available for post-response memory review.");
@@ -1782,7 +1892,11 @@ function ChatScreen({
             content: [
               "Review one completed conversation turn. Return only valid JSON with shape {\"condensedMessages\":[{\"id\":\"\",\"text\":\"\"}],\"memories\":[{\"text\":\"\",\"tags\":[],\"reason\":\"\",\"confidence\":0.0}] }.",
               "For each supplied message eligible for condensation, create an independent high-fidelity condensation within its exact maximum-character limit. Preserve dialogue and tone, actions, outcomes, intentions, emotional and relationship subtext, names, locations, injuries, discoveries, consequences, exact terms, ambiguity, and who knows what. Remove only redundancy and decorative prose. Aim to retain roughly 70-80% when meaningful nuance exists; go shorter only for genuinely repetitive or mostly decorative text. Never add interpretation or facts. Omit a condensation when shortening would lose important nuance.",
-              project.memoryMode === "manual" ? "Return an empty memories array because project memory saving is manual." : "Return an empty memories array when nothing qualifies. Maximum three memories. Follow the project's memory instruction exactly. Do not save ordinary narration, transient actions, momentary emotion, speculation, duplicate facts, inventory/log details, or technical/tool text.",
+              project.memoryMode === "manual"
+                ? "Return an empty memories array because project memory saving is manual."
+                : memoryHandledByTool
+                  ? "Return an empty memories array because this turn's explicit memory request was already handled by the save_memory tool."
+                  : "Return an empty memories array when nothing qualifies. Maximum three memories. Follow the project's memory instruction exactly. Do not save ordinary narration, transient actions, momentary emotion, speculation, duplicate facts, inventory/log details, or technical/tool text.",
               `Project memory instruction:\n${project.memoryInstruction || defaultMemoryInstruction}`
             ].join("\n\n")
           },
@@ -1803,7 +1917,7 @@ function ChatScreen({
       const responseText = json.choices?.[0]?.message?.content ?? "";
       await storeContextCondensations(condensationCandidates, responseText);
       const auditRequest = auditSafeValue(reviewPayload) as Record<string, unknown>;
-      if (project.memoryMode === "manual") return { status: "completed", reason: "Only context condensation was reviewed; memory saving is manual.", requestPayload: auditRequest, rawResponse: responseText, condensationMessageIds: condensationCandidates.map((message) => message.id), candidates: [] };
+      if (project.memoryMode === "manual" || memoryHandledByTool) return { status: "completed", reason: project.memoryMode === "manual" ? "Only context condensation was reviewed; memory saving is manual." : "The explicit memory request was already handled by save_memory; only context condensation was reviewed.", requestPayload: auditRequest, rawResponse: responseText, condensationMessageIds: condensationCandidates.map((message) => message.id), candidates: [] };
       const candidates = parseMemoryReview(responseText);
       if (!candidates.length) return { status: "completed", reason: "The review proposed no memories.", requestPayload: auditRequest, rawResponse: responseText, condensationMessageIds: condensationCandidates.map((message) => message.id), candidates: [] };
       const [saved, pending] = await Promise.all([
@@ -1915,6 +2029,7 @@ function ChatScreen({
       || includeCharacters
       || deltaEngagementEnabled()
       || (project?.inventoryEnabled && autoManageInventory)
+      || (project && project.memoryMode !== "manual")
     );
   }
 
@@ -2067,15 +2182,21 @@ function ChatScreen({
     const name = kind === "currency" ? (project.currencyName?.trim() || (typeof args.name === "string" ? args.name.trim() : "")) : typeof args.name === "string" ? normaliseInventoryName(args.name) : "";
     const delta = typeof args.delta === "number" ? args.delta : Number(args.delta);
     const unitWeightKg = typeof args.unitWeightKg === "number" ? args.unitWeightKg : Number(args.unitWeightKg);
+    let resolvedUnitWeightKg = Number.isFinite(unitWeightKg) && unitWeightKg > 0 ? unitWeightKg : undefined;
     const logSentence = typeof args.logSentence === "string" ? args.logSentence.trim() : "";
     if (!name || !Number.isFinite(delta) || delta === 0) return { error: "A non-empty item name and non-zero delta are required." };
     if (!logSentence) return { error: "A one-line log sentence is required." };
+    if (kind === "inventory") {
+      const existing = await db.inventoryItems.where("chatId").equals(chatId).and((item) => item.kind === "inventory" && item.normalisedName === name).first();
+      if (existing?.unitWeightKg) resolvedUnitWeightKg = existing.unitWeightKg;
+      else if (delta > 0 && !resolvedUnitWeightKg) return { error: "unitWeightKg is required for a new physical item. Estimate a sensible per-unit weight and retry the update." };
+    }
     const update: InventoryUpdateRequest = {
       id: uid(),
       kind,
       name,
       delta,
-      ...(Number.isFinite(unitWeightKg) && unitWeightKg > 0 ? { unitWeightKg } : {}),
+      ...(resolvedUnitWeightKg ? { unitWeightKg: resolvedUnitWeightKg } : {}),
       logSentence,
       status: shouldConfirmInventoryUpdate(kind) ? "pending" : "applied"
     };
@@ -2102,6 +2223,13 @@ function ChatScreen({
       const reason = typeof args.reason === "string" ? args.reason.trim() : "";
       const confidence = typeof args.confidence === "number" ? args.confidence : Number(args.confidence);
       if (!text) return { error: "Memory text is required." };
+      const identity = text.toLocaleLowerCase().replace(/\s+/g, " ");
+      const [savedMemories, pendingMemories] = await Promise.all([
+        db.memories.where("projectId").equals(project.id).toArray(),
+        db.pendingMemories.where("projectId").equals(project.id).toArray()
+      ]);
+      const duplicate = [...savedMemories, ...pendingMemories].find((memory) => memory.text.trim().toLocaleLowerCase().replace(/\s+/g, " ") === identity);
+      if (duplicate) return { duplicate: true, id: duplicate.id, status: "sourceType" in duplicate ? "already saved" : "already pending approval" };
       if (project.memoryMode === "approval") {
         const timestamp = now();
         await db.pendingMemories.add({
@@ -2118,6 +2246,7 @@ function ChatScreen({
         return { proposedForApproval: true };
       }
       const memory = await createMemory(project.id, text, tags, "automatic", sourceMessageIds);
+      await db.memories.update(memory.id, { sourceChatId: chatId });
       return { saved: true, id: memory.id };
     }
     return { error: `Unknown tool ${toolCall.function.name}.` };
@@ -2188,6 +2317,7 @@ function ChatScreen({
     if (!toolsEnabled(imageContextMessageId)) return { messages: messagesToSend, usage: undefined as OpenRouterUsage | undefined };
     let nextMessages = [...messagesToSend];
     let usage: OpenRouterUsage | undefined;
+    let memoryHandledByTool = false;
     const deltaImminentProposals: DeltaImminentProposal[] = [];
     for (let index = 0; index < 4; index += 1) {
       const response = await openRouterRequest(openRouterPayload(nextMessages, false, imageContextMessageId, index === 0 && Boolean(imageContextMessageId)));
@@ -2195,7 +2325,7 @@ function ChatScreen({
       usage = json.usage ?? usage;
       const assistantMessage = json.choices?.[0]?.message;
       const toolCalls = assistantMessage?.tool_calls ?? [];
-      if (!toolCalls.length) return { messages: nextMessages, assistantMessage, usage, deltaImminentProposal: deltaImminentProposals[deltaImminentProposals.length - 1] };
+      if (!toolCalls.length) return { messages: nextMessages, assistantMessage, usage, memoryHandledByTool, deltaImminentProposal: deltaImminentProposals[deltaImminentProposals.length - 1] };
       nextMessages = [
         ...nextMessages,
         {
@@ -2206,6 +2336,7 @@ function ChatScreen({
       ];
       for (const toolCall of toolCalls) {
         const result = await runToolCall(toolCall, chatId, inventoryUpdates, sourceMessageIds, deltaImminentProposals, imageContextMessageId);
+        if (toolCall.function.name === "save_memory" && result && typeof result === "object" && ("saved" in result || "proposedForApproval" in result || "duplicate" in result)) memoryHandledByTool = true;
         toolLog.push(toolCall.function.name);
         toolEvents.push({
           round: index + 1,
@@ -2228,7 +2359,7 @@ function ChatScreen({
         });
       }
     }
-    return { messages: nextMessages, usage, deltaImminentProposal: deltaImminentProposals[deltaImminentProposals.length - 1] };
+    return { messages: nextMessages, usage, memoryHandledByTool, deltaImminentProposal: deltaImminentProposals[deltaImminentProposals.length - 1] };
   }
 
   async function completeWithTools(messagesToSend: OpenRouterMessage[], toolLog: string[], toolEvents: MainChatAuditToolEvent[], inventoryUpdates: InventoryUpdateRequest[], chatId: string, sourceMessageIds: string[], imageContextMessageId?: string) {
@@ -2238,6 +2369,7 @@ function ChatScreen({
       replyText,
       inputTokens: resolved.usage?.prompt_tokens,
       outputTokens: resolved.usage?.completion_tokens,
+      memoryHandledByTool: resolved.memoryHandledByTool,
       deltaImminentProposal: resolved.deltaImminentProposal
     };
   }
@@ -2523,6 +2655,7 @@ function ChatScreen({
         sourceFiles.length ? `Source files:\n${sourceFiles.map((file) => `# ${file.name}\n${file.textContent}`).join("\n\n")}` : "",
         attachedFileDetails,
         images.length ? "An image is attached to the latest user message. First call save_image_context exactly once with a detailed concise visual extraction. It is hidden from the user. Then answer the user normally from the image." : "",
+        project.memoryMode !== "manual" ? "Memory saving is available through save_memory. When the user explicitly asks you to remember or save something as project memory, call save_memory and only confirm the outcome after its tool result. Do not claim that you cannot save project memory while this tool is available." : "",
         memoryDetails.text,
         inventoryDetails
       ].filter(Boolean);
@@ -2576,7 +2709,7 @@ function ChatScreen({
           if (createdChatId) await onChatCreated(createdChatId);
           else await onRefresh();
           finishActiveSend(sendController);
-          const memoryReview = await reviewTurnForMemories(chatId, text, completedReplyText, [userMessageId, reply.id].filter((id): id is string => Boolean(id)));
+          const memoryReview = await reviewTurnForMemories(chatId, text, completedReplyText, [userMessageId, reply.id].filter((id): id is string => Boolean(id)), completed.memoryHandledByTool);
           await storePostResponseMemoryAudit(reply.id, memoryReview);
           await onRefresh();
           return;
@@ -2693,15 +2826,6 @@ function ChatScreen({
     return { ...message, body: clean, updatedAt: timestamp, estimatedTokens: true };
   }
 
-  async function answeredUserMessage(message: Message) {
-    if (message.role === "user") return (await db.messages.get(message.id)) ?? message;
-    return db.messages
-      .where("[chatId+branchId+sequence]")
-      .between([message.chatId, message.branchId, Dexie.minKey], [message.chatId, message.branchId, message.sequence - 1])
-      .and((row) => row.role === "user")
-      .last();
-  }
-
   async function resendFromMessage(message: Message) {
     if (!project || !settings.apiKey) {
       alert("Add your OpenRouter API key before regenerating.");
@@ -2711,11 +2835,11 @@ function ChatScreen({
       alert("Choose a model before regenerating.");
       return;
     }
-    const promptMessage = await answeredUserMessage(message);
-    if (!promptMessage) {
-      alert("No user message was found to regenerate from.");
+    if (message.role !== "user") {
+      alert("Only user messages can be resent.");
       return;
     }
+    const promptMessage = (await db.messages.get(message.id)) ?? message;
     const chatId = message.chatId;
     const branchId = message.branchId;
     const timestamp = now();
@@ -2909,11 +3033,19 @@ function ChatScreen({
     await onRefresh();
   }
 
-  async function handleInventoryUpdateAction(message: Message, action: "confirm" | "edit" | "reject") {
+  async function handleInventoryUpdateAction(message: Message, action: "confirm" | "edit" | "reject", editedUpdates?: InventoryUpdateRequest[]) {
     const updates = message.requestInfo?.inventoryUpdates ?? [];
-    const pendingUpdates = updates.filter((update) => update.status === "pending");
+    const pendingUpdates = updates.filter((update) => update.status === "pending" || update.status === "edit");
     if (!pendingUpdates.length) return;
-    const status: InventoryUpdateRequest["status"] = action === "confirm" ? "confirmed" : action === "edit" ? "edit" : "rejected";
+    const editedById = new Map((editedUpdates ?? []).map((update) => [update.id, update]));
+    const resolvedUpdates = updates.map((update) => {
+      if (update.status !== "pending" && update.status !== "edit") return update;
+      if (action === "edit") {
+        const edited = editedById.get(update.id);
+        return edited ? { ...edited, id: update.id, status: "pending" as const } : update;
+      }
+      return { ...update, status: action === "confirm" ? "confirmed" as const : "rejected" as const };
+    });
     if (action === "confirm" && project) {
       for (const update of pendingUpdates) {
         await applyInventoryUpdate(project.id, message.chatId, update);
@@ -2925,17 +3057,10 @@ function ChatScreen({
         settings: message.requestInfo?.settings ?? [],
         toggles: message.requestInfo?.toggles ?? [],
         toolCalls: message.requestInfo?.toolCalls ?? [],
-        inventoryUpdates: updates.map((update) => update.status === "pending" ? { ...update, status } : update)
+        inventoryUpdates: resolvedUpdates
       },
       updatedAt: now()
     });
-    const nextDraft =
-      action === "confirm"
-        ? "((OOC: Inventory update confirmed.))"
-        : action === "edit"
-          ? "((OOC: Inventory update edit;\n\n))"
-          : "((OOC: Inventory update rejected because;\n\n))";
-    setBody((current) => current.trim() ? `${current}\n${nextDraft}` : nextDraft);
     await onRefresh();
   }
 
@@ -3069,7 +3194,7 @@ function ChatScreen({
   }, []);
   const editMessageStable = useCallback((message: Message, nextBody: string) => editMessageRef.current(message, nextBody), []);
   const resendFromMessageStable = useCallback((message: Message) => resendFromMessageRef.current(message), []);
-  const inventoryUpdateActionStable = useCallback((message: Message, action: "confirm" | "edit" | "reject") => inventoryUpdateActionRef.current(message, action), []);
+  const inventoryUpdateActionStable = useCallback((message: Message, action: "confirm" | "edit" | "reject", editedUpdates?: InventoryUpdateRequest[]) => inventoryUpdateActionRef.current(message, action, editedUpdates), []);
   const beginDeltaBriefStable = useCallback((message: Message) => beginDeltaBriefRef.current(message), []);
   const avoidDeltaBriefStable = useCallback((message: Message, attempt: string) => avoidDeltaBriefRef.current(message, attempt), []);
   const onRefreshStable = useCallback(() => onRefreshRef.current(), []);
@@ -3236,7 +3361,7 @@ function MessageRow({
   onExpand: (messageId: string) => void;
   onEdit: (message: Message, nextBody: string) => Promise<Message>;
   onResend: (message: Message) => Promise<void>;
-  onInventoryUpdateAction: (message: Message, action: "confirm" | "edit" | "reject") => Promise<void>;
+  onInventoryUpdateAction: (message: Message, action: "confirm" | "edit" | "reject", editedUpdates?: InventoryUpdateRequest[]) => Promise<void>;
   onBeginDeltaBrief: (message: Message) => Promise<void>;
   onAvoidDeltaBrief: (message: Message, attempt: string) => Promise<void>;
   deltaLocked: boolean;
@@ -3412,8 +3537,8 @@ function MessageRow({
         )}
         {message.role === "assistant" && (
           <InventoryUpdateCard
-            updates={(message.requestInfo?.inventoryUpdates ?? []).filter((update) => update.status === "pending")}
-            onAction={(action) => onInventoryUpdateAction(message, action)}
+            updates={(message.requestInfo?.inventoryUpdates ?? []).filter((update) => update.status === "pending" || update.status === "edit" || update.status === "rejected")}
+            onAction={(action, editedUpdates) => onInventoryUpdateAction(message, action, editedUpdates)}
           />
         )}
         <div className={`message-meta ${expanded ? "show" : ""}`}>
@@ -3423,7 +3548,7 @@ function MessageRow({
           <button aria-label="Response audit" title="Response audit" onClick={(event) => { event.stopPropagation(); setInfoOpen(true); }}><Info size={16} /></button>
           <span>{formatMessageDate(message.createdAt)}</span>
           <span>{message.inputTokens ?? message.outputTokens ?? estimateTokens(message.body)}t</span>
-          <button className="resend" aria-label="Resend message" title={deltaLocked ? "Resolve engagement to unlock resend" : "Resend"} disabled={deltaLocked} onClick={(event) => { event.stopPropagation(); setResendConfirm("resend"); }}><RefreshCw size={16} /></button>
+          {message.role === "user" && <button className="resend" aria-label="Resend message" title={deltaLocked ? "Resolve engagement to unlock resend" : "Resend"} disabled={deltaLocked} onClick={(event) => { event.stopPropagation(); setResendConfirm("resend"); }}><RefreshCw size={16} /></button>}
         </div>
       </article>
       {infoOpen && createPortal(<MessageInfoModal message={message} onClose={() => setInfoOpen(false)} />, document.body)}
@@ -3522,7 +3647,7 @@ type VirtualMessageListData = {
   onExpand: (messageId: string) => void;
   onEdit: (message: Message, nextBody: string) => Promise<Message>;
   onResend: (message: Message) => Promise<void>;
-  onInventoryUpdateAction: (message: Message, action: "confirm" | "edit" | "reject") => Promise<void>;
+  onInventoryUpdateAction: (message: Message, action: "confirm" | "edit" | "reject", editedUpdates?: InventoryUpdateRequest[]) => Promise<void>;
   onBeginDeltaBrief: (message: Message) => Promise<void>;
   onAvoidDeltaBrief: (message: Message, attempt: string) => Promise<void>;
   deltaLocked: boolean;
@@ -3692,24 +3817,66 @@ function MessageImageAttachments({ messageId }: { messageId: string }) {
   return <><div className="message-image-strip"><ImageStrip attachments={attachments} onOpen={setViewerIndex} /></div>{viewerIndex !== undefined && <ImageViewer attachments={attachments} index={viewerIndex} onChange={setViewerIndex} onClose={() => setViewerIndex(undefined)} />}</>;
 }
 
-function InventoryUpdateCard({ updates, onAction }: { updates: InventoryUpdateRequest[]; onAction: (action: "confirm" | "edit" | "reject") => Promise<void> }) {
+function InventoryUpdateCard({ updates, onAction }: { updates: InventoryUpdateRequest[]; onAction: (action: "confirm" | "edit" | "reject", editedUpdates?: InventoryUpdateRequest[]) => Promise<void> }) {
+  const [editing, setEditing] = useState(false);
+  const [drafts, setDrafts] = useState(updates);
+  const [error, setError] = useState("");
+  const rejected = updates.every((update) => update.status === "rejected");
+  useEffect(() => {
+    setDrafts(updates);
+    setEditing(false);
+    setError("");
+  }, [updates]);
   if (!updates.length) return null;
+
+  function updateDraft(id: string, patch: Partial<InventoryUpdateRequest>) {
+    setDrafts((current) => current.map((update) => update.id === id ? { ...update, ...patch } : update));
+  }
+
+  async function saveEdits() {
+    const cleaned = drafts.map((update) => ({
+      ...update,
+      name: update.kind === "currency" ? update.name.trim() : normaliseInventoryName(update.name),
+      logSentence: update.logSentence.trim()
+    }));
+    if (cleaned.some((update) => !update.name || !Number.isFinite(update.delta) || update.delta === 0 || !update.logSentence || (update.kind === "inventory" && update.delta > 0 && (!update.unitWeightKg || !Number.isFinite(update.unitWeightKg))) || (update.unitWeightKg !== undefined && (!Number.isFinite(update.unitWeightKg) || update.unitWeightKg <= 0)))) {
+      setError("Each update needs an item name, a non-zero quantity, and a log sentence. Added physical items also need a positive unit weight.");
+      return;
+    }
+    await onAction("edit", cleaned);
+  }
+
   return (
-    <div className="inventory-update-card" onClick={(event) => event.stopPropagation()}>
+    <div className={`inventory-update-card ${rejected ? "rejected" : ""}`} onClick={(event) => event.stopPropagation()}>
       <h3>Inventory Update</h3>
       <div className="inventory-update-list">
-        {updates.map((update) => (
+        {(editing ? drafts : updates).map((update) => editing ? (
+          <div className="inventory-update-editor" key={update.id}>
+            <label>Item<input value={update.name} onChange={(event) => updateDraft(update.id, { name: event.target.value })} /></label>
+            <label>Quantity<input type="number" step="any" value={update.delta} onChange={(event) => updateDraft(update.id, { delta: Number(event.target.value) })} /></label>
+            {update.kind !== "currency" && <label>Unit weight (kg)<input type="number" min="0" step="any" value={update.unitWeightKg ?? ""} onChange={(event) => updateDraft(update.id, { unitWeightKg: event.target.value === "" ? undefined : Number(event.target.value) })} /></label>}
+            <label className="inventory-update-log">Log sentence<input value={update.logSentence} onChange={(event) => updateDraft(update.id, { logSentence: event.target.value })} /></label>
+          </div>
+        ) : (
           <div className={`inventory-update-row ${update.delta > 0 ? "add" : "remove"}`} key={update.id}>
-            <span>{update.name}</span>
+            <span>{update.name}{update.unitWeightKg ? <small>{formatInventoryKg(update.unitWeightKg)} kg each · {formatInventoryKg(Math.abs(update.delta) * update.unitWeightKg)} kg total</small> : null}</span>
             <strong>{update.delta > 0 ? "+" : ""}{update.delta}</strong>
           </div>
         ))}
       </div>
-      <div className="inventory-update-actions">
-        <button type="button" onClick={() => onAction("confirm")}>Confirm</button>
-        <button type="button" onClick={() => onAction("edit")}>Edit</button>
-        <button type="button" onClick={() => onAction("reject")}>Reject</button>
-      </div>
+      {error && <small className="error">{error}</small>}
+      {rejected ? <p className="inventory-update-status">((inventory rejected by user))</p> : editing ? (
+        <div className="inventory-update-actions">
+          <button type="button" onClick={() => void saveEdits()}>Save changes</button>
+          <button type="button" onClick={() => { setDrafts(updates); setEditing(false); setError(""); }}>Cancel</button>
+        </div>
+      ) : (
+        <div className="inventory-update-actions">
+          <button type="button" onClick={() => void onAction("confirm")}>Confirm</button>
+          <button type="button" onClick={() => setEditing(true)}>Edit</button>
+          <button type="button" onClick={() => void onAction("reject")}>Reject</button>
+        </div>
+      )}
     </div>
   );
 }
@@ -4436,6 +4603,8 @@ function DeltaBaseEditor({ value, onChange }: { value: DeltaBaseTemplate[]; onCh
             <label>ID<input value={item.id} onChange={(event) => update(index, { id: event.target.value })} /></label>
             <label>Label<input value={item.label} onChange={(event) => update(index, { label: event.target.value.toUpperCase() })} placeholder="BASE" /></label>
             <label>HP bonus<input type="number" value={item.hpBonus ?? 0} onChange={(event) => update(index, { hpBonus: Number(event.target.value) })} /></label>
+            <label>Carry kg / STR<input type="number" min={0.1} step={0.1} value={item.carryKgPerStr ?? 6.8} onChange={(event) => update(index, { carryKgPerStr: Number(event.target.value) })} /></label>
+            <label>Combat load %<input type="number" min={1} max={100} step={1} value={item.combatLoadPercent ?? 50} onChange={(event) => update(index, { combatLoadPercent: Number(event.target.value) })} /></label>
             <button className="icon-button delta-template-delete" onClick={() => onChange(value.filter((_, itemIndex) => itemIndex !== index))} aria-label={`Delete ${item.label || "BASE"}`} title="Delete BASE"><Trash2 size={15} /></button>
           </div>
           <AbilityModifierEditor value={item.statModifiers} onChange={(statModifiers) => update(index, { statModifiers })} />
@@ -4849,7 +5018,7 @@ function CharacterTile({ character, dragging, onDragStart, onDrop, onOpen }: { c
   );
 }
 
-function CharacterProfilePage({ project, characterId, onBack, onDeleted }: { project: Project; characterId: string; onBack: () => void; onDeleted: () => void }) {
+function CharacterProfilePage({ project, characterId, chatId, onSaved, onBack, onDeleted }: { project: Project; characterId: string; chatId?: string; onSaved?: () => void; onBack: () => void; onDeleted: () => void }) {
   const [character, setCharacter] = useState<Character>();
   async function load() {
     const row = await db.characters.get(characterId);
@@ -4857,14 +5026,18 @@ function CharacterProfilePage({ project, characterId, onBack, onDeleted }: { pro
   }
   useEffect(() => { load(); }, [characterId, project.id]);
   if (!character) return <EmptyState title="Character not found" body="This character could not be opened in the selected project." />;
-  return <Page><CharacterEditor project={project} character={character} onRefresh={load} onBack={onBack} onDeleted={onDeleted} /></Page>;
+  return <Page><CharacterEditor project={project} character={character} chatId={chatId} onSaved={onSaved} onRefresh={load} onBack={onBack} onDeleted={onDeleted} /></Page>;
 }
 
-function CharacterEditor({ project, character, onRefresh, onBack, onDeleted }: { project: Project; character: Character; onRefresh: () => Promise<void>; onBack: () => void; onDeleted: () => void }) {
+function CharacterEditor({ project, character, chatId, onSaved, onRefresh, onBack, onDeleted }: { project: Project; character: Character; chatId?: string; onSaved?: () => void; onRefresh: () => Promise<void>; onBack: () => void; onDeleted: () => void }) {
   const [draft, setDraft] = useState(character);
   const [editing, setEditing] = useState(false);
   const [attachments, setAttachments] = useState<{ id: string; url: string; mimeType: string }[]>([]);
   const [bonuses, setBonuses] = useState<CharacterBonus[]>([]);
+  const [gearStatBonuses, setGearStatBonuses] = useState<AbilityModifiers>({});
+  const [carryGearWeightKg, setCarryGearWeightKg] = useState(0);
+  const [carryInventoryWeightKg, setCarryInventoryWeightKg] = useState(0);
+  const [unweighedItemCount, setUnweighedItemCount] = useState(0);
   const [viewerIndex, setViewerIndex] = useState<number>();
   const [saved, showSaved] = useSavedNotice();
   const buildMode = characterBuildMode(draft);
@@ -4879,15 +5052,29 @@ function CharacterEditor({ project, character, onRefresh, onBack, onDeleted }: {
   async function loadBonuses() {
     setBonuses(await db.characterBonuses.where("characterId").equals(character.id).toArray());
   }
+  async function loadCarryWeights() {
+    const [gearSlots, inventoryItems] = await Promise.all([
+      db.characterGearSlots.where("characterId").equals(character.id).toArray(),
+      chatId ? db.inventoryItems.where("chatId").equals(chatId).and((item) => item.kind === "inventory").toArray() : Promise.resolve([])
+    ]);
+    setCarryGearWeightKg(gearSlots.reduce((sum, slot) => sum + (slot.carryWeightKg ?? 0), 0));
+    setGearStatBonuses(abilities.reduce<AbilityModifiers>((totals, ability) => {
+      totals[ability] = gearSlots.filter((slot) => slot.itemName.trim()).reduce((sum, slot) => sum + (slot.statBonuses?.[ability] ?? 0), 0);
+      return totals;
+    }, {}));
+    setCarryInventoryWeightKg(inventoryItems.reduce((sum, item) => sum + (item.unitWeightKg ?? 0) * item.quantity, 0));
+    setUnweighedItemCount(inventoryItems.filter((item) => !item.unitWeightKg).reduce((sum, item) => sum + item.quantity, 0));
+  }
   useEffect(() => {
     setDraft(character);
     loadAttachments();
     loadBonuses();
+    loadCarryWeights();
     return () => attachments.forEach((item) => URL.revokeObjectURL(item.url));
   }, [character.id]);
   async function save() {
     const mode = characterBuildMode(draft);
-    await db.characters.put({
+    const savedCharacter: Character = {
       ...draft,
       buildMode: mode,
       jobCategory: mode === "template" ? draft.jobCategory : undefined,
@@ -4895,10 +5082,13 @@ function CharacterEditor({ project, character, onRefresh, onBack, onDeleted }: {
       customJobName: mode === "custom" ? draft.customJobName?.trim() : undefined,
       normalisedName: normaliseTag(draft.name),
       updatedAt: now()
-    });
+    };
+    await db.characters.put(savedCharacter);
+    await refreshActiveDeltaCharacterStats(project, savedCharacter);
     setEditing(false);
     showSaved();
     await onRefresh();
+    onSaved?.();
   }
   async function addBonus() {
     const timestamp = now();
@@ -4952,7 +5142,7 @@ function CharacterEditor({ project, character, onRefresh, onBack, onDeleted }: {
         <div className="character-display">
           <div className="character-summary-row">
             {attachments[0] && <img className="profile-side-image" src={attachments[0].url} alt="" />}
-            {character.statsEnabled && <StatsDisplay project={project} character={character} bonuses={bonuses} />}
+            {character.statsEnabled && <StatsDisplay project={project} character={character} bonuses={bonuses} gearStatBonuses={gearStatBonuses} />}
           </div>
           <p className="bio-full"><strong>Bio:</strong> {character.bio || "No bio saved yet."}</p>
           <div className="split-actions">
@@ -4976,7 +5166,8 @@ function CharacterEditor({ project, character, onRefresh, onBack, onDeleted }: {
           <label className="file-pick"><ImageIcon size={18} /> Add images<input type="file" accept="image/*" multiple onChange={(event) => addImages(event.target.files)} /></label>
           <ImageStrip attachments={attachments} onOpen={setViewerIndex} />
           <label className="compact-check"><input type="checkbox" checked={draft.statsEnabled} onChange={(event) => setDraft({ ...draft, statsEnabled: event.target.checked })} /> Enable ability scores</label>
-          {draft.statsEnabled && <PointBuyEditor project={project} draft={draft} bonuses={bonuses} onDraft={setDraft} />}
+          {draft.statsEnabled && <PointBuyEditor project={project} draft={draft} bonuses={bonuses} gearStatBonuses={gearStatBonuses} onDraft={setDraft} />}
+          {draft.statsEnabled && <CharacterCarryPreview project={project} character={draft} bonuses={bonuses} gearStatBonuses={gearStatBonuses} inventoryWeightKg={carryInventoryWeightKg} gearWeightKg={carryGearWeightKg} unweighedItemCount={unweighedItemCount} />}
           <CharacterActionLibraryEditor character={character} />
           {!valid && <p className="error">{buildMode === "template" ? "Choose a JOB for template builds." : "Custom builds need a job name and must stay within 27 points, with base scores from 8 to 15."}</p>}
           <div className="split-actions persistent-actions"><button disabled={!valid} onClick={save}><Save size={18} /> Save</button><button onClick={() => setEditing(false)}>Cancel</button>{saved && <span className="save-status">Saved</span>}</div>
@@ -5199,23 +5390,42 @@ function templateOptionLabel(label: string, statModifiers: AbilityModifiers = {}
   return bonuses.length > 0 ? `${label} (${bonuses.join(", ")})` : label;
 }
 
-function StatsDisplay({ project, character, bonuses }: { project: Project; character: Character; bonuses: CharacterBonus[] }) {
+function StatsDisplay({ project, character, bonuses, gearStatBonuses }: { project: Project; character: Character; bonuses: CharacterBonus[]; gearStatBonuses: AbilityModifiers }) {
   const template = characterTemplateBonus(project, character);
   const templateBuild = characterBuildMode(character) === "template";
   const buildTag = characterBuildTag(character, template.generated.templateTag);
   const defaultStats = project.deltaDefaultNpcStats ?? defaultDeltaNpcStats();
   const conBonus = bonuses.filter((item) => item.stat === "CON").reduce((sum, item) => sum + item.value, 0);
-  const totalCon = (templateBuild ? defaultStats.CON : character.con) + template.bonus.CON + conBonus;
+  const totalCon = (templateBuild ? defaultStats.CON : character.con) + template.bonus.CON + conBonus + (gearStatBonuses.CON ?? 0);
   const totalHp = Math.max(1, 10 + scoreModifier(totalCon) + template.generated.hpBonus);
   return <div className="stat-display">{abilities.map((ability) => {
     const key = ability.toLowerCase() as "str" | "dex" | "con" | "int" | "wis" | "cha";
     const legacyBonus = bonuses.filter((item) => item.stat === ability).reduce((sum, item) => sum + item.value, 0);
-    const total = (templateBuild ? defaultStats[ability] : character[key]) + template.bonus[ability] + legacyBonus;
+    const total = (templateBuild ? defaultStats[ability] : character[key]) + template.bonus[ability] + legacyBonus + (gearStatBonuses[ability] ?? 0);
     return <span key={ability}>{ability} {total} <small>{modifierLabel(total)}</small></span>;
   })}<span className="character-hp-display">HP {totalHp} <HpSquares current={totalHp} max={totalHp} character /></span>{buildTag && <small className="delta-template-tag">{buildTag}</small>}</div>;
 }
 
-function PointBuyEditor({ project, draft, bonuses, onDraft }: { project: Project; draft: Character; bonuses: CharacterBonus[]; onDraft: (character: Character) => void }) {
+function CharacterCarryPreview({ project, character, bonuses, gearStatBonuses, inventoryWeightKg, gearWeightKg, unweighedItemCount }: { project: Project; character: Character; bonuses: CharacterBonus[]; gearStatBonuses: AbilityModifiers; inventoryWeightKg: number; gearWeightKg: number; unweighedItemCount: number }) {
+  const template = characterTemplateBonus(project, character);
+  const templateBuild = characterBuildMode(character) === "template";
+  const defaultStats = project.deltaDefaultNpcStats ?? defaultDeltaNpcStats();
+  const legacyStrengthBonus = bonuses.filter((bonus) => bonus.stat === "STR").reduce((sum, bonus) => sum + bonus.value, 0);
+  const finalStrength = (templateBuild ? defaultStats.STR : character.str) + template.bonus.STR + legacyStrengthBonus + (gearStatBonuses.STR ?? 0);
+  const currentLoadKg = inventoryWeightKg + gearWeightKg;
+  const profile = deltaCarryProfile(project, character.base, finalStrength, currentLoadKg);
+  const status = profile.status === "overloaded" ? "Overloaded" : profile.status === "encumbered" ? "Encumbered" : "Normal";
+  return (
+    <section className="character-carry-preview" aria-label="Carrying preview">
+      <div><span>Carry capacity</span><strong>{formatInventoryKg(profile.carryCapacityKg)} kg</strong><small>STR {finalStrength} × {profile.carryKgPerStr} kg</small></div>
+      <div><span>Combat load</span><strong>{formatInventoryKg(profile.combatLoadKg)} kg</strong><small>{profile.combatLoadPercent}% of capacity</small></div>
+      <div><span>Current load</span><strong>{formatInventoryKg(currentLoadKg)} kg</strong><small>{formatInventoryKg(inventoryWeightKg)} inventory + {formatInventoryKg(gearWeightKg)} gear</small></div>
+      <div><span>Status</span><strong className={`gear-load-status ${profile.status}`}>{status}</strong>{unweighedItemCount > 0 && <small>+ {unweighedItemCount} unweighed item{unweighedItemCount === 1 ? "" : "s"}</small>}</div>
+    </section>
+  );
+}
+
+function PointBuyEditor({ project, draft, bonuses, gearStatBonuses, onDraft }: { project: Project; draft: Character; bonuses: CharacterBonus[]; gearStatBonuses: AbilityModifiers; onDraft: (character: Character) => void }) {
   const buildMode = characterBuildMode(draft);
   const templateBuild = buildMode === "template";
   const pointCost = abilities.reduce((sum, ability) => {
@@ -5228,7 +5438,7 @@ function PointBuyEditor({ project, draft, bonuses, onDraft }: { project: Project
   const jobsForCategory = (project.deltaJobs ?? []).filter((job) => job.category === draft.jobCategory);
   const defaultStats = project.deltaDefaultNpcStats ?? defaultDeltaNpcStats();
   const legacyConBonus = bonuses.filter((item) => item.stat === "CON").reduce((sum, item) => sum + item.value, 0);
-  const totalCon = (templateBuild ? defaultStats.CON : draft.con) + template.bonus.CON + legacyConBonus;
+  const totalCon = (templateBuild ? defaultStats.CON : draft.con) + template.bonus.CON + legacyConBonus + (gearStatBonuses.CON ?? 0);
   const baseHp = Math.max(1, 10 + scoreModifier(totalCon));
   const tagHpBonus = template.generated.hpBonus;
   const totalHp = Math.max(1, baseHp + tagHpBonus);
@@ -5237,7 +5447,7 @@ function PointBuyEditor({ project, draft, bonuses, onDraft }: { project: Project
     const key = ability.toLowerCase() as "str" | "dex" | "con" | "int" | "wis" | "cha";
     const base = templateBuild ? defaultStats[ability] : draft[key];
     const legacyBonus = bonuses.filter((item) => item.stat === ability).reduce((sum, item) => sum + item.value, 0);
-    const bonus = template.bonus[ability] + legacyBonus;
+    const bonus = template.bonus[ability] + legacyBonus + (gearStatBonuses[ability] ?? 0);
     const total = base + bonus;
     return { ability, key, base, bonus, total };
   });

@@ -480,6 +480,13 @@ export interface InventoryItem extends Timestamped {
   normalisedName: string;
   quantity: number;
   unitWeightKg?: number;
+  dpBonus?: number;
+  apBonus?: number;
+  hpBonus?: number;
+  combatLoadKg?: number;
+  carrySlots?: number;
+  carryReductionPercent?: number;
+  statBonuses?: AbilityModifiers;
 }
 
 export interface InventoryLog extends Timestamped {
@@ -533,7 +540,7 @@ export interface CharacterGearSlot extends Timestamped {
   combatLoadKg?: number;
   carrySlots?: number;
   carryReductionPercent?: number;
-  traits?: string;
+  statBonuses?: AbilityModifiers;
 }
 
 export type Ability = "STR" | "DEX" | "CON" | "INT" | "WIS" | "CHA";
@@ -552,6 +559,8 @@ export interface DeltaBaseTemplate {
   label: string;
   statModifiers: AbilityModifiers;
   hpBonus?: number;
+  carryKgPerStr?: number;
+  combatLoadPercent?: number;
   notes?: string;
 }
 

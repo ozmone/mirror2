@@ -93,14 +93,14 @@ export const inventoryTools = [
     type: "function",
     function: {
       name: "update_inventory_item",
-      description: "Add or subtract a quantity from the current chat inventory. Use a positive delta for gained items and a negative delta for spent/lost/removed items. Subtract only the amount used/lost; do not remove a whole stack unless the full quantity is gone. Item names should be singular stack names where possible.",
+      description: "Add or subtract a quantity from the current chat inventory. Use a positive delta for gained items and a negative delta for spent/lost/removed items. Subtract only the amount used/lost; do not remove a whole stack unless the full quantity is gone. Item names should be singular stack names where possible. Every newly added physical inventory item must have a reasonable estimated per-unit weight.",
       parameters: {
         type: "object",
         properties: {
           kind: { type: "string", enum: ["inventory", "currency"], description: "Use inventory for carried items/ammo/consumables and currency for the chat currency amount." },
           name: { type: "string", description: "Singular item stack name, or the currency name when kind is currency." },
           delta: { type: "number", description: "Quantity change. Example: -12 when 12 rounds are used, 32 when 32 rounds are picked up." },
-          unitWeightKg: { type: "number", description: "Optional estimated weight in KG for one unit of this inventory item. Use only when known or strongly implied. Minimum precision is 0.01kg: never use values below 0.01kg or long decimals." },
+          unitWeightKg: { type: "number", minimum: 0.01, description: "Estimated weight in KG for one unit. Required when adding a physical inventory item that does not already have a stored weight. Make a reasonable estimate rather than omitting it. Do not provide weight for currency. Use at least 0.01kg and no long decimals." },
           logSentence: { type: "string", description: "One terse narrative sentence explaining this exact inventory change and where it came from or went, such as 'Obtained Admin Key x 1 from Jaeger.' or 'Spent 9mm x 12 during the alley fight.'" }
         },
         required: ["kind", "name", "delta", "logSentence"]

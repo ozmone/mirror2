@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { db } from "./db";
 import { defaultDeltaBases, defaultSettings, sampleProject } from "./defaults";
-import { addDeltaMessage, applyDeltaDamage, applyInventoryChange, createChat, createMemory, formatDeltaTemplateTag, generatedDeltaStats, getCharacterBio, getCharacterIdentity, getCharacterStats, messagesForIncrementalCompaction, normaliseInventoryName, searchMemories, validatePointBuy } from "./repositories";
+import { addDeltaMessage, applyDeltaDamage, applyInventoryChange, createChat, createMemory, deltaCarryProfile, formatDeltaTemplateTag, generatedDeltaStats, getCharacterBio, getCharacterIdentity, getCharacterStats, messagesForIncrementalCompaction, normaliseInventoryName, searchMemories, validatePointBuy } from "./repositories";
 import { Character, DeltaRollReceipt, Message } from "../types";
 
 describe("local data rules", () => {
@@ -138,6 +138,18 @@ describe("local data rules", () => {
     expect(generated.job).toBe("ROGUE");
     expect(generated.scores).toEqual({ STR: 9, DEX: 15, CON: 9, INT: 10, WIS: 10, CHA: 11 });
     expect(generated.maxHp).toBe(4);
+  });
+
+  it("derives carry capacity and combat-load status from custom BASE values", () => {
+    const project = {
+      ...sampleProject(),
+      deltaBases: [{ id: "scout", label: "SCOUT", statModifiers: {}, carryKgPerStr: 5, combatLoadPercent: 40 }]
+    };
+
+    expect(deltaCarryProfile(project, "SCOUT", 10, 19)).toMatchObject({ carryCapacityKg: 50, combatLoadKg: 20, status: "normal" });
+    expect(deltaCarryProfile(project, "SCOUT", 10, 20)).toMatchObject({ status: "encumbered" });
+    expect(deltaCarryProfile(project, "SCOUT", 10, 51)).toMatchObject({ status: "overloaded" });
+    expect(deltaCarryProfile(project, "deleted-base", 10, 34)).toMatchObject({ carryCapacityKg: 68, combatLoadKg: 34, status: "encumbered" });
   });
 
   it("applies character PREFIX BASE JOB tags to saved character stats", async () => {
