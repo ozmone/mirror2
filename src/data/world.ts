@@ -46,9 +46,9 @@ export function worldInstruction(world: WorldState) {
   if (world.timeMode !== "ai") return "";
   const trackerRows = world.trackers.map((tracker) => `- ${tracker.id}: ${tracker.label} (current ${tracker.currentValue}${tracker.maximum === undefined ? "" : `, maximum ${tracker.maximum}`})`).join("\n") || "(none)";
   return [
-    "WORLD STATE (app authoritative): Return normal prose, then on its own final line exactly `<!--WORLD_STATE {json}-->`.",
-    "The JSON must include a finite non-negative integer advanceSeconds on EVERY reply. Never calculate clock, date, passive time-rule changes, or final tracker values.",
-    world.locationTracking ? "The JSON must include location as the player’s complete current location on EVERY reply, even if unchanged." : "Location tracking is off; omit location.",
+    "WORLD STATE (app authoritative): Your response is accepted only through the required finalize_turn tool. Put the normal visible response in its prose argument.",
+    "finalize_turn must include a finite non-negative integer advanceSeconds on EVERY reply. Never calculate clock, date, passive time-rule changes, or final tracker values.",
+    world.locationTracking ? "finalize_turn must include location as the player’s complete current location on EVERY reply, even if unchanged." : "Location tracking is off; use an empty location string.",
     "trackerChanges may be [] or items of {trackerId, operation:add|subtract, value:number}; use only these stable IDs for direct story-event changes.",
     `Current fictional time: ${formatWorldTime(world) || "not displayed"}${formatWorldCalendar(world) ? `; calendar ${formatWorldCalendar(world)}` : ""}.`,
     `Current location: ${world.location || "(not set)"}.`,

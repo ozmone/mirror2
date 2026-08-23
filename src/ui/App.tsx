@@ -73,7 +73,7 @@ import { GearDrawer } from "./gear/GearDrawer";
 import { DeltaActionTree } from "./delta/DeltaActionTree";
 import { DeltaModeWorkspace } from "./delta/DeltaModeWorkspace";
 import { abstractDeltaRosterName, deltaRosterParticipants, downloadJson, extractJsonObject, fitComposerTextarea, formatInventoryKg, isInvalidDeltaEntityName, jobCategories, keepComposerVisible, useSavedNotice } from "./delta/workspaceSupport";
-import { characterTools, imageContextTools, inventoryTools, memoryTools, deltaImminentTools, type OpenRouterMessage, type OpenRouterResponse, type OpenRouterToolCall, type OpenRouterUsage } from "./openRouter";
+import { characterTools, finalizeTurnTool, imageContextTools, inventoryTools, memoryTools, deltaImminentTools, type OpenRouterMessage, type OpenRouterResponse, type OpenRouterToolCall, type OpenRouterUsage } from "./openRouter";
 import { MarkdownText } from "./shared/MarkdownText";
 import { LoadingSignal } from "./shared/LoadingSignal";
 import { HpSquares } from "./shared/HpSquares";
@@ -1073,7 +1073,9 @@ function WorldTrackerEditor({ tracker, index, count, onChange, onMove, onDelete 
 }
 
 function Header({ title, subtitle, contextNote, onMenu, right, world, worldStatusOpen, onWorldToggle }: { title: string; subtitle?: string; contextNote?: string; onMenu: () => void; right?: React.ReactNode; world?: WorldState; worldStatusOpen?: boolean; onWorldToggle?: () => void }) {
-  const readout = world && [formatWorldTime(world), world.location].filter(Boolean).join(" · ");
+  const [locationTooltipOpen, setLocationTooltipOpen] = useState(false);
+  const worldTime = world && formatWorldTime(world);
+  const hasReadout = Boolean(worldTime || world?.location);
   return (
     <header className="topbar-wrap">
     <div className="topbar">
@@ -1081,12 +1083,11 @@ function Header({ title, subtitle, contextNote, onMenu, right, world, worldStatu
         <Menu size={22} />
       </button>
       <div className="brand-mini">
-        <MothMark />
         <div className="title-stack"><strong>{title}</strong>{(subtitle || contextNote) && <div className="title-meta">{subtitle && <span>{subtitle}</span>}{contextNote && <small>{contextNote}</small>}</div>}</div>
       </div>
-      <div className="header-right">{readout && <button className="world-readout" type="button" title={world?.location || undefined} onClick={onWorldToggle}>{readout}</button>}{right}</div>
+      <div className="header-right">{hasReadout && <button className="world-readout" type="button" title="Show world details" aria-expanded={worldStatusOpen} onClick={() => { if (worldStatusOpen) setLocationTooltipOpen(false); onWorldToggle?.(); }}>{worldTime && <span>{worldTime}</span>}{world?.location && <span>{world.location}</span>}</button>}{right}</div>
     </div>
-    {worldStatusOpen && world && <div className="world-status" title={world.location}>{world.location && <span className="world-status-location">{world.location}</span>}{world.trackers.filter((tracker) => tracker.visibleInStatusBar).sort((a, b) => a.orderIndex - b.orderIndex).map((tracker) => <span key={tracker.id}>{formatTracker(tracker)}</span>)}</div>}
+    {worldStatusOpen && world && <div className="world-status-wrap"><div className="world-status">{world.location && <button className="world-status-location" type="button" aria-expanded={locationTooltipOpen} onClick={() => setLocationTooltipOpen((open) => !open)}>{world.location}</button>}{world.trackers.filter((tracker) => tracker.visibleInStatusBar).sort((a, b) => a.orderIndex - b.orderIndex).map((tracker) => <span key={tracker.id}>{formatTracker(tracker)}</span>)}</div>{locationTooltipOpen && world.location && <div className="world-location-tooltip" role="status">{world.location}</div>}</div>}
     </header>
   );
 }
@@ -1592,6 +1593,7 @@ function ChatScreen({
   const [maxHistory, setMaxHistory] = useState(settings.maxHistoryMessages?.toString() ?? "20");
   const [historyNoLimit, setHistoryNoLimit] = useState(Boolean(settings.historySettingsInitialized && !settings.maxHistoryMessages));
   const [infiniteWarningOpen, setInfiniteWarningOpen] = useState(false);
+  const [toolRequirementOpen, setToolRequirementOpen] = useState(false);
   const [compactionEnabled, setCompactionEnabled] = useState(settings.compactionEnabled ?? false);
   const [streamingEnabled, setStreamingEnabled] = useState(settings.streamingEnabled ?? true);
   const [autoManageInventory, setAutoManageInventory] = useState(settings.autoManageInventory ?? false);
@@ -1765,7 +1767,7 @@ function ChatScreen({
     }
   }
 
-  function openRouterPayload(messagesToSend: OpenRouterMessage[], stream: boolean, imageContextMessageId?: string, forceImageContextTool = false) {
+  function openRouterPayload(messagesToSend: OpenRouterMessage[], stream: boolean, imageContextMessageId?: string, forceImageContextTool = false, forceTurnFinalizer = false) {
     const payload: Record<string, unknown> = {
       model: draftModelId,
       messages: messagesToSend,
@@ -1783,10 +1785,12 @@ function ChatScreen({
       ...(includeCharacters ? [...characterTools] : []),
       ...(project?.inventoryEnabled && autoManageInventory ? [...inventoryTools] : []),
       ...(project && project.memoryMode !== "manual" ? [...memoryTools] : []),
-      ...(imageContextMessageId ? [...imageContextTools] : [])
+      ...(imageContextMessageId ? [...imageContextTools] : []),
+      ...(forceTurnFinalizer ? [finalizeTurnTool] : [])
     ];
     if (activeTools.length) payload.tools = activeTools;
     if (forceImageContextTool) payload.tool_choice = { type: "function", function: { name: "save_image_context" } };
+    else if (forceTurnFinalizer) payload.tool_choice = { type: "function", function: { name: "finalize_turn" } };
     if (stream) payload.stream_options = { include_usage: true };
     return payload;
   }
@@ -2085,11 +2089,22 @@ function ChatScreen({
   function toolsEnabled(imageContextMessageId?: string) {
     return Boolean(
       imageContextMessageId
+      || chat?.world?.timeMode === "ai"
       || includeCharacters
       || deltaEngagementEnabled()
       || (project?.inventoryEnabled && autoManageInventory)
       || (project && project.memoryMode !== "manual")
     );
+  }
+
+  async function requireToolCapableModel() {
+    if (!toolsEnabled()) return true;
+    const model = await db.modelLibrary.where("modelId").equals(draftModelId).first();
+    // Older saved models predate the capability field. Treat an unknown value as
+    // unverified rather than rejecting a model that may support tools.
+    if (model?.supportsTools !== false) return true;
+    setToolRequirementOpen(true);
+    return false;
   }
 
   function createMainChatAudit(options: {
@@ -2325,6 +2340,25 @@ function ChatScreen({
     return { saved: true, context };
   }
 
+  async function runTurnFinalizer(toolCall: OpenRouterToolCall, chatId: string) {
+    let args: Record<string, unknown> = {};
+    try { args = JSON.parse(toolCall.function.arguments || "{}") as Record<string, unknown>; } catch { return { error: "Invalid final turn arguments." }; }
+    const prose = typeof args.prose === "string" ? args.prose.trim() : "";
+    const advanceSeconds = Number(args.advanceSeconds);
+    const activeChat = await db.chats.get(chatId);
+    const world = activeChat?.world;
+    const location = typeof args.location === "string" ? args.location.trim() : "";
+    if (!prose || !Number.isFinite(advanceSeconds) || advanceSeconds < 0 || (world?.locationTracking && !location)) return { error: "A complete prose response, non-negative advanceSeconds, and required location are needed." };
+    const trackerChanges = Array.isArray(args.trackerChanges) ? args.trackerChanges.filter((item): item is { trackerId: string; operation: "add" | "subtract"; value: number } => Boolean(item) && typeof item === "object" && typeof (item as Record<string, unknown>).trackerId === "string" && (((item as Record<string, unknown>).operation === "add") || ((item as Record<string, unknown>).operation === "subtract")) && Number.isFinite((item as Record<string, unknown>).value)) : [];
+    const metadata: WorldReplyMetadata = { advanceSeconds: Math.floor(advanceSeconds), ...(location ? { location } : {}), trackerChanges };
+    if (world?.timeMode === "ai") {
+      const nextWorld = applyWorldReply(world, metadata);
+      await db.chats.update(chatId, { world: nextWorld, updatedAt: now() });
+      setWorld(nextWorld);
+    }
+    return { finalizedTurn: { prose, metadata } };
+  }
+
   function runDeltaImminentTool(toolCall: OpenRouterToolCall, proposals: DeltaImminentProposal[]) {
     let args: Record<string, unknown> = {};
     try {
@@ -2357,6 +2391,7 @@ function ChatScreen({
   }
 
   async function runToolCall(toolCall: OpenRouterToolCall, chatId: string, inventoryUpdates: InventoryUpdateRequest[], sourceMessageIds: string[], deltaImminentProposals: DeltaImminentProposal[], imageContextMessageId?: string) {
+    if (toolCall.function.name === "finalize_turn") return runTurnFinalizer(toolCall, chatId);
     if (toolCall.function.name === "prepare_delta_engagement") {
       return runDeltaImminentTool(toolCall, deltaImminentProposals);
     }
@@ -2372,19 +2407,25 @@ function ChatScreen({
     return runCharacterTool(toolCall);
   }
 
-  async function resolveToolCalls(messagesToSend: OpenRouterMessage[], toolLog: string[], toolEvents: MainChatAuditToolEvent[], inventoryUpdates: InventoryUpdateRequest[], chatId: string, sourceMessageIds: string[], imageContextMessageId?: string) {
+  async function resolveToolCalls(messagesToSend: OpenRouterMessage[], toolLog: string[], toolEvents: MainChatAuditToolEvent[], inventoryUpdates: InventoryUpdateRequest[], chatId: string, sourceMessageIds: string[], imageContextMessageId?: string, forceTurnFinalizer = false) {
     if (!toolsEnabled(imageContextMessageId)) return { messages: messagesToSend, usage: undefined as OpenRouterUsage | undefined };
     let nextMessages = [...messagesToSend];
     let usage: OpenRouterUsage | undefined;
     let memoryHandledByTool = false;
     const deltaImminentProposals: DeltaImminentProposal[] = [];
     for (let index = 0; index < 4; index += 1) {
-      const response = await openRouterRequest(openRouterPayload(nextMessages, false, imageContextMessageId, index === 0 && Boolean(imageContextMessageId)));
+      const response = await openRouterRequest(openRouterPayload(nextMessages, false, imageContextMessageId, index === 0 && Boolean(imageContextMessageId), forceTurnFinalizer && index > 0));
       const json = await response.json() as OpenRouterResponse;
       usage = json.usage ?? usage;
       const assistantMessage = json.choices?.[0]?.message;
       const toolCalls = assistantMessage?.tool_calls ?? [];
-      if (!toolCalls.length) return { messages: nextMessages, assistantMessage, usage, memoryHandledByTool, deltaImminentProposal: deltaImminentProposals[deltaImminentProposals.length - 1] };
+      if (!toolCalls.length) {
+        if (forceTurnFinalizer && index < 3) {
+          nextMessages = [...nextMessages, { role: "assistant", content: assistantMessage?.content ?? "" }];
+          continue;
+        }
+        return { messages: nextMessages, assistantMessage, usage, memoryHandledByTool, deltaImminentProposal: deltaImminentProposals[deltaImminentProposals.length - 1] };
+      }
       nextMessages = [
         ...nextMessages,
         {
@@ -2404,6 +2445,7 @@ function ChatScreen({
           arguments: toolCall.function.arguments || "{}",
           result: JSON.stringify(auditSafeValue(result), null, 2)
         });
+        if (toolCall.function.name === "finalize_turn" && result && typeof result === "object" && "finalizedTurn" in result) return { messages: nextMessages, assistantMessage, usage, memoryHandledByTool, deltaImminentProposal: deltaImminentProposals[deltaImminentProposals.length - 1], finalizedTurn: result.finalizedTurn };
         nextMessages.push({
           role: "tool",
           tool_call_id: toolCall.id,
@@ -2421,15 +2463,17 @@ function ChatScreen({
     return { messages: nextMessages, usage, memoryHandledByTool, deltaImminentProposal: deltaImminentProposals[deltaImminentProposals.length - 1] };
   }
 
-  async function completeWithTools(messagesToSend: OpenRouterMessage[], toolLog: string[], toolEvents: MainChatAuditToolEvent[], inventoryUpdates: InventoryUpdateRequest[], chatId: string, sourceMessageIds: string[], imageContextMessageId?: string) {
-    const resolved = await resolveToolCalls(messagesToSend, toolLog, toolEvents, inventoryUpdates, chatId, sourceMessageIds, imageContextMessageId);
+  async function completeWithTools(messagesToSend: OpenRouterMessage[], toolLog: string[], toolEvents: MainChatAuditToolEvent[], inventoryUpdates: InventoryUpdateRequest[], chatId: string, sourceMessageIds: string[], imageContextMessageId?: string, forceTurnFinalizer = false) {
+    const resolved = await resolveToolCalls(messagesToSend, toolLog, toolEvents, inventoryUpdates, chatId, sourceMessageIds, imageContextMessageId, forceTurnFinalizer);
+    if (forceTurnFinalizer && !resolved.finalizedTurn) throw new Error("This chat requires a model that supports tools.");
     const replyText = typeof resolved.assistantMessage?.content === "string" ? resolved.assistantMessage.content : "";
     return {
       replyText,
       inputTokens: resolved.usage?.prompt_tokens,
       outputTokens: resolved.usage?.completion_tokens,
       memoryHandledByTool: resolved.memoryHandledByTool,
-      deltaImminentProposal: resolved.deltaImminentProposal
+      deltaImminentProposal: resolved.deltaImminentProposal,
+      finalizedTurn: resolved.finalizedTurn
     };
   }
   async function createDeltaBrief(command: string, activeChat: Chat) {
@@ -2600,6 +2644,7 @@ function ChatScreen({
       alert("Choose a model before sending.");
       return;
     }
+    if (!(await requireToolCapableModel())) return;
     let images: { dataUrl: string; mimeType: string }[] = [];
     let attachedFileDetails = "";
     try {
@@ -2743,9 +2788,9 @@ function ChatScreen({
       });
       await db.messages.update(reply.id, { requestInfo, updatedAt: now() });
         if (toolsEnabled(images.length ? userMessageId : undefined)) {
-          const completed = await completeWithTools(requestMessages, toolLog, toolEvents, inventoryUpdates, chatId, selectedHistory.map((message) => message.id), images.length ? userMessageId : undefined);
+          const completed = await completeWithTools(requestMessages, toolLog, toolEvents, inventoryUpdates, chatId, selectedHistory.map((message) => message.id), images.length ? userMessageId : undefined, worldIsAi);
           const deltaProposal = completed.deltaImminentProposal;
-          let completedReplyText = deltaProposal ? `### Δ Delta mode imminent...\n\n${deltaProposal.brief}` : completed.replyText || "(No response text returned.)";
+          let completedReplyText = deltaProposal ? `### Δ Delta mode imminent...\n\n${deltaProposal.brief}` : completed.finalizedTurn?.prose || completed.replyText || "(No response text returned.)";
           await db.messages.update(reply.id, {
             body: completedReplyText,
             deltaBrief: deltaProposal ? {
@@ -2762,6 +2807,7 @@ function ChatScreen({
             outputTokens: completed.outputTokens ?? estimateTokens(deltaProposal?.brief ?? completed.replyText),
             estimatedTokens: !completed.outputTokens,
             status: "complete",
+            worldState: completed.finalizedTurn?.metadata,
             requestInfo: { ...requestInfo, toolCalls: toolLog.length ? toolLog : ["None"], inventoryUpdates },
             updatedAt: now()
           });
@@ -2898,6 +2944,7 @@ function ChatScreen({
       alert("Choose a model before regenerating.");
       return;
     }
+    if (!(await requireToolCapableModel())) return;
     if (message.role !== "user") {
       alert("Only user messages can be resent.");
       return;
@@ -3010,9 +3057,9 @@ function ChatScreen({
     await onRefresh();
     try {
       if (toolsEnabled(resendImages.length ? promptMessage.id : undefined)) {
-        const completed = await completeWithTools(requestMessages, toolLog, toolEvents, inventoryUpdates, chatId, selectedHistory.map((message) => message.id), resendImages.length ? promptMessage.id : undefined);
+        const completed = await completeWithTools(requestMessages, toolLog, toolEvents, inventoryUpdates, chatId, selectedHistory.map((message) => message.id), resendImages.length ? promptMessage.id : undefined, worldIsAi);
         const deltaProposal = completed.deltaImminentProposal;
-        let completedReplyText = deltaProposal ? `### Δ Delta mode imminent...\n\n${deltaProposal.brief}` : completed.replyText || "(No response text returned.)";
+        let completedReplyText = deltaProposal ? `### Δ Delta mode imminent...\n\n${deltaProposal.brief}` : completed.finalizedTurn?.prose || completed.replyText || "(No response text returned.)";
         await db.messages.update(reply.id, {
           body: completedReplyText,
           deltaBrief: deltaProposal ? {
@@ -3029,6 +3076,7 @@ function ChatScreen({
           outputTokens: completed.outputTokens ?? estimateTokens(deltaProposal?.brief ?? completed.replyText),
           estimatedTokens: !completed.outputTokens,
           status: "complete",
+          worldState: completed.finalizedTurn?.metadata,
           requestInfo: { ...requestInfo, toolCalls: toolLog.length ? toolLog : ["None"], inventoryUpdates },
           updatedAt: now()
         });
@@ -3348,9 +3396,8 @@ function ChatScreen({
                 <section className="world-settings stack">
                   <div className="section-title"><h3>World</h3></div>
                   <label>Time mode<select value={world.timeMode} onChange={(event) => setWorld({ ...world, timeMode: event.target.value as WorldState["timeMode"] })}><option value="realtime">Realtime</option><option value="ai">AI Engine</option><option value="disabled">Disabled</option></select></label>
-                  {world.timeMode === "ai" && <label>Fictional clock (seconds)<input type="number" min={0} value={world.fictionalSeconds} onChange={(event) => setWorld({ ...world, fictionalSeconds: Number(event.target.value) || 0 })} /></label>}
                   <label className="compact-check"><input type="checkbox" checked={world.calendarEnabled} onChange={(event) => setWorld({ ...world, calendarEnabled: event.target.checked })} /> Calendar</label>
-                  {world.calendarEnabled && <div className="world-calendar-grid"><label>Year<input type="number" value={world.calendar.year} onChange={(event) => setWorld({ ...world, calendar: { ...world.calendar, year: Number(event.target.value) || 0 } })} /></label><label>Month<input type="number" value={world.calendar.month} onChange={(event) => setWorld({ ...world, calendar: { ...world.calendar, month: Number(event.target.value) || 1 } })} /></label><label>Day<input type="number" value={world.calendar.day} onChange={(event) => setWorld({ ...world, calendar: { ...world.calendar, day: Number(event.target.value) || 1 } })} /></label><label>Year Prefix<input value={world.calendar.yearPrefix} onChange={(event) => setWorld({ ...world, calendar: { ...world.calendar, yearPrefix: event.target.value } })} /></label><label>Year Suffix<input value={world.calendar.yearSuffix} onChange={(event) => setWorld({ ...world, calendar: { ...world.calendar, yearSuffix: event.target.value } })} /></label><small>Preview: {formatWorldCalendar(world)}</small></div>}
+                  {world.calendarEnabled && <div className="world-calendar"><div className="world-calendar-date"><label>Year<input type="number" value={world.calendar.year} onChange={(event) => setWorld({ ...world, calendar: { ...world.calendar, year: Number(event.target.value) || 0 } })} /></label><label>Month<input type="number" value={world.calendar.month} onChange={(event) => setWorld({ ...world, calendar: { ...world.calendar, month: Number(event.target.value) || 1 } })} /></label><label>Day<input type="number" value={world.calendar.day} onChange={(event) => setWorld({ ...world, calendar: { ...world.calendar, day: Number(event.target.value) || 1 } })} /></label></div><div className="world-calendar-year-style"><label>Year prefix<input value={world.calendar.yearPrefix} onChange={(event) => setWorld({ ...world, calendar: { ...world.calendar, yearPrefix: event.target.value } })} /></label><label>Year suffix<input value={world.calendar.yearSuffix} onChange={(event) => setWorld({ ...world, calendar: { ...world.calendar, yearSuffix: event.target.value } })} /></label></div><small className="world-calendar-preview">Preview: {formatWorldCalendar(world)}</small></div>}
                   <label className="compact-check"><input type="checkbox" checked={world.locationTracking} onChange={(event) => setWorld({ ...world, locationTracking: event.target.checked })} /> Location Tracking</label>
                   <label>Current location<input value={world.location} onChange={(event) => setWorld({ ...world, location: event.target.value })} /></label>
                   <div className="section-title"><h3>Trackers</h3><button type="button" onClick={() => setWorld({ ...world, trackers: [...world.trackers, { id: uid(), label: "", currentValue: 0, display: "number", visibleInStatusBar: true, orderIndex: world.trackers.length }] })}><Plus size={16} /> Add Tracker</button></div>
@@ -3378,6 +3425,17 @@ function ChatScreen({
                 {saved && <span className="save-status">Saved</span>}
                 <button type="button" className="done-button" onClick={closeChatSettings}>Done</button>
               </div>
+            </section>
+          </div>,
+          document.body
+        )}
+        {toolRequirementOpen && createPortal(
+          <div className="modal-backdrop tool-requirement-backdrop" onClick={() => setToolRequirementOpen(false)}>
+            <section className="confirm-modal tool-requirement-modal" role="alertdialog" aria-modal="true" aria-labelledby="tool-requirement-title" onClick={(event) => event.stopPropagation()}>
+              <div className="section-title"><h2 id="tool-requirement-title">Tool support needed</h2><button type="button" className="icon-button" onClick={() => setToolRequirementOpen(false)} aria-label="Close"><X size={18} /></button></div>
+              <p>This chat has features that use tools. The saved details for <strong>{draftModelId}</strong> say it does not support them.</p>
+              <p className="muted">If that is out of date, fetch OpenRouter models again in API settings, then refresh this model in your library.</p>
+              <div className="split-actions"><button type="button" onClick={() => setToolRequirementOpen(false)}>Okay</button></div>
             </section>
           </div>,
           document.body
@@ -4851,7 +4909,7 @@ function ApiSettingsContent({ settings, onRefresh }: { settings: AppSettings; on
 
 function ModelLibrary() {
   const [models, setModels] = useState<ModelLibraryEntry[]>([]);
-  const [fetchedModels, setFetchedModels] = useState<{ id: string; name?: string; context_length?: number; pricing?: { prompt?: string; completion?: string } }[]>([]);
+  const [fetchedModels, setFetchedModels] = useState<{ id: string; name?: string; context_length?: number; supported_parameters?: string[]; pricing?: { prompt?: string; completion?: string } }[]>([]);
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState("");
   async function load() { setModels(await db.modelLibrary.orderBy("orderIndex").toArray()); }
@@ -4861,7 +4919,7 @@ function ModelLibrary() {
     try {
       const response = await fetch("https://openrouter.ai/api/v1/models");
       if (!response.ok) throw new Error("Could not fetch models.");
-      const json = await response.json() as { data?: { id: string; name?: string; context_length?: number; pricing?: { prompt?: string; completion?: string } }[] };
+      const json = await response.json() as { data?: { id: string; name?: string; context_length?: number; supported_parameters?: string[]; pricing?: { prompt?: string; completion?: string } }[] };
       setFetchedModels(json.data ?? []);
       setStatus(`Fetched ${(json.data ?? []).length} models`);
     } catch {
@@ -4878,8 +4936,9 @@ function ModelLibrary() {
     const inputPricePerMillionUsd = perMillion(model.pricing?.prompt);
     const outputPricePerMillionUsd = perMillion(model.pricing?.completion);
     const existing = models.find((item) => item.modelId === model.id);
-    if (existing) await db.modelLibrary.update(existing.id, { contextLength: model.context_length, inputPricePerMillionUsd, outputPricePerMillionUsd, updatedAt: timestamp });
-    else await db.modelLibrary.add({ id: uid(), modelId: model.id, cosmeticName: model.name || model.id.split("/").pop() || model.id, contextLength: model.context_length, inputPricePerMillionUsd, outputPricePerMillionUsd, orderIndex: models.length, createdAt: timestamp, updatedAt: timestamp });
+    const supportsTools = model.supported_parameters?.includes("tools");
+    if (existing) await db.modelLibrary.update(existing.id, { contextLength: model.context_length, supportsTools, inputPricePerMillionUsd, outputPricePerMillionUsd, updatedAt: timestamp });
+    else await db.modelLibrary.add({ id: uid(), modelId: model.id, cosmeticName: model.name || model.id.split("/").pop() || model.id, contextLength: model.context_length, supportsTools, inputPricePerMillionUsd, outputPricePerMillionUsd, orderIndex: models.length, createdAt: timestamp, updatedAt: timestamp });
     await load();
   }
   async function updatePrice(model: ModelLibraryEntry, field: "inputPricePerMillionUsd" | "outputPricePerMillionUsd", value: string) {

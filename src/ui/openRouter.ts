@@ -109,6 +109,26 @@ export const inventoryTools = [
   }
 ] as const;
 
+export const finalizeTurnTool = {
+  type: "function",
+  function: {
+    name: "finalize_turn",
+    description: "Required final response for this turn. Put all user-visible prose in prose. The client owns clocks, calendars, tracker arithmetic, inventory, and gear; report only elapsed seconds and direct event changes, never resulting values.",
+    parameters: {
+      type: "object",
+      properties: {
+        prose: { type: "string", description: "The complete normal in-world response shown to the user." },
+        advanceSeconds: { type: "number", minimum: 0, description: "Required fictional elapsed seconds for this reply. Use 0 when essentially no time passes." },
+        location: { type: "string", description: "Complete current player location. Required every turn when location tracking is enabled; otherwise use an empty string." },
+        trackerChanges: { type: "array", items: { type: "object", properties: { trackerId: { type: "string" }, operation: { type: "string", enum: ["add", "subtract"] }, value: { type: "number" } }, required: ["trackerId", "operation", "value"] } },
+        inventoryReviewed: { type: "boolean", description: "Whether this turn was considered for inventory updates." },
+        gearReviewed: { type: "boolean", description: "Whether this turn was considered for gear updates." }
+      },
+      required: ["prose", "advanceSeconds", "location", "trackerChanges", "inventoryReviewed", "gearReviewed"]
+    }
+  }
+} as const;
+
 export const imageContextTools = [
   {
     type: "function",
