@@ -451,6 +451,10 @@ export const db = new MirrorDatabase();
 export async function ensureSeedData(database = db) {
   const settings = await database.settings.get("settings");
   if (!settings) await database.settings.put(defaultSettings());
+  else if (!settings.historySettingsInitialized) {
+    // Older installs had no default and were accidentally treated as unlimited.
+    await database.settings.update("settings", { maxHistoryMessages: 20, historySettingsInitialized: true, updatedAt: Date.now() });
+  }
 
   const projectCount = await database.projects.count();
   if (projectCount === 0) await database.projects.add(sampleProject());

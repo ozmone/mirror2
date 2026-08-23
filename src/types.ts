@@ -64,6 +64,8 @@ export interface AppSettings extends Timestamped {
   topP?: number;
   maxTokens?: number;
   maxHistoryMessages?: number;
+  /** Distinguishes a deliberate unlimited-history choice from legacy missing settings. */
+  historySettingsInitialized?: boolean;
   compactionEnabled?: boolean;
   includeWorld?: boolean;
   includeInstructions?: boolean;
@@ -129,6 +131,39 @@ export interface Chat extends Timestamped {
   deltaPlayerCharacterId?: string;
   deltaRevealText?: boolean;
   deltaRevealSpeed?: number;
+  world?: WorldState;
+}
+
+export type WorldTimeMode = "realtime" | "ai" | "disabled";
+export type TrackerDisplay = "number" | "percentage" | "currentMaximum";
+export type TrackerTimeUnit = "seconds" | "minutes" | "hours" | "days";
+
+export interface WorldTracker {
+  id: string;
+  label: string;
+  currentValue: number;
+  maximum?: number;
+  display: TrackerDisplay;
+  visibleInStatusBar: boolean;
+  orderIndex: number;
+  timeRule?: { operation: "add" | "subtract"; amount: number; every: number; unit: TrackerTimeUnit };
+}
+
+export interface WorldState {
+  timeMode: WorldTimeMode;
+  fictionalSeconds: number;
+  realtimeUpdatedAt?: number;
+  calendarEnabled: boolean;
+  calendar: { year: number; month: number; day: number; yearPrefix: string; yearSuffix: string };
+  locationTracking: boolean;
+  location: string;
+  trackers: WorldTracker[];
+}
+
+export interface WorldReplyMetadata {
+  advanceSeconds: number;
+  location?: string;
+  trackerChanges?: Array<{ trackerId: string; operation: "add" | "subtract"; value: number }>;
 }
 
 export interface Branch extends Timestamped {
@@ -154,6 +189,7 @@ export interface Message extends Timestamped {
   starred: boolean;
   status: "pending" | "streaming" | "complete" | "failed" | "cancelled";
   error?: string;
+  worldState?: WorldReplyMetadata;
   requestInfo?: {
     settings: string[];
     toggles: string[];
@@ -644,6 +680,8 @@ export interface ModelLibraryEntry extends Timestamped {
   contextLength?: number;
   supportsTools?: boolean;
   pricing?: string;
+  inputPricePerMillionUsd?: number;
+  outputPricePerMillionUsd?: number;
   lastSeenAt?: number;
 }
 

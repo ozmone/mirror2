@@ -65,7 +65,8 @@ import {
   validatePointBuy
 } from "../data/repositories";
 import { defaultDeltaJobs, defaultDeltaNpcStats, defaultDeltaSystemPrompt, effectiveDeltaSystemPrompt, defaultMemoryInstruction, defaultSettings } from "../data/defaults";
-import { Ability, AbilityModifiers, AbilityScores, AppSettings, BubbleMode, Character, CharacterActionMacro, CharacterActionSlot, CharacterBonus, CharacterGearSlot, Chat, DeltaAllyCacheEntry, DeltaBaseTemplate, DeltaBriefRoster, DeltaEffectDefinition, DeltaEffectPolarity, DeltaEntity, DeltaIconAsset, DeltaJobTemplate, DeltaMapSize, DeltaMessage, DeltaPrefixTemplate, DeltaSavingThrowTiming, DeltaSession, GearBodyType, GearSlotName, InventoryKind, InventoryItem, InventoryLog, InventoryUpdateRequest, MainChatAuditToolEvent, MainChatMemoryReviewAudit, MainChatRequestAudit, Memory, Message, PendingMemory, Project, RouteName } from "../types";
+import { applyWorldReply, defaultWorldState, extractWorldMetadata, formatTracker, formatWorldCalendar, formatWorldTime, syncRealtimeWorld, worldInstruction } from "../data/world";
+import { Ability, AbilityModifiers, AbilityScores, AppSettings, BubbleMode, Character, CharacterActionMacro, CharacterActionSlot, CharacterBonus, CharacterGearSlot, Chat, DeltaAllyCacheEntry, DeltaBaseTemplate, DeltaBriefRoster, DeltaEffectDefinition, DeltaEffectPolarity, DeltaEntity, DeltaIconAsset, DeltaJobTemplate, DeltaMapSize, DeltaMessage, DeltaPrefixTemplate, DeltaSavingThrowTiming, DeltaSession, GearBodyType, GearSlotName, InventoryKind, InventoryItem, InventoryLog, InventoryUpdateRequest, MainChatAuditToolEvent, MainChatMemoryReviewAudit, MainChatRequestAudit, Memory, Message, ModelLibraryEntry, PendingMemory, Project, RouteName, WorldReplyMetadata, WorldState, WorldTracker } from "../types";
 import { estimateTokens, formatDate, normaliseTag, now, splitTags, uid } from "../utils";
 import { ProjectIcon, projectIcons } from "./icons";
 import { GearDrawer } from "./gear/GearDrawer";
@@ -593,9 +594,24 @@ export function App() {
   const [deltaStartContext, setDeltaStartContext] = useState("");
   const [selectedChatActiveDelta, setSelectedChatActiveDelta] = useState<DeltaSession>();
   const [updateAvailable, setUpdateAvailable] = useState(false);
+  const [worldStatusOpen, setWorldStatusOpen] = useState(false);
+  const [, setWorldClockTick] = useState(0);
   const selectedProject = projects.find((project) => project.id === selectedProjectId);
   const editingProject = projects.find((project) => project.id === (editingProjectId ?? selectedProjectId));
   const selectedChat = chats.find((chat) => chat.id === selectedChatId);
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setWorldClockTick((value) => value + 1);
+      if (!selectedChatId) return;
+      void db.chats.get(selectedChatId).then(async (current) => {
+        if (!current?.world || current.world.timeMode !== "realtime") return;
+        const world = syncRealtimeWorld(current.world);
+        await db.chats.update(current.id, { world, updatedAt: now() });
+        setChats((rows) => rows.map((chat) => chat.id === current.id ? { ...chat, world, updatedAt: now() } : chat));
+      });
+    }, 30_000);
+    return () => window.clearInterval(timer);
+  }, [selectedChatId]);
 
   useEffect(() => {
     setDeltaOpen(false);
@@ -876,6 +892,9 @@ export function App() {
         title={title}
         subtitle={route === "chat" ? selectedChat?.title : undefined}
         contextNote={route === "chat" && selectedChat?.infiniteHistoryLocked ? "⚠︎ infinite context" : undefined}
+        world={route === "chat" ? selectedChat?.world : undefined}
+        worldStatusOpen={worldStatusOpen}
+        onWorldToggle={() => setWorldStatusOpen((open) => !open)}
         onMenu={() => setDrawerOpen(true)}
         right={route === "chat" && selectedProject ? (
           <div className="header-actions">
@@ -1039,9 +1058,25 @@ export function App() {
   );
 }
 
-function Header({ title, subtitle, contextNote, onMenu, right }: { title: string; subtitle?: string; contextNote?: string; onMenu: () => void; right?: React.ReactNode }) {
+function WorldTrackerEditor({ tracker, index, count, onChange, onMove, onDelete }: { tracker: WorldTracker; index: number; count: number; onChange: (tracker: WorldTracker) => void; onMove: (direction: -1 | 1) => void; onDelete: () => void }) {
+  const rule = tracker.timeRule;
+  return <div className="world-tracker-editor">
+    <div className="world-tracker-actions"><button type="button" disabled={index === 0} onClick={() => onMove(-1)}>↑</button><button type="button" disabled={index === count - 1} onClick={() => onMove(1)}>↓</button><button type="button" className="danger" onClick={onDelete}><Trash2 size={15} /></button></div>
+    <label>Label<input value={tracker.label} onChange={(event) => onChange({ ...tracker, label: event.target.value })} /></label>
+    <label>Current Value<input type="number" value={tracker.currentValue} onChange={(event) => onChange({ ...tracker, currentValue: Number(event.target.value) || 0 })} /></label>
+    <label>Display<select value={tracker.display} onChange={(event) => onChange({ ...tracker, display: event.target.value as WorldTracker["display"] })}><option value="number">Number</option><option value="percentage">Percentage</option><option value="currentMaximum">Current / Maximum</option></select></label>
+    {tracker.display === "currentMaximum" && <label>Maximum<input type="number" value={tracker.maximum ?? 0} onChange={(event) => onChange({ ...tracker, maximum: Number(event.target.value) || 0 })} /></label>}
+    <label className="compact-check"><input type="checkbox" checked={tracker.visibleInStatusBar} onChange={(event) => onChange({ ...tracker, visibleInStatusBar: event.target.checked })} /> Visible in Status Bar</label>
+    <label className="compact-check"><input type="checkbox" checked={Boolean(rule)} onChange={(event) => onChange({ ...tracker, timeRule: event.target.checked ? { operation: "add", amount: 0, every: 1, unit: "hours" } : undefined })} /> Time Rule</label>
+    {rule && <div className="world-rule"><select value={rule.operation} onChange={(event) => onChange({ ...tracker, timeRule: { ...rule, operation: event.target.value as "add" | "subtract" } })}><option value="add">Add</option><option value="subtract">Subtract</option></select><input type="number" value={rule.amount} onChange={(event) => onChange({ ...tracker, timeRule: { ...rule, amount: Number(event.target.value) || 0 } })} /><span>every</span><input type="number" min={0.0001} value={rule.every} onChange={(event) => onChange({ ...tracker, timeRule: { ...rule, every: Number(event.target.value) || 1 } })} /><select value={rule.unit} onChange={(event) => onChange({ ...tracker, timeRule: { ...rule, unit: event.target.value as typeof rule.unit } })}><option value="seconds">Seconds</option><option value="minutes">Minutes</option><option value="hours">Hours</option><option value="days">Days</option></select></div>}
+  </div>;
+}
+
+function Header({ title, subtitle, contextNote, onMenu, right, world, worldStatusOpen, onWorldToggle }: { title: string; subtitle?: string; contextNote?: string; onMenu: () => void; right?: React.ReactNode; world?: WorldState; worldStatusOpen?: boolean; onWorldToggle?: () => void }) {
+  const readout = world && [formatWorldTime(world), world.location].filter(Boolean).join(" · ");
   return (
-    <header className="topbar">
+    <header className="topbar-wrap">
+    <div className="topbar">
       <button className="icon-button" onClick={onMenu} aria-label="Open navigation">
         <Menu size={22} />
       </button>
@@ -1049,7 +1084,9 @@ function Header({ title, subtitle, contextNote, onMenu, right }: { title: string
         <MothMark />
         <div className="title-stack"><strong>{title}</strong>{(subtitle || contextNote) && <div className="title-meta">{subtitle && <span>{subtitle}</span>}{contextNote && <small>{contextNote}</small>}</div>}</div>
       </div>
-      <div className="header-right">{right}</div>
+      <div className="header-right">{readout && <button className="world-readout" type="button" title={world?.location || undefined} onClick={onWorldToggle}>{readout}</button>}{right}</div>
+    </div>
+    {worldStatusOpen && world && <div className="world-status" title={world.location}>{world.location && <span className="world-status-location">{world.location}</span>}{world.trackers.filter((tracker) => tracker.visibleInStatusBar).sort((a, b) => a.orderIndex - b.orderIndex).map((tracker) => <span key={tracker.id}>{formatTracker(tracker)}</span>)}</div>}
     </header>
   );
 }
@@ -1540,6 +1577,7 @@ function ChatScreen({
   const [body, setBody] = useState("");
   const [contextOpen, setContextOpen] = useState(false);
   const [chatSettingsOpen, setChatSettingsOpen] = useState(false);
+  const [chatSettingsTab, setChatSettingsTab] = useState<"general" | "world">("general");
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [modelSaving, setModelSaving] = useState(false);
   const [modelSaveError, setModelSaveError] = useState("");
@@ -1551,8 +1589,8 @@ function ChatScreen({
   const [temperature, setTemperature] = useState(settings.temperature?.toString() ?? "0");
   const [topP, setTopP] = useState(settings.topP?.toString() ?? "0");
   const [maxTokens, setMaxTokens] = useState(settings.maxTokens?.toString() ?? "");
-  const [maxHistory, setMaxHistory] = useState(settings.maxHistoryMessages?.toString() ?? "");
-  const [historyNoLimit, setHistoryNoLimit] = useState(!settings.maxHistoryMessages);
+  const [maxHistory, setMaxHistory] = useState(settings.maxHistoryMessages?.toString() ?? "20");
+  const [historyNoLimit, setHistoryNoLimit] = useState(Boolean(settings.historySettingsInitialized && !settings.maxHistoryMessages));
   const [infiniteWarningOpen, setInfiniteWarningOpen] = useState(false);
   const [compactionEnabled, setCompactionEnabled] = useState(settings.compactionEnabled ?? false);
   const [streamingEnabled, setStreamingEnabled] = useState(settings.streamingEnabled ?? true);
@@ -1562,6 +1600,7 @@ function ChatScreen({
   const [confirmGearUpdates, setConfirmGearUpdates] = useState(settings.confirmGearUpdates ?? true);
   const [inventoryEnabled, setInventoryEnabled] = useState(project?.inventoryEnabled ?? false);
   const [gearEnabled, setGearEnabled] = useState(project?.gearEnabled ?? false);
+  const [world, setWorld] = useState<WorldState>(chat?.world ?? defaultWorldState());
   const [attachedImages, setAttachedImages] = useState<File[]>([]);
   const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
   const [attachmentError, setAttachmentError] = useState("");
@@ -1592,8 +1631,8 @@ function ChatScreen({
     setTemperature(settings.temperature?.toString() ?? "0");
     setTopP(settings.topP?.toString() ?? "0");
     setMaxTokens(settings.maxTokens?.toString() ?? "");
-    setMaxHistory(settings.maxHistoryMessages?.toString() ?? "");
-    setHistoryNoLimit(Boolean(chat?.infiniteHistoryLocked) || !settings.maxHistoryMessages);
+    setMaxHistory(settings.maxHistoryMessages?.toString() ?? "20");
+    setHistoryNoLimit(Boolean(chat?.infiniteHistoryLocked) || Boolean(settings.historySettingsInitialized && !settings.maxHistoryMessages));
     setCompactionEnabled(settings.compactionEnabled ?? false);
     setStreamingEnabled(settings.streamingEnabled ?? true);
     setAutoManageInventory(settings.autoManageInventory ?? false);
@@ -1606,6 +1645,7 @@ function ChatScreen({
     setGearEnabled(project?.gearEnabled ?? false);
     setInfiniteWarningOpen(false);
   }, [project?.id, project?.inventoryEnabled, project?.gearEnabled]);
+  useEffect(() => setWorld(chat?.world ?? defaultWorldState()), [chat?.id, chat?.world]);
   useEffect(() => setInfiniteWarningOpen(false), [chat?.id]);
   useEffect(() => {
     const composer = composerRef.current;
@@ -1652,6 +1692,7 @@ function ChatScreen({
       topP: optionalNumber(topP),
       maxTokens: optionalNumber(maxTokens),
       maxHistoryMessages: effectiveHistoryNoLimit ? undefined : optionalNumber(maxHistory),
+      historySettingsInitialized: true,
       compactionEnabled,
       includeWorld,
       includeInstructions,
@@ -1665,10 +1706,27 @@ function ChatScreen({
       updatedAt: timestamp
     });
     if (project) await db.projects.update(project.id, { inventoryEnabled, gearEnabled, updatedAt: timestamp });
-    if (chat && lockInfiniteHistory) await db.chats.update(chat.id, { infiniteHistoryLocked: true, updatedAt: timestamp });
+    if (chat) await db.chats.update(chat.id, { world: world.timeMode === "realtime" ? { ...world, realtimeUpdatedAt: timestamp } : world, ...(lockInfiniteHistory ? { infiniteHistoryLocked: true } : {}), updatedAt: timestamp });
     setInfiniteWarningOpen(false);
     showSaved();
     await onSettingsSaved(draftModelId);
+  }
+
+  async function applyAssistantWorldState(chatId: string, replyId: string, rawText: string) {
+    const currentChat = await db.chats.get(chatId);
+    const currentWorld = currentChat?.world;
+    if (!currentChat || !currentWorld || currentWorld.timeMode !== "ai") return rawText;
+    const extracted = extractWorldMetadata(rawText);
+    const metadata = extracted.metadata;
+    const valid = Boolean(metadata && (!currentWorld.locationTracking || metadata.location?.trim()));
+    if (!valid || !metadata) return extracted.text || rawText;
+    const nextWorld = applyWorldReply(currentWorld, metadata);
+    await db.transaction("rw", db.chats, db.messages, async () => {
+      await db.chats.update(chatId, { world: nextWorld, updatedAt: now() });
+      await db.messages.update(replyId, { body: extracted.text || "(No response text returned.)", worldState: metadata, updatedAt: now() });
+    });
+    setWorld(nextWorld);
+    return extracted.text || "(No response text returned.)";
   }
   async function saveChatSettings() {
     if (chat && effectiveHistoryNoLimit && !infiniteHistoryLocked) {
@@ -1680,6 +1738,7 @@ function ChatScreen({
   function openChatSettings() {
     setContextOpen(false);
     setModelMenuOpen(false);
+    setChatSettingsTab("general");
     setChatSettingsOpen(true);
     window.history.pushState({ ...window.history.state, mirrorChatSettings: true }, "", window.location.href);
   }
@@ -2614,7 +2673,8 @@ function ChatScreen({
         toolCalls: toolLog,
         inventoryUpdates
       };
-      const canStreamDirectly = streamingEnabled && !toolsEnabled(images.length ? userMessageId : undefined);
+      const worldIsAi = (await db.chats.get(chatId))?.world?.timeMode === "ai";
+      const canStreamDirectly = streamingEnabled && !worldIsAi && !toolsEnabled(images.length ? userMessageId : undefined);
       const reply = await addMessage(chatId, branchId, "assistant", canStreamDirectly ? "" : "...");
       await db.messages.update(reply.id, { modelId: draftModelId, status: canStreamDirectly ? "streaming" : "pending", requestInfo });
       const sendController = new AbortController();
@@ -2647,6 +2707,7 @@ function ChatScreen({
       const deltaAvailable = deltaEngagementEnabled();
       const systemParts = [
         `Project: ${project.name}`,
+        activeChat?.world ? worldInstruction(activeChat.world) : "",
         deltaAvailable ? "Delta Mode boundary: the main chat must not run structured fights, hostile standoffs, tactical engagements, mission commitments, or combat-like confrontations as ordinary roleplay once they become imminent. When the current reply would initiate or clearly commit to that kind of engagement, call prepare_delta_engagement with a short in-world third-person scene beat instead of continuing the scene as normal chat. Use this only when the engagement is imminent, not for ordinary tension." : "",
         includeInstructions && project.instructions ? `Project instructions:\n${project.instructions}` : "",
         includeWorld && project.worldSetting ? `World setting:\n${project.worldSetting}` : "",
@@ -2684,7 +2745,7 @@ function ChatScreen({
         if (toolsEnabled(images.length ? userMessageId : undefined)) {
           const completed = await completeWithTools(requestMessages, toolLog, toolEvents, inventoryUpdates, chatId, selectedHistory.map((message) => message.id), images.length ? userMessageId : undefined);
           const deltaProposal = completed.deltaImminentProposal;
-          const completedReplyText = deltaProposal ? `### Δ Delta mode imminent...\n\n${deltaProposal.brief}` : completed.replyText || "(No response text returned.)";
+          let completedReplyText = deltaProposal ? `### Δ Delta mode imminent...\n\n${deltaProposal.brief}` : completed.replyText || "(No response text returned.)";
           await db.messages.update(reply.id, {
             body: completedReplyText,
             deltaBrief: deltaProposal ? {
@@ -2704,6 +2765,7 @@ function ChatScreen({
             requestInfo: { ...requestInfo, toolCalls: toolLog.length ? toolLog : ["None"], inventoryUpdates },
             updatedAt: now()
           });
+          completedReplyText = await applyAssistantWorldState(chatId, reply.id, completedReplyText);
           setAttachedImages([]);
           setAttachedFiles([]);
           if (createdChatId) await onChatCreated(createdChatId);
@@ -2715,7 +2777,7 @@ function ChatScreen({
           return;
         }
         let completedReplyText = "";
-        const response = await openRouterRequest(openRouterPayload(requestMessages, streamingEnabled));
+        const response = await openRouterRequest(openRouterPayload(requestMessages, worldIsAi ? false : streamingEnabled));
         await db.messages.update(reply.id, { requestInfo: { ...requestInfo, toolCalls: toolLog.length ? toolLog : ["None"] } });
         if (streamingEnabled && response.body) {
           const reader = response.body.getReader();
@@ -2758,6 +2820,7 @@ function ChatScreen({
             updatedAt: now()
           });
         }
+        completedReplyText = await applyAssistantWorldState(chatId, reply.id, completedReplyText);
         await onRefresh();
         finishActiveSend(sendController);
         const memoryReview = await reviewTurnForMemories(chatId, text, completedReplyText, [userMessageId, reply.id].filter((id): id is string => Boolean(id)));
@@ -2866,6 +2929,7 @@ function ChatScreen({
     const deltaAvailable = deltaEngagementEnabled();
     const systemParts = [
       `Project: ${project.name}`,
+      activeChat?.world ? worldInstruction(activeChat.world) : "",
       deltaAvailable ? "Delta Mode boundary: the main chat must not run structured fights, hostile standoffs, tactical engagements, mission commitments, or combat-like confrontations as ordinary roleplay once they become imminent. When the current reply would initiate or clearly commit to that kind of engagement, call prepare_delta_engagement with a short in-world third-person scene beat instead of continuing the scene as normal chat. Use this only when the engagement is imminent, not for ordinary tension." : "",
       includeInstructions && project.instructions ? `Project instructions:\n${project.instructions}` : "",
       includeWorld && project.worldSetting ? `World setting:\n${project.worldSetting}` : "",
@@ -2926,6 +2990,7 @@ function ChatScreen({
       toolEvents
     });
     let reply: Message | undefined;
+    const worldIsAi = activeChat?.world?.timeMode === "ai";
     await db.transaction("rw", db.messages, db.stars, db.chats, async () => {
       const laterIds = await db.messages
         .where("[chatId+branchId+sequence]")
@@ -2936,7 +3001,7 @@ function ChatScreen({
         await db.stars.where("messageId").anyOf(messageIds).delete();
         await db.messages.bulkDelete(messageIds);
       }
-      const canStreamDirectly = streamingEnabled && !toolsEnabled(resendImages.length ? promptMessage.id : undefined);
+      const canStreamDirectly = streamingEnabled && !worldIsAi && !toolsEnabled(resendImages.length ? promptMessage.id : undefined);
       reply = await addMessage(chatId, branchId, "assistant", canStreamDirectly ? "" : "...");
       await db.messages.update(reply.id, { modelId: draftModelId, status: canStreamDirectly ? "streaming" : "pending", requestInfo });
       await db.chats.update(chatId, { updatedAt: timestamp });
@@ -2947,7 +3012,7 @@ function ChatScreen({
       if (toolsEnabled(resendImages.length ? promptMessage.id : undefined)) {
         const completed = await completeWithTools(requestMessages, toolLog, toolEvents, inventoryUpdates, chatId, selectedHistory.map((message) => message.id), resendImages.length ? promptMessage.id : undefined);
         const deltaProposal = completed.deltaImminentProposal;
-        const completedReplyText = deltaProposal ? `### Δ Delta mode imminent...\n\n${deltaProposal.brief}` : completed.replyText || "(No response text returned.)";
+        let completedReplyText = deltaProposal ? `### Δ Delta mode imminent...\n\n${deltaProposal.brief}` : completed.replyText || "(No response text returned.)";
         await db.messages.update(reply.id, {
           body: completedReplyText,
           deltaBrief: deltaProposal ? {
@@ -2967,6 +3032,7 @@ function ChatScreen({
           requestInfo: { ...requestInfo, toolCalls: toolLog.length ? toolLog : ["None"], inventoryUpdates },
           updatedAt: now()
         });
+        completedReplyText = await applyAssistantWorldState(chatId, reply.id, completedReplyText);
         await onRefresh();
         const memoryReview = await reviewTurnForMemories(chatId, promptMessage.body, completedReplyText, [promptMessage.id, reply.id]);
         await storePostResponseMemoryAudit(reply.id, memoryReview);
@@ -2974,7 +3040,7 @@ function ChatScreen({
         return;
       }
       let completedReplyText = "";
-      const response = await openRouterRequest(openRouterPayload(requestMessages, streamingEnabled));
+      const response = await openRouterRequest(openRouterPayload(requestMessages, worldIsAi ? false : streamingEnabled));
       await db.messages.update(reply.id, { requestInfo: { ...requestInfo, toolCalls: toolLog.length ? toolLog : ["None"] } });
       if (streamingEnabled && response.body) {
         const reader = response.body.getReader();
@@ -3017,6 +3083,7 @@ function ChatScreen({
           updatedAt: now()
         });
       }
+      completedReplyText = await applyAssistantWorldState(chatId, reply.id, completedReplyText);
       await onRefresh();
       const memoryReview = await reviewTurnForMemories(chatId, promptMessage.body, completedReplyText, [promptMessage.id, reply.id]);
       await storePostResponseMemoryAudit(reply.id, memoryReview);
@@ -3269,11 +3336,28 @@ function ChatScreen({
                 <h2 id="chat-settings-title">Chat settings</h2>
                 <button type="button" className="icon-button" onClick={closeChatSettings} aria-label="Close chat settings"><X size={18} /></button>
               </div>
+              <div className="settings-tabs chat-settings-tabs"><button type="button" className={chatSettingsTab === "general" ? "picked" : ""} onClick={() => setChatSettingsTab("general")}>General</button><button type="button" className={chatSettingsTab === "world" ? "picked" : ""} onClick={() => setChatSettingsTab("world")}>World</button></div>
               <div className="chat-settings-content">
+                {chatSettingsTab === "general" && <>
                 <label className="compact-check"><input type="checkbox" checked={includeWorld} onChange={(event) => setIncludeWorld(event.target.checked)} /> World Setting</label>
                 <label className="compact-check"><input type="checkbox" checked={includeInstructions} onChange={(event) => setIncludeInstructions(event.target.checked)} /> Instructions</label>
                 <label className="compact-check"><input type="checkbox" checked={includeCharacters} onChange={(event) => setIncludeCharacters(event.target.checked)} /> Characters</label>
                 <label className="compact-check"><input type="checkbox" checked={includeSourceFiles} onChange={(event) => setIncludeSourceFiles(event.target.checked)} /> Source files</label>
+                </>}
+                {chatSettingsTab === "world" && <>
+                <section className="world-settings stack">
+                  <div className="section-title"><h3>World</h3></div>
+                  <label>Time mode<select value={world.timeMode} onChange={(event) => setWorld({ ...world, timeMode: event.target.value as WorldState["timeMode"] })}><option value="realtime">Realtime</option><option value="ai">AI Engine</option><option value="disabled">Disabled</option></select></label>
+                  {world.timeMode === "ai" && <label>Fictional clock (seconds)<input type="number" min={0} value={world.fictionalSeconds} onChange={(event) => setWorld({ ...world, fictionalSeconds: Number(event.target.value) || 0 })} /></label>}
+                  <label className="compact-check"><input type="checkbox" checked={world.calendarEnabled} onChange={(event) => setWorld({ ...world, calendarEnabled: event.target.checked })} /> Calendar</label>
+                  {world.calendarEnabled && <div className="world-calendar-grid"><label>Year<input type="number" value={world.calendar.year} onChange={(event) => setWorld({ ...world, calendar: { ...world.calendar, year: Number(event.target.value) || 0 } })} /></label><label>Month<input type="number" value={world.calendar.month} onChange={(event) => setWorld({ ...world, calendar: { ...world.calendar, month: Number(event.target.value) || 1 } })} /></label><label>Day<input type="number" value={world.calendar.day} onChange={(event) => setWorld({ ...world, calendar: { ...world.calendar, day: Number(event.target.value) || 1 } })} /></label><label>Year Prefix<input value={world.calendar.yearPrefix} onChange={(event) => setWorld({ ...world, calendar: { ...world.calendar, yearPrefix: event.target.value } })} /></label><label>Year Suffix<input value={world.calendar.yearSuffix} onChange={(event) => setWorld({ ...world, calendar: { ...world.calendar, yearSuffix: event.target.value } })} /></label><small>Preview: {formatWorldCalendar(world)}</small></div>}
+                  <label className="compact-check"><input type="checkbox" checked={world.locationTracking} onChange={(event) => setWorld({ ...world, locationTracking: event.target.checked })} /> Location Tracking</label>
+                  <label>Current location<input value={world.location} onChange={(event) => setWorld({ ...world, location: event.target.value })} /></label>
+                  <div className="section-title"><h3>Trackers</h3><button type="button" onClick={() => setWorld({ ...world, trackers: [...world.trackers, { id: uid(), label: "", currentValue: 0, display: "number", visibleInStatusBar: true, orderIndex: world.trackers.length }] })}><Plus size={16} /> Add Tracker</button></div>
+                  {world.trackers.sort((a, b) => a.orderIndex - b.orderIndex).map((tracker, index) => <WorldTrackerEditor key={tracker.id} tracker={tracker} index={index} count={world.trackers.length} onChange={(next) => setWorld({ ...world, trackers: world.trackers.map((item) => item.id === next.id ? next : item) })} onMove={(direction) => { const next = [...world.trackers].sort((a, b) => a.orderIndex - b.orderIndex); const target = index + direction; if (target < 0 || target >= next.length) return; [next[index], next[target]] = [next[target], next[index]]; setWorld({ ...world, trackers: next.map((item, position) => ({ ...item, orderIndex: position })) }); }} onDelete={() => setWorld({ ...world, trackers: world.trackers.filter((item) => item.id !== tracker.id).map((item, position) => ({ ...item, orderIndex: position })) })} />)}
+                </section>
+                </>}
+                {chatSettingsTab === "general" && <>
                 <label className="compact-check"><input type="checkbox" checked={inventoryEnabled} onChange={(event) => setInventoryEnabled(event.target.checked)} /> Enable inventory</label>
                 {inventoryEnabled && <div className="inline-setting-pair"><label className="compact-check"><input type="checkbox" checked={autoManageInventory} onChange={(event) => setAutoManageInventory(event.target.checked)} /> Auto manage Inventory</label><label className="compact-check"><input type="checkbox" checked={confirmInventoryUpdates} onChange={(event) => setConfirmInventoryUpdates(event.target.checked)} /> Use confirmation</label></div>}
                 <label className="compact-check"><input type="checkbox" checked={gearEnabled} onChange={(event) => setGearEnabled(event.target.checked)} /> Enable gear</label>
@@ -3287,6 +3371,7 @@ function ChatScreen({
                 <label className="compact-check"><input type="checkbox" checked={effectiveHistoryNoLimit} disabled={infiniteHistoryLocked} onChange={(event) => setHistoryNoLimit(event.target.checked)} /> No message history limit</label>
                 {infiniteHistoryLocked && <small className="setting-lock-note">This chat is permanently set to infinite context.</small>}
                 {!effectiveHistoryNoLimit && <label>Message history limit<input type="number" min={10} max={500} value={maxHistory} onChange={(event) => setMaxHistory(event.target.value)} /></label>}
+                </>}
               </div>
               <div className="split-actions chat-settings-actions">
                 <button type="button" onClick={() => void saveChatSettings()}><Save size={18} /> Save</button>
@@ -3311,8 +3396,8 @@ function ChatScreen({
             {attachmentError && <small className="error">{attachmentError}</small>}
           </div>
         )}
-        {infiniteWarningOpen && (
-          <div className="modal-backdrop" onClick={() => setInfiniteWarningOpen(false)}>
+        {infiniteWarningOpen && createPortal(
+          <div className="modal-backdrop infinite-context-backdrop" onClick={() => setInfiniteWarningOpen(false)}>
             <section className="modal infinite-context-confirm" onClick={(event) => event.stopPropagation()}>
               <div className="section-title"><h2>Use infinite context?</h2></div>
               <p>This chat cannot be changed back to a limited message history after you save it as infinite.</p>
@@ -3322,7 +3407,7 @@ function ChatScreen({
               </div>
             </section>
           </div>
-        )}
+        , document.body)}
         <button className="composer-plus" onClick={() => setContextOpen(!contextOpen)} disabled={deltaLocked} aria-label="Chat settings and attachments">
           <Plus size={20} />
         </button>
@@ -3500,7 +3585,6 @@ function MessageRow({
   return (
     <>
       <article className={`message ${message.role} ${message.status === "cancelled" ? "cancelled" : ""}`} onClick={() => onExpand(message.id)}>
-        {expanded && message.role === "assistant" && message.modelId && <div className="message-model">{message.modelId}</div>}
         {message.role === "user" && <MessageImageAttachments messageId={message.id} />}
         <div className="message-body">{message.status === "pending" && message.body.trim() === "..." ? <LoadingSignal /> : <MarkdownText text={message.body} inventoryMarkers />}</div>
         {message.deltaBrief?.status === "pending" && (
@@ -3541,6 +3625,7 @@ function MessageRow({
             onAction={(action, editedUpdates) => onInventoryUpdateAction(message, action, editedUpdates)}
           />
         )}
+        {expanded && message.role === "assistant" && message.modelId && <div className="message-model">{message.modelId}</div>}
         <div className={`message-meta ${expanded ? "show" : ""}`}>
           <button aria-label="Edit message" title={deltaLocked ? "Resolve engagement to unlock editing" : "Edit"} disabled={deltaLocked} onClick={(event) => { event.stopPropagation(); if (!deltaLocked) setEditOpen(true); }}><Edit3 size={16} /></button>
           <button aria-label={message.starred ? "Unstar message" : "Star message"} title={message.starred ? "Unstar" : "Star"} onClick={(event) => { event.stopPropagation(); star(); }}><Star size={16} fill={message.starred ? "currentColor" : "none"} /></button>
@@ -3548,6 +3633,7 @@ function MessageRow({
           <button aria-label="Response audit" title="Response audit" onClick={(event) => { event.stopPropagation(); setInfoOpen(true); }}><Info size={16} /></button>
           <span>{formatMessageDate(message.createdAt)}</span>
           <span>{message.inputTokens ?? message.outputTokens ?? estimateTokens(message.body)}t</span>
+          {expanded && <EstimatedMessageCost message={message} />}
           {message.role === "user" && <button className="resend" aria-label="Resend message" title={deltaLocked ? "Resolve engagement to unlock resend" : "Resend"} disabled={deltaLocked} onClick={(event) => { event.stopPropagation(); setResendConfirm("resend"); }}><RefreshCw size={16} /></button>}
         </div>
       </article>
@@ -3760,9 +3846,15 @@ function VirtualMessageList({
       const resetIndex = pendingResetIndex.current;
       resizeFrame.current = undefined;
       pendingResetIndex.current = undefined;
-      if (resetIndex !== undefined) listRef.current?.resetAfterIndex(resetIndex, true);
+      if (resetIndex !== undefined) {
+        listRef.current?.resetAfterIndex(resetIndex, true);
+        // New threads begin with estimated row heights. Once the real, often much
+        // shorter heights arrive, re-clamp the bottom position so row zero is not
+        // left above the visible list viewport.
+        if (staysAtBottom.current) listRef.current?.scrollToItem(Math.max(0, messages.length - 1), "end");
+      }
     });
-  }, []);
+  }, [messages.length]);
   const itemData = useMemo<VirtualMessageListData>(() => ({
     projectId, messages, expandedMessageId, onExpand, onEdit, onResend, onInventoryUpdateAction,
     onBeginDeltaBrief, onAvoidDeltaBrief, deltaLocked, onOpenChatSettings, onRefresh, onSize
@@ -3881,8 +3973,34 @@ function InventoryUpdateCard({ updates, onAction }: { updates: InventoryUpdateRe
   );
 }
 
+function formatEstimatedCost(cost: number) {
+  if (cost === 0) return "$0";
+  if (cost < 0.000001) return "<$0.000001";
+  return `$${cost.toFixed(cost < 0.01 ? 6 : 4)}`;
+}
+
+function EstimatedMessageCost({ message }: { message: Message }) {
+  const [pricing, setPricing] = useState<Pick<ModelLibraryEntry, "inputPricePerMillionUsd" | "outputPricePerMillionUsd">>();
+  useEffect(() => {
+    if (!message.modelId) { setPricing(undefined); return; }
+    void db.modelLibrary.where("modelId").equals(message.modelId).first().then((model) => setPricing(model));
+  }, [message.modelId]);
+  const inputCost = pricing?.inputPricePerMillionUsd !== undefined && message.inputTokens !== undefined ? message.inputTokens / 1_000_000 * pricing.inputPricePerMillionUsd : 0;
+  const outputCost = pricing?.outputPricePerMillionUsd !== undefined && message.outputTokens !== undefined ? message.outputTokens / 1_000_000 * pricing.outputPricePerMillionUsd : 0;
+  const hasCost = inputCost > 0 || outputCost > 0 || (pricing && ((message.inputTokens !== undefined && pricing.inputPricePerMillionUsd === 0) || (message.outputTokens !== undefined && pricing.outputPricePerMillionUsd === 0)));
+  return hasCost ? <span className="message-cost" title="Estimated cost from the locally saved model rates">{formatEstimatedCost(inputCost + outputCost)}</span> : null;
+}
+
 function MessageInfoModal({ message, onClose }: { message: Message; onClose: () => void }) {
   const audit = message.requestInfo?.audit;
+  const [pricing, setPricing] = useState<Pick<ModelLibraryEntry, "inputPricePerMillionUsd" | "outputPricePerMillionUsd">>();
+  useEffect(() => {
+    if (!message.modelId) { setPricing(undefined); return; }
+    void db.modelLibrary.where("modelId").equals(message.modelId).first().then((model) => setPricing(model));
+  }, [message.modelId]);
+  const inputCost = pricing?.inputPricePerMillionUsd !== undefined && message.inputTokens !== undefined ? message.inputTokens / 1_000_000 * pricing.inputPricePerMillionUsd : 0;
+  const outputCost = pricing?.outputPricePerMillionUsd !== undefined && message.outputTokens !== undefined ? message.outputTokens / 1_000_000 * pricing.outputPricePerMillionUsd : 0;
+  const hasCost = inputCost > 0 || outputCost > 0 || (pricing && ((message.inputTokens !== undefined && pricing.inputPricePerMillionUsd === 0) || (message.outputTokens !== undefined && pricing.outputPricePerMillionUsd === 0)));
   async function copyAudit() {
     if (!audit) return;
     await navigator.clipboard.writeText(JSON.stringify(audit, null, 2));
@@ -3900,6 +4018,7 @@ function MessageInfoModal({ message, onClose }: { message: Message; onClose: () 
           {message.modelId && <><span>Model</span><strong>{message.modelId}</strong></>}
           <span>Created</span><strong>{formatMessageDate(message.createdAt)}</strong>
           <span>Tokens</span><strong>{message.inputTokens ?? message.outputTokens ?? estimateTokens(message.body)}t</strong>
+          {hasCost && <><span>Estimated cost</span><strong>{formatEstimatedCost(inputCost + outputCost)} <small>(${pricing?.inputPricePerMillionUsd ?? 0}/M in · ${pricing?.outputPricePerMillionUsd ?? 0}/M out)</small></strong></>}
           {message.error && <><span>Error</span><strong>{message.error}</strong></>}
         </div>
         {message.requestInfo && (
@@ -4722,8 +4841,8 @@ function ApiSettingsContent({ settings, onRefresh }: { settings: AppSettings; on
   return (
     <>
       <p className="notice">This static app stores the key in this browser only. Browser-only storage cannot protect a key as strongly as a private server.</p>
-      <label>OpenRouter API key<input type={show ? "text" : "password"} value={key} onChange={(event) => setKey(event.target.value)} placeholder="sk-or-..." /></label>
-      <div className="split-actions persistent-actions"><button onClick={() => setShow(!show)}>{show ? "Hide" : "Show"}</button><button onClick={save}><Save size={18} /> Save</button><button className="danger" onClick={remove}>Remove</button>{saved && <span className="save-status">Saved</span>}</div>
+      <label>OpenRouter API key<div className="input-with-action"><input type={show ? "text" : "password"} value={key} onChange={(event) => setKey(event.target.value)} placeholder="sk-or-..." /><button type="button" className="icon-button" onClick={() => setShow(!show)} aria-label={show ? "Hide API key" : "Show API key"} title={show ? "Hide API key" : "Show API key"}><Eye size={18} /></button></div></label>
+      <div className="split-actions persistent-actions"><button onClick={save}><Save size={18} /> Save</button><button className="danger" onClick={remove}>Remove</button>{saved && <span className="save-status">Saved</span>}</div>
       <label>Privacy preset<select value={settings.privacyPreset} onChange={async (event) => { await db.settings.update("settings", { privacyPreset: event.target.value as AppSettings["privacyPreset"], updatedAt: now() }); await onRefresh(); }}><option value="maximum">Maximum Privacy</option><option value="balanced">Balanced</option><option value="availability">Maximum Availability</option></select></label>
       <ModelLibrary />
     </>
@@ -4731,8 +4850,8 @@ function ApiSettingsContent({ settings, onRefresh }: { settings: AppSettings; on
 }
 
 function ModelLibrary() {
-  const [models, setModels] = useState<{ id: string; modelId: string; cosmeticName: string }[]>([]);
-  const [fetchedModels, setFetchedModels] = useState<{ id: string; name?: string; context_length?: number }[]>([]);
+  const [models, setModels] = useState<ModelLibraryEntry[]>([]);
+  const [fetchedModels, setFetchedModels] = useState<{ id: string; name?: string; context_length?: number; pricing?: { prompt?: string; completion?: string } }[]>([]);
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState("");
   async function load() { setModels(await db.modelLibrary.orderBy("orderIndex").toArray()); }
@@ -4742,17 +4861,31 @@ function ModelLibrary() {
     try {
       const response = await fetch("https://openrouter.ai/api/v1/models");
       if (!response.ok) throw new Error("Could not fetch models.");
-      const json = await response.json() as { data?: { id: string; name?: string; context_length?: number }[] };
+      const json = await response.json() as { data?: { id: string; name?: string; context_length?: number; pricing?: { prompt?: string; completion?: string } }[] };
       setFetchedModels(json.data ?? []);
       setStatus(`Fetched ${(json.data ?? []).length} models`);
     } catch {
       setStatus("Model fetch failed. Check connection and try again.");
     }
   }
-  async function addModel(modelId: string, name?: string, contextLength?: number) {
-    if (!modelId.trim() || models.some((model) => model.modelId === modelId)) return;
+  function perMillion(value?: string) {
+    const perToken = Number(value);
+    return Number.isFinite(perToken) && perToken >= 0 ? perToken * 1_000_000 : undefined;
+  }
+  async function addOrUpdateModel(model: typeof fetchedModels[number]) {
+    if (!model.id.trim()) return;
     const timestamp = now();
-    await db.modelLibrary.add({ id: uid(), modelId, cosmeticName: name || modelId.split("/").pop() || modelId, contextLength, orderIndex: models.length, createdAt: timestamp, updatedAt: timestamp });
+    const inputPricePerMillionUsd = perMillion(model.pricing?.prompt);
+    const outputPricePerMillionUsd = perMillion(model.pricing?.completion);
+    const existing = models.find((item) => item.modelId === model.id);
+    if (existing) await db.modelLibrary.update(existing.id, { contextLength: model.context_length, inputPricePerMillionUsd, outputPricePerMillionUsd, updatedAt: timestamp });
+    else await db.modelLibrary.add({ id: uid(), modelId: model.id, cosmeticName: model.name || model.id.split("/").pop() || model.id, contextLength: model.context_length, inputPricePerMillionUsd, outputPricePerMillionUsd, orderIndex: models.length, createdAt: timestamp, updatedAt: timestamp });
+    await load();
+  }
+  async function updatePrice(model: ModelLibraryEntry, field: "inputPricePerMillionUsd" | "outputPricePerMillionUsd", value: string) {
+    const parsed = value.trim() === "" ? undefined : Number(value);
+    if (parsed !== undefined && (!Number.isFinite(parsed) || parsed < 0)) return;
+    await db.modelLibrary.update(model.id, { [field]: parsed, updatedAt: now() });
     await load();
   }
   const filtered = fetchedModels.filter((model) => `${model.id} ${model.name ?? ""}`.toLowerCase().includes(query.toLowerCase())).slice(0, 40);
@@ -4762,8 +4895,8 @@ function ModelLibrary() {
       <button onClick={fetchModels}><Download size={18} /> Fetch OpenRouter models</button>
       {status && <p className="save-status">{status}</p>}
       <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Filter fetched models" />
-      {filtered.length > 0 && <div className="model-results">{filtered.map((model) => <button key={model.id} onClick={() => addModel(model.id, model.name, model.context_length)}><Plus size={16} /><span>{model.name ?? model.id}</span><small>{model.id}</small></button>)}</div>}
-      {models.map((model) => <div className="mini-row" key={model.id}><span>{model.cosmeticName}</span><small>{model.modelId}</small><button className="danger" onClick={async () => { await db.modelLibrary.delete(model.id); await load(); }}><Trash2 size={16} /> Remove</button></div>)}
+      {filtered.length > 0 && <div className="model-results">{filtered.map((model) => { const saved = models.some((item) => item.modelId === model.id); return <button key={model.id} onClick={() => void addOrUpdateModel(model)}>{saved ? <RefreshCw size={16} /> : <Plus size={16} />}<span>{model.name ?? model.id}</span><small>{model.id}{model.pricing?.prompt !== undefined && model.pricing?.completion !== undefined ? ` · $${perMillion(model.pricing.prompt)?.toFixed(2)}/M in · $${perMillion(model.pricing.completion)?.toFixed(2)}/M out` : ""}</small></button>; })}</div>}
+      {models.map((model) => <div className="model-library-row" key={model.id}><div><strong>{model.cosmeticName}</strong><small>{model.modelId}</small></div><label>Input USD / 1M<input type="number" min={0} step="any" defaultValue={model.inputPricePerMillionUsd ?? ""} placeholder="not set" onBlur={(event) => void updatePrice(model, "inputPricePerMillionUsd", event.target.value)} /></label><label>Output USD / 1M<input type="number" min={0} step="any" defaultValue={model.outputPricePerMillionUsd ?? ""} placeholder="not set" onBlur={(event) => void updatePrice(model, "outputPricePerMillionUsd", event.target.value)} /></label><button className="danger" onClick={async () => { await db.modelLibrary.delete(model.id); await load(); }}><Trash2 size={16} /> Remove</button></div>)}
     </section>
   );
 }

@@ -75,6 +75,8 @@ export const defaultSettings = (): AppSettings => {
     includeInstructions: true,
     includeCharacters: false,
     includeSourceFiles: false,
+    maxHistoryMessages: 20,
+    historySettingsInitialized: true,
     // Streaming makes slow providers feel responsive as soon as their first tokens arrive.
     streamingEnabled: true,
     autoManageInventory: false,

@@ -1,5 +1,6 @@
 import Dexie from "dexie";
 import { db } from "./db";
+import { defaultWorldState } from "./world";
 import { defaultDeltaBases, defaultDeltaJobs, defaultDeltaNpcStats, defaultDeltaPrefixes, defaultDeltaSystemPrompt, defaultMemoryInstruction } from "./defaults";
 import { Ability, AbilityModifiers, AbilityScores, Character, CharacterBonus, Chat, DeltaAllyCacheEntry, DeltaBaseTemplate, DeltaEntity, DeltaMessage, DeltaPrefixTemplate, DeltaSession, InventoryKind, Memory, Message, Project } from "../types";
 import { estimateTokens, fallbackChatTitle, normaliseTag, now, uid } from "../utils";
@@ -315,7 +316,8 @@ export async function createChat(projectId: string, firstMessage: string) {
       createdAt: timestamp,
       updatedAt: timestamp,
       archived: false,
-      compactionMemory: ""
+      compactionMemory: "",
+      world: defaultWorldState()
     });
     await addMessage(chatId, branchId, "user", firstMessage, undefined, 0);
   });
