@@ -35,7 +35,6 @@ export type RouteName =
   | "characterProfile"
   | "memories"
   | "compaction"
-  | "sourceFiles"
   | "api"
   | "data"
   | "settings";
@@ -70,6 +69,7 @@ export interface AppSettings extends Timestamped {
   includeWorld?: boolean;
   includeInstructions?: boolean;
   includeCharacters?: boolean;
+  /** Legacy saved preference; source lookup is now always on demand. */
   includeSourceFiles?: boolean;
   streamingEnabled?: boolean;
   autoManageInventory?: boolean;
@@ -502,6 +502,18 @@ export interface SourceFile extends Timestamped {
   size: number;
   textContent?: string;
   attachmentId?: string;
+  /** Deterministic slices of the original file, generated locally for retrieval. */
+  sourceChunks?: SourceChunk[];
+  sourceIndexUpdatedAt?: number;
+}
+
+export interface SourceChunk {
+  id: string;
+  order: number;
+  start: number;
+  end: number;
+  heading?: string;
+  text: string;
 }
 
 export type InventoryKind = "inventory" | "gear";

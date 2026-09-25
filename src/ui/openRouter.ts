@@ -29,6 +29,12 @@ export type OpenRouterResponse = {
   usage?: OpenRouterUsage;
 };
 
+export const sourceTools = [
+  { type: "function", function: { name: "list_sources", description: "List original source files in the active project.", parameters: { type: "object", properties: {} } } },
+  { type: "function", function: { name: "search_sources", description: "Search original source text and filenames. Returns matching passages with character offsets. Try alternate terms if needed.", parameters: { type: "object", properties: { query: { type: "string" }, sourceId: { type: "string", description: "Optional source ID to narrow the search." } }, required: ["query"] } } },
+  { type: "function", function: { name: "read_source", description: "Read original source text by source ID. Follow nextStart to continue reading.", parameters: { type: "object", properties: { sourceId: { type: "string" }, start: { type: "integer", minimum: 0, description: "Character offset; defaults to 0." }, length: { type: "integer", minimum: 1, maximum: 24000, description: "Characters to read; defaults to 12000." } }, required: ["sourceId"] } } }
+] as const;
+
 export const characterTools = [
   {
     type: "function",
