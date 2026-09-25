@@ -39,7 +39,7 @@ import {
   X
 } from "lucide-react";
 import { buildSourceChunks, runSourceTool } from "../data/sources";
-import { importCastSources } from "../data/castImport";
+import { importCastSources, isCastSource } from "../data/castImport";
 import { db, ensureSeedData } from "../data/db";
 import { createFullBackup, createRecoverySnapshot, installAutomaticRecoverySnapshots, listRecoverySnapshots, mergeFullBackup, parseAndValidateBackup, replaceWithFullBackup, restoreRecoverySnapshot, type RecoverySlot, type RecoverySnapshot } from "../data/backup";
 import {
@@ -5273,6 +5273,9 @@ function EditableMemory({ memory, onRefresh }: { memory: Memory; onRefresh: () =
 
 export function CharactersPage({ project, onOpenProfile }: { project?: Project; onOpenProfile: (id: string) => void }) {
   const [characters, setCharacters] = useState<Character[]>([]);
+  const [sourcePicker, setSourcePicker] = useState<{ projectId: string; files: SourceFile[] }>();
+  const [selectedSourceIds, setSelectedSourceIds] = useState<string[]>([]);
+  const [loadingSources, setLoadingSources] = useState(false);
   const [importing, setImporting] = useState(false);
   const [importResult, setImportResult] = useState<{ projectId: string; message: string; error?: boolean }>();
   const [draggedCharacterId, setDraggedCharacterId] = useState<string>();
@@ -5284,16 +5287,30 @@ export function CharactersPage({ project, onOpenProfile }: { project?: Project; 
   useEffect(() => { load(); }, [project?.id]);
   if (!project) return <EmptyState title="No project selected" body="Choose a project to manage characters." />;
   const projectId = project.id;
+  async function openSourcePicker() {
+    setLoadingSources(true);
+    setSelectedSourceIds([]);
+    setImportResult(undefined);
+    try {
+      const files = (await db.sourceFiles.where("projectId").equals(projectId).toArray())
+        .filter((file) => isCastSource(file.name)).sort((a, b) => a.name.localeCompare(b.name));
+      setSourcePicker({ projectId, files });
+    } catch {
+      setImportResult({ projectId, message: "Could not load source files. Please try again.", error: true });
+    } finally { setLoadingSources(false); }
+  }
   async function importCharacters() {
-    if (importing) return;
+    if (importing || sourcePicker?.projectId !== projectId || !selectedSourceIds.length) return;
     setImporting(true);
     setImportResult(undefined);
     try {
-      const result = await importCastSources(projectId, (message) => setImportResult({ projectId, message }));
+      const result = await importCastSources(projectId, selectedSourceIds, (message) => setImportResult({ projectId, message }));
       const message = result.files === 0
         ? "No cast_*.md source files found in this project. Upload files such as cast_Girls.md or cast_Unity.md in the project’s source files first."
         : `Imported ${result.imported} character${result.imported === 1 ? "" : "s"} from ${result.files} cast file${result.files === 1 ? "" : "s"}.${result.skippedFiles.length ? ` No characters extracted from: ${result.skippedFiles.join(", ")}.` : ""}`;
       setImportResult({ projectId, message });
+      setSourcePicker(undefined);
+      setSelectedSourceIds([]);
       await load();
     } catch (error) {
       setImportResult({ projectId, message: error instanceof Error ? error.message : "Could not import characters. Please try again.", error: true });
@@ -5323,9 +5340,25 @@ export function CharactersPage({ project, onOpenProfile }: { project?: Project; 
     <Page>
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
         <button onClick={add} disabled={importing}><Plus size={18} /> Add character</button>
-        <button onClick={() => void importCharacters()} disabled={importing}>{importing ? "Importing characters…" : "Import characters from source files"}</button>
+        <button onClick={() => void openSourcePicker()} disabled={importing || loadingSources}>{importing ? "Importing characters…" : loadingSources ? "Loading source files…" : "Import characters from source files"}</button>
       </div>
-      <p className="notice">AI reads this project’s cast_*.md files and adds their character information to the library for use during chat. No special file layout needed.</p>
+      <p className="notice">Import character information from selected cast_*.md files, preserving the original wording in identity fields and biography. No special file layout needed.</p>
+      {sourcePicker?.projectId === projectId && <fieldset disabled={importing}>
+        <legend>Choose source files to import</legend>
+        {sourcePicker.files.length ? <>
+          <p className="notice">Select the files to process. Each import creates new character entries, including names already in your library.</p>
+          <div style={{ display: "grid", gap: 8, maxHeight: 280, overflowY: "auto" }}>
+            {sourcePicker.files.map((file) => <label key={file.id} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <input type="checkbox" style={{ width: "auto" }} checked={selectedSourceIds.includes(file.id)} onChange={(event) => setSelectedSourceIds((ids) => event.target.checked ? [...ids, file.id] : ids.filter((id) => id !== file.id))} />
+              {file.name}
+            </label>)}
+          </div>
+        </> : <p role="status">No cast_*.md source files found in this project. Upload your cast files in the project’s source files first.</p>}
+        <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+          <button onClick={() => { setSourcePicker(undefined); setSelectedSourceIds([]); }}>Cancel</button>
+          <button disabled={!selectedSourceIds.length || importing} onClick={() => void importCharacters()}>{importing ? "Importing…" : `Import selected files (${selectedSourceIds.length})`}</button>
+        </div>
+      </fieldset>}
       {importResult?.projectId === projectId && <p className={importResult.error ? "error" : "notice"} role={importResult.error ? "alert" : "status"}>{importResult.message}</p>}
       <div className="character-gallery">
         {characters.map((character) => (
