@@ -12,6 +12,48 @@ beforeEach(async () => { await db.settings.put({ ...defaultSettings(), apiKey: "
 afterEach(async () => { vi.unstubAllGlobals(); await db.sourceFiles.clear(); await db.characters.clear(); await db.settings.clear(); });
 
 describe("AI cast imports", () => {
+  it("removes duplicated name and age lines from Jaeger's bio while retaining narrative", async () => {
+    const original = "name: Jaeger\nage: 38\nJaeger survived the siege.\nHe still dreams about it.";
+    await db.sourceFiles.add(source("jaeger", original));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response([extracted("Jaeger", [original], { age: ["38"] })])));
+    await importCastSources("project", ["jaeger"]);
+    expect((await db.characters.toArray())[0]).toMatchObject({ name: "Jaeger", age: "38", bio: "Jaeger survived the siege.\nHe still dreams about it." });
+  });
+
+  it("keeps a deliberately empty bio empty when only identity information exists", async () => {
+    await db.sourceFiles.add(source("jaeger", "name: Jaeger\nage: 38"));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response([extracted("Jaeger", [], { age: ["38"] })])));
+    await importCastSources("project", ["jaeger"]);
+    expect((await db.characters.toArray())[0]).toMatchObject({ name: "Jaeger", age: "38", bio: "" });
+  });
+
+  it("does not recover the entire file when a bio is omitted", async () => {
+    await db.sourceFiles.add(source("sparse", "World notes: a distant planet.\nKairos eats shit\nBeth flies."));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ characters: [{ name: "Kairos" }] }) } }] }) }));
+    await importCastSources("project", ["sparse"]);
+    expect((await db.characters.toArray())[0].bio).toBe("Kairos eats shit");
+  });
+
+  it.each([
+    { name: "Kairos", bio: "Kairos eats shit" },
+    { name: "Kairos", bio: ["Kairos eats shit"], age: null, misc: "" },
+    { name: "Kairos" },
+  ])("imports sparse entries and tolerates omitted or plain-text fields: %j", async (character) => {
+    await db.sourceFiles.add(source("sparse", "Kairos eats shit"));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ characters: [character] }) } }] }) }));
+    expect(await importCastSources("project", ["sparse"])).toMatchObject({ imported: 1 });
+    expect((await db.characters.toArray())[0]).toMatchObject({ name: "Kairos", bio: "Kairos eats shit", age: "", gender: "", personality: "", misc: "" });
+  });
+
+  it("recovers missing bios for multiple sparse entries from their source paragraphs", async () => {
+    await db.sourceFiles.add(source("sparse", "Kairos eats shit\n\nBeth flies."));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ characters: [{ name: "Kairos" }, { name: "Beth" }] }) } }] }) }));
+    await importCastSources("project", ["sparse"]);
+    const characters = await db.characters.toArray();
+    expect(characters.find((character) => character.name === "Kairos")?.bio).toBe("Kairos eats shit");
+    expect(characters.find((character) => character.name === "Beth")?.bio).toBe("Beth flies.");
+  });
+
   it("processes only selected files and rejects empty or unavailable selections before calling AI", async () => {
     await db.sourceFiles.bulkAdd([source("a", "Alice: selected character"), source("b", "Beth: unselected character"), source("foreign", "Other project", "other")]);
     const request = vi.fn().mockResolvedValue(response([extracted("Alice", ["Alice: selected character"])]));
@@ -30,13 +72,13 @@ describe("AI cast imports", () => {
     expect(["cast_.md", "cast.md", "forecast_Girls.md", "cast_Girls.txt"].some(isCastSource)).toBe(false);
   });
 
-  it("preserves the complete source passage exactly and fills identity fields for chat lookup", async () => {
+  it("preserves uncategorized narrative and fills identity fields for chat lookup", async () => {
     const original = "Alice is 24, a woman; stubborn, but kind.\r\n\r\nShe wears **blue**.  Never red!\r\n- Keeps an old compass.\r\n- Won’t sell it.\r\n";
     await db.sourceFiles.add(source("a", original));
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response([extracted("Alice", [original], { age: ["24"], gender: ["woman"], personality: ["stubborn, but kind"], misc: ["She wears **blue**.  Never red!", "- Keeps an old compass.\r\n- Won’t sell it."] })])));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response([extracted("Alice", [], { age: ["24"], gender: ["woman"], personality: ["stubborn, but kind"], misc: ["She wears **blue**.  Never red!", "- Keeps an old compass.\r\n- Won’t sell it."] })])));
     await importCastSources("project", ["a"]);
     const [alice] = await findCharacters("project", "Alice");
-    expect(await getCharacterBio("project", alice.id)).toEqual({ character: "Alice", bio: original });
+    expect(await getCharacterBio("project", alice.id)).toEqual({ character: "Alice", bio: "" });
     expect(await getCharacterIdentity("project", alice.id)).toEqual({ character: "Alice", identity: { age: "24", gender: "woman", personality: "stubborn, but kind", misc: "She wears **blue**.  Never red!\n\n- Keeps an old compass.\r\n- Won’t sell it." } });
     expect((await db.characters.get(alice.id))?.bio).not.toContain("Source:");
     expect((await db.characters.get(alice.id))?.bio).not.toContain("cast_a.md");
@@ -64,7 +106,7 @@ describe("AI cast imports", () => {
     vi.stubGlobal("fetch", request);
     await importCastSources("project", ["long"]);
     expect(request).toHaveBeenCalledTimes(2);
-    expect((await db.characters.toArray())[0].bio).toBe(original);
+    expect((await db.characters.toArray())[0].bio).toBe(original.slice("Alice\n".length));
   });
 
   it("rejects paraphrased biographies, changed identity text and invented names without saving", async () => {

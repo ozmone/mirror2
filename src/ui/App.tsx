@@ -5279,6 +5279,32 @@ export function CharactersPage({ project, onOpenProfile }: { project?: Project; 
   const [importing, setImporting] = useState(false);
   const [importResult, setImportResult] = useState<{ projectId: string; message: string; error?: boolean }>();
   const [draggedCharacterId, setDraggedCharacterId] = useState<string>();
+  const [managing, setManaging] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState("");
+  useEffect(() => { setManaging(false); setSelectedIds([]); setDeleteError(""); }, [project?.id]);
+  async function deleteSelected() {
+    if (deleting || !selectedIds.length) return;
+    if (!confirm(`Delete ${selectedIds.length} selected character(s)? This permanently removes their profiles, images, bonuses, gear slots, and actions.`)) return;
+    setDeleting(true);
+    setDeleteError("");
+    try {
+      await db.transaction("rw", [db.characters, db.characterBonuses, db.characterGearSlots, db.characterActionSlots, db.characterActionMacros, db.attachments], async () => {
+        await db.characterBonuses.where("characterId").anyOf(selectedIds).delete();
+        await db.characterGearSlots.where("characterId").anyOf(selectedIds).delete();
+        const slots = await db.characterActionSlots.where("characterId").anyOf(selectedIds).primaryKeys();
+        if (slots.length) await db.characterActionMacros.where("slotId").anyOf(slots).delete();
+        await db.characterActionSlots.where("characterId").anyOf(selectedIds).delete();
+        await db.attachments.where("[ownerType+ownerId]").anyOf(selectedIds.map((id) => ["character", id])).delete();
+        await db.characters.bulkDelete(selectedIds);
+      });
+      setSelectedIds([]);
+      setManaging(false);
+      await load();
+    } catch { setDeleteError("Could not delete the selected characters. Please try again."); }
+    finally { setDeleting(false); }
+  }
   async function load() {
     if (!project) return;
     const rows = await db.characters.where("projectId").equals(project.id).toArray();
@@ -5342,7 +5368,14 @@ export function CharactersPage({ project, onOpenProfile }: { project?: Project; 
         <button onClick={add} disabled={importing}><Plus size={18} /> Add character</button>
         <button onClick={() => void openSourcePicker()} disabled={importing || loadingSources}>{importing ? "Importing characters…" : loadingSources ? "Loading source files…" : "Import characters from source files"}</button>
       </div>
-      <p className="notice">Import character information from selected cast_*.md files, preserving the original wording in identity fields and biography. No special file layout needed.</p>
+      {characters.length > 0 && !managing && <button onClick={() => setManaging(true)}>Manage characters</button>}
+      {managing && <div className="character-manage-toolbar" role="group" aria-label="Manage characters">
+        <strong role="status">{selectedIds.length} selected</strong>
+        <button disabled={deleting} onClick={() => setSelectedIds(selectedIds.length === characters.length ? [] : characters.map((character) => character.id))}>{selectedIds.length === characters.length ? "Deselect all" : "Select all"}</button>
+        <button className="danger" disabled={deleting || !selectedIds.length} onClick={() => void deleteSelected()}><Trash2 size={18} />{deleting ? "Deleting…" : `Delete selected (${selectedIds.length})`}</button>
+        <button disabled={deleting} onClick={() => { setManaging(false); setSelectedIds([]); setDeleteError(""); }}>Done</button>
+      </div>}
+      {deleteError && <p className="error" role="alert">{deleteError}</p>}
       {sourcePicker?.projectId === projectId && <fieldset disabled={importing}>
         <legend>Choose source files to import</legend>
         {sourcePicker.files.length ? <>
@@ -5363,8 +5396,13 @@ export function CharactersPage({ project, onOpenProfile }: { project?: Project; 
       <div className="character-gallery">
         {characters.map((character) => (
           <CharacterTile
-            key={character.id}
+            key={`${projectId}:${character.id}`}
             character={character}
+            managing={managing}
+            selected={selectedIds.includes(character.id)}
+            disabled={deleting}
+            onHold={() => { setManaging(true); setSelectedIds([character.id]); setDraggedCharacterId(undefined); }}
+            onToggle={() => setSelectedIds((ids) => ids.includes(character.id) ? ids.filter((id) => id !== character.id) : [...ids, character.id])}
             dragging={draggedCharacterId === character.id}
             onDragStart={() => setDraggedCharacterId(character.id)}
             onDrop={() => moveCharacter(character.id)}
@@ -5376,7 +5414,15 @@ export function CharactersPage({ project, onOpenProfile }: { project?: Project; 
   );
 }
 
-function CharacterTile({ character, dragging, onDragStart, onDrop, onOpen }: { character: Character; dragging: boolean; onDragStart: () => void; onDrop: () => void; onOpen: () => void }) {
+function CharacterTile({ character, dragging, managing, selected, disabled, onHold, onToggle, onDragStart, onDrop, onOpen }: { character: Character; dragging: boolean; managing: boolean; selected: boolean; disabled: boolean; onHold: () => void; onToggle: () => void; onDragStart: () => void; onDrop: () => void; onOpen: () => void }) {
+  const holdTimer = useRef<ReturnType<typeof setTimeout>>();
+  const origin = useRef<{ x: number; y: number }>();
+  const suppressClick = useRef(false);
+  function cancelHold() {
+    clearTimeout(holdTimer.current);
+    origin.current = undefined;
+  }
+  useEffect(() => cancelHold, []);
   const [imageUrl, setImageUrl] = useState<string>();
   useEffect(() => {
     db.attachments.where("[ownerType+ownerId]").equals(["character", character.id]).first().then((attachment) => {
@@ -5386,10 +5432,32 @@ function CharacterTile({ character, dragging, onDragStart, onDrop, onOpen }: { c
   }, [character.id]);
   return (
     <button
-      className={`character-tile ${dragging ? "dragging" : ""}`}
-      draggable
-      onClick={onOpen}
+      className={`character-tile ${dragging ? "dragging" : ""} ${managing ? "managing" : ""} ${selected ? "selected" : ""}`}
+      disabled={disabled}
+      aria-pressed={managing ? selected : undefined}
+      draggable={!managing}
+      onPointerDown={(event) => {
+        cancelHold();
+        suppressClick.current = false;
+        if (managing || event.button !== 0) return;
+        origin.current = { x: event.clientX, y: event.clientY };
+        holdTimer.current = setTimeout(() => { suppressClick.current = true; onHold(); }, 500);
+      }}
+      onPointerMove={(event) => {
+        if (origin.current && Math.hypot(event.clientX - origin.current.x, event.clientY - origin.current.y) > 10) cancelHold();
+      }}
+      onPointerUp={cancelHold}
+      onPointerCancel={cancelHold}
+      onPointerLeave={cancelHold}
+      onContextMenu={(event) => event.preventDefault()}
+      onClick={(event) => {
+        if (suppressClick.current && event.detail !== 0) { suppressClick.current = false; return; }
+        suppressClick.current = false;
+        if (managing) onToggle(); else onOpen();
+      }}
       onDragStart={(event) => {
+        cancelHold();
+        if (managing || suppressClick.current) { event.preventDefault(); return; }
         event.dataTransfer.effectAllowed = "move";
         event.dataTransfer.setData("text/plain", character.id);
         onDragStart();
@@ -5400,10 +5468,11 @@ function CharacterTile({ character, dragging, onDragStart, onDrop, onOpen }: { c
       }}
       onDrop={(event) => {
         event.preventDefault();
-        onDrop();
+        if (!managing) onDrop();
       }}
     >
-      {imageUrl ? <img src={imageUrl} alt="" /> : <UserRound className="character-placeholder-icon" size={54} strokeWidth={1.55} />}
+      {managing && <span className="character-selection-mark" aria-hidden="true">{selected ? "✓" : ""}</span>}
+      {imageUrl ? <img src={imageUrl} alt="" draggable={false} /> : <UserRound className="character-placeholder-icon" size={54} strokeWidth={1.55} />}
       <span>{character.name}</span>
     </button>
   );
