@@ -23,6 +23,8 @@ export type FontName = "system" | "inter" | "lora" | "nunito";
 export type FontSizeName = "small" | "standard" | "large" | "xl";
 export type BubbleMode = "bubbles" | "minimal";
 export type BubbleScope = "global" | "project";
+export type SidebarSpacing = "36" | "28" | "24" | "22";
+export type SidebarWidth = "380" | "340" | "300" | "420";
 export type MemoryMode = "manual" | "automatic" | "approval";
 export type RouteName =
   | "chat"
@@ -56,6 +58,8 @@ export interface AppSettings extends Timestamped {
   entryWidth: number;
   messageSpacing: number;
   paragraphSpacing?: number;
+  sidebarSpacing?: SidebarSpacing;
+  sidebarWidth?: SidebarWidth;
   apiKey?: string;
   privacyPreset: "maximum" | "balanced" | "availability";
   defaultModelId?: string;
@@ -69,13 +73,13 @@ export interface AppSettings extends Timestamped {
   includeWorld?: boolean;
   includeInstructions?: boolean;
   includeCharacters?: boolean;
-  /** Legacy saved preference; source lookup is now always on demand. */
+  /** Legacy preference used when sourceFilesMode is absent. */
   includeSourceFiles?: boolean;
+  sourceFilesMode?: "all" | "lookup" | "none";
+  charactersMode?: "all" | "lookup" | "none";
   streamingEnabled?: boolean;
   autoManageInventory?: boolean;
   confirmInventoryUpdates?: boolean;
-  autoManageGear?: boolean;
-  confirmGearUpdates?: boolean;
 }
 
 export interface InventoryUpdateRequest {
@@ -224,6 +228,25 @@ export interface MainChatAuditToolEvent {
   name: string;
   arguments: string;
   result: string;
+  sources?: SourceAuditVersion[];
+}
+
+export interface SourceAuditVersion {
+  id: string;
+  name: string;
+  updatedAt: number;
+  characters: number;
+  sha256?: string;
+}
+
+export interface MainChatAuditRequest {
+  purpose: "reply" | "compaction" | "memory review";
+  capturedAt: number;
+  payload: Record<string, unknown>;
+  usage?: { prompt_tokens?: number; completion_tokens?: number };
+  pricing?: { inputPricePerMillionUsd?: number; outputPricePerMillionUsd?: number };
+  status: "pending" | "complete" | "failed";
+  error?: string;
 }
 
 export interface MainChatMemoryReviewAudit {
@@ -241,7 +264,9 @@ export interface MainChatMemoryReviewAudit {
 }
 
 export interface MainChatRequestAudit {
-  version: 1;
+  version: 1 | 2;
+  requests?: MainChatAuditRequest[];
+  sourceVersions?: SourceAuditVersion[];
   capturedAt: number;
   requestKind: "send" | "resend";
   projectId: string;
@@ -265,7 +290,7 @@ export interface MainChatRequestAudit {
     concepts: string[];
     hits: MainChatAuditMemoryHit[];
   };
-  requestPayload: Record<string, unknown>;
+  requestPayload?: Record<string, unknown>;
   toolEvents: MainChatAuditToolEvent[];
   postResponseMemory?: MainChatMemoryReviewAudit;
 }

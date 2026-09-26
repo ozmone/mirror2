@@ -35,15 +35,6 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
-export function CardsIcon({ size = 18 }: { size?: number }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <path d="M5 17H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2" />
-      <rect x={7} y={7} width={13} height={14} rx={2} />
-    </svg>
-  );
-}
-
 export const projectIcons: { name: string; label: string; Icon: LucideIcon }[] = [
   { name: "folder", label: "Folder", Icon: Folder },
   { name: "book", label: "Book", Icon: BookOpen },

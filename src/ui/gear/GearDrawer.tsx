@@ -41,19 +41,19 @@ function EmptyState({ title, body }: { title: string; body: string }) {
   return <div className="empty"><h1>{title}</h1><p>{body}</p></div>;
 }
 
-export function GearDrawer({ open, project, chat, refreshVersion, elevated, onOpenCharacter, onClose, onRefresh }: { open: boolean; project: Project; chat: Chat; refreshVersion?: number; elevated?: boolean; onOpenCharacter: (id: string) => void; onClose: () => void; onRefresh: () => Promise<void> }) {
+export function GearDrawer({ open, project, chat, refreshVersion, elevated, onOpenCharacter, onClose }: { open: boolean; project: Project; chat: Chat; refreshVersion?: number; elevated?: boolean; onOpenCharacter: (id: string) => void; onClose: () => void }) {
   if (!open) return null;
   return (
     <>
       <button className={`drawer-backdrop ${elevated ? "elevated" : ""}`} onClick={onClose} aria-label="Close gear" />
       <aside className={`inventory-drawer gear-drawer ${elevated ? "delta-inventory" : ""}`}>
-        <CharacterGearPanel project={project} chat={chat} refreshVersion={refreshVersion} onOpenCharacter={onOpenCharacter} onRefresh={onRefresh} />
+        <CharacterGearPanel project={project} chat={chat} refreshVersion={refreshVersion} onOpenCharacter={onOpenCharacter} />
       </aside>
     </>
   );
 }
 
-function CharacterGearPanel({ project, chat, refreshVersion, onOpenCharacter, onRefresh }: { project: Project; chat: Chat; refreshVersion?: number; onOpenCharacter: (id: string) => void; onRefresh: () => Promise<void> }) {
+function CharacterGearPanel({ project, chat, refreshVersion, onOpenCharacter }: { project: Project; chat: Chat; refreshVersion?: number; onOpenCharacter: (id: string) => void }) {
   const [characters, setCharacters] = useState<Character[]>([]);
   const [selectedCharacterId, setSelectedCharacterId] = useState(chat.deltaPlayerCharacterId ?? "");
   const [selectedCharacter, setSelectedCharacter] = useState<Character>();

@@ -59,7 +59,7 @@ function scoreChunk(chunk: SourceChunk, file: SourceFile, query: string, terms: 
   return score;
 }
 
-export async function runSourceTool(projectId: string, name: string, rawArguments: string) {
+export async function runSourceTool(projectId: string, name: string, rawArguments: string, captureSources?: (files: SourceFile[]) => Promise<void>) {
   let args: Record<string, unknown>;
   try {
     const parsed: unknown = JSON.parse(rawArguments || "{}");
@@ -68,12 +68,14 @@ export async function runSourceTool(projectId: string, name: string, rawArgument
   } catch { return { error: "Invalid source lookup arguments." }; }
   const files = await db.sourceFiles.where("projectId").equals(projectId).toArray();
   if (name === "list_sources") {
+    await captureSources?.(files);
     const indexed = await Promise.all(files.map(async (file) => ({ file, chunks: await ensureSourceIndex(file) })));
     return { sources: indexed.map(({ file, chunks }) => ({ id: file.id, name: file.name, readable: Boolean(file.textContent?.trim()), characters: file.textContent?.length ?? 0, sections: chunks.length })) };
   }
   if (name === "read_source") {
     const file = files.find((item) => item.id === args.sourceId);
     if (!file) return { error: "Source not found in this project." };
+    await captureSources?.([file]);
     if (!file.textContent?.trim()) return { error: "This source has no extracted readable text." };
     const start = args.start === undefined ? 0 : args.start;
     const length = args.length === undefined ? 12000 : args.length;
@@ -91,5 +93,6 @@ export async function runSourceTool(projectId: string, name: string, rawArgument
     .sort((a, b) => b.score - a.score || a.file.name.localeCompare(b.file.name) || a.chunk.order - b.chunk.order)
     .slice(0, 8)
     .map(({ file, chunk, score }) => ({ id: file.id, name: file.name, score, heading: chunk.heading, passages: [{ start: chunk.start, end: chunk.end, text: chunk.text }] }));
+  await captureSources?.(files.filter((file) => hits.some((hit) => hit.id === file.id)));
   return { totalMatches: hits.length, hits };
 }

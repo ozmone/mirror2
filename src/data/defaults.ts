@@ -69,6 +69,8 @@ export const defaultSettings = (): AppSettings => {
     entryWidth: 80,
     messageSpacing: 4,
     paragraphSpacing: 4,
+    sidebarSpacing: "36",
+    sidebarWidth: "380",
     privacyPreset: "balanced",
     compactionEnabled: false,
     includeWorld: true,
@@ -80,9 +82,7 @@ export const defaultSettings = (): AppSettings => {
     // Streaming makes slow providers feel responsive as soon as their first tokens arrive.
     streamingEnabled: true,
     autoManageInventory: false,
-    confirmInventoryUpdates: true,
-    autoManageGear: false,
-    confirmGearUpdates: true
+    confirmInventoryUpdates: true
   };
 };
 

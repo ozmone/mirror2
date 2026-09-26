@@ -2,7 +2,7 @@ import Dexie from "dexie";
 import { db } from "./db";
 import { defaultWorldState } from "./world";
 import { defaultDeltaBases, defaultDeltaJobs, defaultDeltaNpcStats, defaultDeltaPrefixes, defaultDeltaSystemPrompt, defaultMemoryInstruction } from "./defaults";
-import { Ability, AbilityModifiers, AbilityScores, Character, CharacterBonus, Chat, DeltaAllyCacheEntry, DeltaBaseTemplate, DeltaEntity, DeltaMessage, DeltaPrefixTemplate, DeltaSession, InventoryKind, Memory, Message, Project } from "../types";
+import { Ability, AbilityModifiers, AbilityScores, Character, Chat, DeltaAllyCacheEntry, DeltaBaseTemplate, DeltaEntity, DeltaMessage, DeltaPrefixTemplate, DeltaSession, InventoryKind, Memory, Message, Project } from "../types";
 import { estimateTokens, fallbackChatTitle, normaliseTag, now, uid } from "../utils";
 
 export const abilities: Ability[] = ["STR", "DEX", "CON", "INT", "WIS", "CHA"];
