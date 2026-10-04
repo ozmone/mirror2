@@ -81,6 +81,22 @@ function MessageRow({
   const editImagePickerRef = useRef<HTMLInputElement>(null);
   const editFilePickerRef = useRef<HTMLInputElement>(null);
   const attachmentPressTimer = useRef<number>();
+  const messagePressTimer = useRef<number>();
+  const messagePressStart = useRef<{ x: number; y: number }>();
+  function cancelMessagePress() {
+    window.clearTimeout(messagePressTimer.current);
+    messagePressTimer.current = undefined;
+    messagePressStart.current = undefined;
+  }
+  useEffect(() => {
+    window.addEventListener("scroll", cancelMessagePress, true);
+    window.addEventListener("blur", cancelMessagePress);
+    return () => {
+      cancelMessagePress();
+      window.removeEventListener("scroll", cancelMessagePress, true);
+      window.removeEventListener("blur", cancelMessagePress);
+    };
+  }, [message.id]);
   useEffect(() => setDraftBody(message.body), [message.id, message.body]);
   async function loadDeltaCharacters() {
     const rows = await db.characters.where("projectId").equals(projectId).toArray();
@@ -197,7 +213,34 @@ function MessageRow({
   })();
   return (
     <>
-      <article className={`message ${message.role} ${message.status === "cancelled" ? "cancelled" : ""}`} onClick={() => onExpand(message.id)}>
+      <article
+        className={`message ${message.role} ${message.status === "cancelled" ? "cancelled" : ""}`}
+        tabIndex={0}
+        aria-label={`${message.role === "user" ? "Your" : "Assistant"} message`}
+        aria-expanded={expanded}
+        onPointerDown={(event) => {
+          cancelMessagePress();
+          if (!event.isPrimary || event.button !== 0 || (event.target as Element).closest("button, a, input, textarea, select, [role='button'], [contenteditable='true']")) return;
+          messagePressStart.current = { x: event.clientX, y: event.clientY };
+          messagePressTimer.current = window.setTimeout(() => {
+            cancelMessagePress();
+            onExpand(message.id);
+          }, 520);
+        }}
+        onPointerMove={(event) => {
+          const start = messagePressStart.current;
+          if (start && Math.hypot(event.clientX - start.x, event.clientY - start.y) > 10) cancelMessagePress();
+        }}
+        onPointerUp={cancelMessagePress}
+        onPointerCancel={cancelMessagePress}
+        onPointerLeave={cancelMessagePress}
+        onKeyDown={(event) => {
+          if (event.target === event.currentTarget && !event.repeat && (event.key === "Enter" || event.key === " ")) {
+            event.preventDefault();
+            onExpand(message.id);
+          }
+        }}
+      >
         {message.role === "user" && <MessageImageAttachments messageId={message.id} />}
         <div className="message-body">{message.status === "pending" && message.body.trim() === "..." ? <LoadingSignal /> : <MarkdownText text={message.body} inventoryMarkers />}</div>
         {message.deltaBrief?.status === "pending" && (
@@ -246,6 +289,7 @@ function MessageRow({
           <button aria-label="Response audit" title="Response audit" onClick={(event) => { event.stopPropagation(); setInfoOpen(true); }}><Info size={16} /></button>
           <span>{formatMessageDate(message.createdAt)}</span>
           <span>{message.inputTokens ?? message.outputTokens ?? estimateTokens(message.body)}t</span>
+          {message.role === "assistant" && <span title={message.requestInfo?.audit?.version === 2 ? "Recorded API requests for this reply, including tool rounds, memory review, compaction, and Timeline continuity. Includes failed attempts; updates after background work finishes. No extra AI requests are made to count these." : "Request count unavailable for this older message."}>R:{message.requestInfo?.audit?.version === 2 ? message.requestInfo.audit.requests?.length ?? 0 : "?"}</span>}
           {expanded && <EstimatedMessageCost message={message} />}
           {message.role === "user" && <button className="resend" aria-label="Resend message" title={deltaLocked ? "Resolve engagement to unlock resend" : "Resend"} disabled={deltaLocked} onClick={(event) => { event.stopPropagation(); setResendConfirm("resend"); }}><RefreshCw size={16} /></button>}
         </div>
@@ -389,7 +433,13 @@ function VirtualMessageListRow({ index, style, data }: ListChildComponentProps<V
   );
 }
 
-export function VirtualMessageList({
+type VirtualMessageListProps = Omit<VirtualMessageListData, "onSize"> & { bubbleMode: BubbleMode; chatId?: string };
+
+export function VirtualMessageList(props: VirtualMessageListProps) {
+  return <MeasuredMessageList key={props.chatId ?? "new"} {...props} />;
+}
+
+function MeasuredMessageList({
   projectId,
   messages,
   bubbleMode,
@@ -403,8 +453,7 @@ export function VirtualMessageList({
   deltaLocked,
   onOpenChatSettings,
   onRefresh,
-  chatId
-}: Omit<VirtualMessageListData, "onSize"> & { bubbleMode: BubbleMode; chatId?: string }) {
+}: VirtualMessageListProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const listRef = useRef<VariableSizeList<VirtualMessageListData>>(null);
   const listOuterRef = useRef<HTMLDivElement>(null);
@@ -432,21 +481,10 @@ export function VirtualMessageList({
   }, []);
 
   useEffect(() => {
-    if (resizeFrame.current !== undefined) window.cancelAnimationFrame(resizeFrame.current);
-    resizeFrame.current = undefined;
-    pendingResetIndex.current = undefined;
-    rowHeights.current.clear();
-    listRef.current?.resetAfterIndex(0, true);
-    staysAtBottom.current = true;
-    const frame = window.requestAnimationFrame(() => listRef.current?.scrollToItem(Math.max(0, messages.length - 1), "end"));
-    return () => window.cancelAnimationFrame(frame);
-  }, [chatId]);
-
-  useEffect(() => {
     if (!lastMessage || !staysAtBottom.current) return;
     const frame = window.requestAnimationFrame(() => listRef.current?.scrollToItem(messages.length - 1, "end"));
     return () => window.cancelAnimationFrame(frame);
-  }, [lastMessage?.id, lastMessage?.updatedAt, lastMessage?.body, messages.length]);
+  }, [lastMessage?.id, lastMessage?.updatedAt, lastMessage?.body, messages.length, height]);
 
   const onSize = useCallback((index: number, messageId: string, nextHeight: number) => {
     const roundedHeight = Math.ceil(nextHeight);
@@ -486,9 +524,13 @@ export function VirtualMessageList({
         itemKey={(index) => messages[index].id}
         itemSize={(index) => rowHeights.current.get(messages[index].id) ?? 280}
         overscanCount={3}
-        onScroll={({ scrollOffset }) => {
+        onScroll={({ scrollOffset, scrollUpdateWasRequested, scrollDirection }) => {
           const element = listOuterRef.current;
-          if (element) staysAtBottom.current = element.scrollHeight - element.clientHeight - scrollOffset < 80;
+          // Programmatic positioning and changing row estimates are not user
+          // intent to stop following the bottom. Only an upward scroll opts out.
+          if (!element || scrollUpdateWasRequested) return;
+          if (element.scrollHeight - element.clientHeight - scrollOffset < 80) staysAtBottom.current = true;
+          else if (scrollDirection === "backward") staysAtBottom.current = false;
         }}
       >
         {VirtualMessageListRow}

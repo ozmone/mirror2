@@ -3,7 +3,8 @@ import { db } from "./db";
 /** Shared by chat deletion and resend; attachments must disappear with their messages. */
 export async function deleteMessages(messageIds: string[], database = db) {
   if (!messageIds.length) return;
-  await database.transaction("rw", [database.messages, database.stars, database.attachments], async () => {
+  await database.transaction("rw", [database.messages, database.stars, database.attachments, database.timelineEntries], async () => {
+    await database.timelineEntries.where("sourceMessageIds").anyOf(messageIds).delete();
     await database.attachments.where("[ownerType+ownerId]").anyOf(messageIds.map((id) => ["message", id])).delete();
     await database.stars.where("messageId").anyOf(messageIds).delete();
     await database.messages.bulkDelete(messageIds);
@@ -29,7 +30,7 @@ export async function deleteProject(projectId: string, database = db) {
     database.characterGearSlots, database.characterActionSlots, database.characterActionMacros, database.memories,
     database.pendingMemories, database.sourceFiles, database.inventoryItems, database.inventoryLogs,
     database.deltaSessions, database.deltaMessages, database.deltaEntities, database.deltaAllyCache,
-    database.deltaActionMacros, database.deltaEffects, database.deltaIcons];
+    database.deltaActionMacros, database.deltaEffects, database.deltaIcons, database.timelineEntries];
   await database.transaction("rw", tables, async () => {
     const chatIds = await database.chats.where("projectId").equals(projectId).primaryKeys();
     const archiveIds = await database.archives.where("projectId").equals(projectId).primaryKeys();
@@ -52,7 +53,7 @@ export async function deleteProject(projectId: string, database = db) {
     await database.deltaActionMacros.where("chatId").anyOf(chatIds).delete();
     await database.chats.bulkDelete(chatIds);
     for (const table of [database.stars, database.memories, database.pendingMemories, database.sourceFiles,
-      database.inventoryItems, database.inventoryLogs, database.deltaEffects, database.deltaIcons]) {
+      database.inventoryItems, database.inventoryLogs, database.deltaEffects, database.deltaIcons, database.timelineEntries]) {
       await table.where("projectId").equals(projectId).delete();
     }
     await database.projects.delete(projectId);

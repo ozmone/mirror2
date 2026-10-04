@@ -15,6 +15,8 @@ import { createPortal } from "react-dom";
 import { db } from "../../data/db";
 import { defaultMemoryInstruction } from "../../data/defaults";
 import { deleteMessages } from "../../data/deletion";
+import { hasMemoryManagementEntries, memoryManagementInstruction, runMemoryManagementTool, type MemoryManagementSession } from "../../data/memoryManagement";
+import { formatTimelineContinuity, invalidateTimelineMessages, timelineEntries, timelineHistoryBoundary, updateTimelineContinuity } from "../../data/timeline";
 import {
   addMessage,
   applyInventoryChange,
@@ -22,9 +24,6 @@ import {
   createChat,
   createMemory,
   findCharacters,
-  getCharacterBio,
-  getCharacterIdentity,
-  getCharacterStats,
   messagesForIncrementalCompaction,
   normaliseInventoryName,
   searchMemories
@@ -35,7 +34,7 @@ import { AppSettings, Chat, DeltaMapSize, InventoryUpdateRequest, MainChatAuditR
 import { estimateTokens, now, uid } from "../../utils";
 import { isDeltaModeRequest, normaliseDeltaMapSize } from "../delta/config";
 import { abstractDeltaRosterName, fitComposerTextarea, formatInventoryKg, keepComposerVisible, useSavedNotice } from "../delta/workspaceSupport";
-import { characterTools, deltaImminentTools, finalizeTurnTool, imageContextTools, inventoryTools, memoryTools, sourceTools, type OpenRouterMessage, type OpenRouterResponse, type OpenRouterToolCall, type OpenRouterUsage } from "../openRouter";
+import { characterTools, deltaImminentTools, finalizeTurnTool, imageContextTools, inventoryTools, memoryManagementTools, memoryTools, sourceTools, type OpenRouterMessage, type OpenRouterResponse, type OpenRouterToolCall, type OpenRouterUsage } from "../openRouter";
 import { auditSafeValue, recordModelRequest, sourceAuditVersions } from "../responseAudit";
 import { EmptyState } from "../shared/appElements";
 import { VirtualMessageList } from "./MessageList";
@@ -86,7 +85,8 @@ export function ChatScreen({
   models,
   deltaLocked,
   onOpenDelta,
-  onSettingsSaved
+  onSettingsSaved,
+  onModelSelected
 }: {
   project?: Project;
   chat?: Chat;
@@ -101,6 +101,7 @@ export function ChatScreen({
   deltaLocked: boolean;
   onOpenDelta: (chat: Chat, startContext: string, mapSize?: DeltaMapSize) => Promise<void>;
   onSettingsSaved: (modelId: string) => Promise<void>;
+  onModelSelected: (modelId: string) => void;
 }) {
   const [body, setBody] = useState("");
   const [contextOpen, setContextOpen] = useState(false);
@@ -130,7 +131,10 @@ export function ChatScreen({
   const [historyNoLimit, setHistoryNoLimit] = useState(Boolean(settings.historySettingsInitialized && !settings.maxHistoryMessages));
   const [infiniteWarningOpen, setInfiniteWarningOpen] = useState(false);
   const [toolRequirementOpen, setToolRequirementOpen] = useState(false);
-  const [compactionEnabled, setCompactionEnabled] = useState(settings.compactionEnabled ?? false);
+  const [compactionEnabled, setCompactionEnabled] = useState(chat?.compactionEnabled ?? settings.compactionEnabled ?? false);
+  const [timelineContinuityEnabled, setTimelineContinuityEnabled] = useState(chat ? chat.timelineContinuityEnabled ?? false : settings.timelineContinuityEnabled ?? false);
+  const [timelineStatus, setTimelineStatus] = useState("");
+  const memoryManagementAvailability = useRef({ projectId: "", available: false });
   const [streamingEnabled, setStreamingEnabled] = useState(settings.streamingEnabled ?? true);
   const [autoManageInventory, setAutoManageInventory] = useState(settings.autoManageInventory ?? false);
   const [confirmInventoryUpdates, setConfirmInventoryUpdates] = useState(settings.confirmInventoryUpdates ?? true);
@@ -169,11 +173,12 @@ export function ChatScreen({
     setMaxTokens(settings.maxTokens?.toString() ?? "");
     setMaxHistory(settings.maxHistoryMessages?.toString() ?? "20");
     setHistoryNoLimit(Boolean(chat?.infiniteHistoryLocked) || Boolean(settings.historySettingsInitialized && !settings.maxHistoryMessages));
-    setCompactionEnabled(settings.compactionEnabled ?? false);
+    setCompactionEnabled(chat?.compactionEnabled ?? settings.compactionEnabled ?? false);
+    setTimelineContinuityEnabled(chat ? chat.timelineContinuityEnabled ?? false : settings.timelineContinuityEnabled ?? false);
     setStreamingEnabled(settings.streamingEnabled ?? true);
     setAutoManageInventory(settings.autoManageInventory ?? false);
     setConfirmInventoryUpdates(settings.confirmInventoryUpdates ?? true);
-  }, [settings, selectedModelId, chat?.id, chat?.infiniteHistoryLocked]);
+  }, [settings, selectedModelId, chat?.id, chat?.infiniteHistoryLocked, chat?.compactionEnabled, chat?.timelineContinuityEnabled]);
   useEffect(() => {
     setInventoryEnabled(project?.inventoryEnabled ?? false);
     setGearEnabled(project?.gearEnabled ?? false);
@@ -227,7 +232,7 @@ export function ChatScreen({
       maxTokens: optionalNumber(maxTokens),
       maxHistoryMessages: effectiveHistoryNoLimit ? undefined : optionalNumber(maxHistory),
       historySettingsInitialized: true,
-      compactionEnabled,
+      ...(!chat ? { compactionEnabled, timelineContinuityEnabled } : {}),
       includeWorld,
       includeInstructions,
       includeCharacters,
@@ -240,7 +245,7 @@ export function ChatScreen({
       updatedAt: timestamp
     });
     if (project) await db.projects.update(project.id, { inventoryEnabled, gearEnabled, updatedAt: timestamp });
-    if (chat) await db.chats.update(chat.id, { world: world.timeMode === "realtime" ? { ...world, realtimeUpdatedAt: timestamp } : world, ...(lockInfiniteHistory ? { infiniteHistoryLocked: true } : {}), updatedAt: timestamp });
+    if (chat) await db.chats.update(chat.id, { compactionEnabled, timelineContinuityEnabled, world: world.timeMode === "realtime" ? { ...world, realtimeUpdatedAt: timestamp } : world, ...(lockInfiniteHistory ? { infiniteHistoryLocked: true } : {}), updatedAt: timestamp });
     setInfiniteWarningOpen(false);
     showSaved();
     await onSettingsSaved(draftModelId);
@@ -291,7 +296,7 @@ export function ChatScreen({
       setDraftModelId(modelId);
       setModelMenuOpen(false);
       showSaved();
-      await onSettingsSaved(modelId);
+      onModelSelected(modelId);
     } catch (error) {
       setModelSaveError(error instanceof Error ? `Couldn't save model: ${error.message}` : "Couldn't save model. Please try again.");
     } finally {
@@ -332,6 +337,7 @@ export function ChatScreen({
       ...(project && charactersMode === "lookup" ? [...characterTools] : []),
       ...(project?.inventoryEnabled && autoManageInventory ? [...inventoryTools] : []),
       ...(project && project.memoryMode !== "manual" ? [...memoryTools] : []),
+      ...(memoryManagementEnabled() ? [...memoryManagementTools] : []),
       ...(imageContextMessageId ? [...imageContextTools] : []),
       ...(forceTurnFinalizer ? [finalizeTurnTool] : [])
     ];
@@ -352,7 +358,7 @@ export function ChatScreen({
 
   async function characterLibraryContext() {
     if (!project || charactersMode === "none") return "";
-    if (charactersMode === "lookup") return "Project character lookup: use find_characters, get_character_identity, get_character_bio, and get_character_stats to retrieve character details when needed.";
+    if (charactersMode === "lookup") return "Project character lookup: use find_characters with a character name to retrieve their full identity, biography, and calculated stats together in one lookup. Reuse those details for this turn; no separate section lookups are needed.";
     const characters = (await db.characters.where("projectId").equals(project.id).toArray())
       .sort((a, b) => (a.orderIndex ?? Number.MAX_SAFE_INTEGER) - (b.orderIndex ?? Number.MAX_SAFE_INTEGER) || a.normalisedName.localeCompare(b.normalisedName));
     if (!characters.length) return "Project character library:\n(none)";
@@ -459,7 +465,7 @@ export function ChatScreen({
     if (!settings.apiKey?.trim() || !draftModelId) return skipped("No API key or model was available for post-response memory review.");
     if (!assistantText.trim()) return skipped("The assistant response was empty.");
     const sourceMessages = (await db.messages.bulkGet(sourceMessageIds)).filter((message): message is Message => Boolean(message));
-    const condensationCandidates = sourceMessages.filter((message) => message.body.length >= contextCondensationMinimumCharacters);
+    const condensationCandidates = compactionEnabled ? sourceMessages.filter((message) => message.body.length >= contextCondensationMinimumCharacters) : [];
     if (project.memoryMode === "manual" && !condensationCandidates.length) return skipped("Memory mode is manual and no message needed context condensation.");
     let reviewPayload: Record<string, unknown> | undefined;
     try {
@@ -474,7 +480,7 @@ export function ChatScreen({
               project.memoryMode === "manual"
                 ? "Return an empty memories array because project memory saving is manual."
                 : memoryHandledByTool
-                  ? "Return an empty memories array because this turn's explicit memory request was already handled by the save_memory tool."
+                  ? "Return an empty memories array because this turn's memory request was handled by tools. Never recreate deleted memories or store memory-management conversation as a new memory."
                   : "Return an empty memories array when nothing qualifies. Maximum three memories. Follow the project's memory instruction exactly. Do not save ordinary narration, transient actions, momentary emotion, speculation, duplicate facts, inventory/log details, or technical/tool text.",
               `Project memory instruction:\n${project.memoryInstruction || defaultMemoryInstruction}`
             ].join("\n\n")
@@ -496,7 +502,7 @@ export function ChatScreen({
       const responseText = json.choices?.[0]?.message?.content ?? "";
       await storeContextCondensations(condensationCandidates, responseText);
       const auditRequest = auditSafeValue(reviewPayload) as Record<string, unknown>;
-      if (project.memoryMode === "manual" || memoryHandledByTool) return { status: "completed", reason: project.memoryMode === "manual" ? "Only context condensation was reviewed; memory saving is manual." : "The explicit memory request was already handled by save_memory; only context condensation was reviewed.", requestPayload: auditRequest, rawResponse: responseText, condensationMessageIds: condensationCandidates.map((message) => message.id), candidates: [] };
+      if (project.memoryMode === "manual" || memoryHandledByTool) return { status: "completed", reason: project.memoryMode === "manual" ? "Only context condensation was reviewed; memory saving is manual." : "The memory request was already handled by tools; only context condensation was reviewed.", requestPayload: auditRequest, rawResponse: responseText, condensationMessageIds: condensationCandidates.map((message) => message.id), candidates: [] };
       const candidates = parseMemoryReview(responseText);
       if (!candidates.length) return { status: "completed", reason: "The review proposed no memories.", requestPayload: auditRequest, rawResponse: responseText, condensationMessageIds: condensationCandidates.map((message) => message.id), candidates: [] };
       const [saved, pending] = await Promise.all([
@@ -536,6 +542,20 @@ export function ChatScreen({
     } catch (error) {
       // Memory review must never turn a successful chat reply into a failed send.
       return { status: "failed", error: error instanceof Error ? error.message : "Unknown memory review error.", requestPayload: reviewPayload ? auditSafeValue(reviewPayload) as Record<string, unknown> : undefined, condensationMessageIds: condensationCandidates.map((message) => message.id), candidates: [] };
+    }
+  }
+
+  async function updateTimeline(chatId: string, requests: MainChatAuditRequest[], history: Message[], historyLimit?: number) {
+    if (!timelineContinuityEnabled) return;
+    const beforeSequence = timelineHistoryBoundary(history, historyLimit);
+    if (beforeSequence === undefined) return;
+    const signal = activeSendRef.current?.controller.signal ?? new AbortController().signal;
+    setTimelineStatus("Updating Timeline continuity…");
+    try {
+      await updateTimelineContinuity(chatId, draftModelId, (payload) => openRouterRequest(payload, signal, requests, "timeline continuity"), db, beforeSequence);
+      setTimelineStatus("");
+    } catch (error) {
+      setTimelineStatus(`Timeline continuity needs an update: ${error instanceof Error ? error.message : "Please retry from the timeline page."}`);
     }
   }
 
@@ -598,6 +618,15 @@ export function ChatScreen({
     return Boolean(project?.deltaEnabled && project.inventoryEnabled && project.gearEnabled);
   }
 
+  function memoryManagementEnabled() {
+    return Boolean(project && (project.memoryMode !== "manual" || timelineContinuityEnabled
+      || (memoryManagementAvailability.current.projectId === project.id && memoryManagementAvailability.current.available)));
+  }
+
+  async function prepareMemoryManagement() {
+    if (project) memoryManagementAvailability.current = { projectId: project.id, available: await hasMemoryManagementEntries(project.id) };
+  }
+
   function toolsEnabled(imageContextMessageId?: string) {
     return Boolean(
       imageContextMessageId
@@ -607,6 +636,7 @@ export function ChatScreen({
       || deltaEngagementEnabled()
       || (project?.inventoryEnabled && autoManageInventory)
       || (project && project.memoryMode !== "manual")
+      || memoryManagementEnabled()
     );
   }
 
@@ -632,6 +662,7 @@ export function ChatScreen({
     inventoryDetails: string;
     compactionMemory: string;
     compactionIncluded: boolean;
+    timelineContext: string;
     imageCount: number;
     attachedFileCount: number;
     toolEvents: MainChatAuditToolEvent[];
@@ -650,7 +681,7 @@ export function ChatScreen({
         id: message.id,
         sequence: message.sequence,
         role: message.role,
-        usedCondensation: Boolean(message.contextCondensation && message.contextCondensationSourceUpdatedAt === message.updatedAt && message.id !== options.userMessageId)
+        usedCondensation: Boolean(compactionEnabled && message.contextCondensation && message.contextCondensationSourceUpdatedAt === message.updatedAt && message.id !== options.userMessageId)
       })),
       contextSources: [
         { name: "Project instructions", included: Boolean(includeInstructions && project?.instructions), detail: project?.instructions ? `${project.instructions.length} characters` : undefined },
@@ -658,6 +689,7 @@ export function ChatScreen({
         { name: "Character library", included: Boolean(options.characterDetails), detail: options.characterDetails ? `${options.characterDetails.length} characters` : undefined },
         { name: "Source library", included: hasSources && sourceFilesMode !== "none", detail: sourceFilesMode === "all" ? "Full available source text sent." : sourceFilesMode === "lookup" ? "Original text is available through source lookup." : "Disabled" },
         { name: "Compaction memory", included: options.compactionIncluded, detail: options.compactionIncluded ? `${options.compactionMemory.length} characters` : undefined },
+        { name: "Timeline continuity", included: Boolean(options.timelineContext), detail: options.timelineContext ? `${options.timelineContext.length} characters; one shared project record` : "Disabled" },
         { name: "Retrieved project memories", included: options.memoryDetails.hits.length > 0, detail: `${options.memoryDetails.hits.length} hit${options.memoryDetails.hits.length === 1 ? "" : "s"}` },
         { name: "Live inventory", included: Boolean(options.inventoryDetails), detail: options.inventoryDetails ? `${options.inventoryDetails.length} characters` : undefined },
         { name: "Attached images", included: options.imageCount > 0, detail: `${options.imageCount}` },
@@ -700,16 +732,9 @@ export function ChatScreen({
     } catch {
       return { error: "Invalid tool arguments." };
     }
-    const characterId = typeof args.characterId === "string" ? args.characterId : "";
     switch (toolCall.function.name) {
       case "find_characters":
         return findCharacters(project.id, typeof args.nameQuery === "string" ? args.nameQuery : "");
-      case "get_character_identity":
-        return characterId ? getCharacterIdentity(project.id, characterId) : { error: "characterId is required." };
-      case "get_character_bio":
-        return characterId ? getCharacterBio(project.id, characterId) : { error: "characterId is required." };
-      case "get_character_stats":
-        return characterId ? getCharacterStats(project.id, characterId) : { error: "characterId is required." };
       default:
         return { error: `Unknown tool ${toolCall.function.name}.` };
     }
@@ -876,7 +901,11 @@ export function ChatScreen({
     return { prepared: true, message: "Delta Mode imminent card queued. Do not continue the engagement in ordinary chat." };
   }
 
-  async function runToolCall(toolCall: OpenRouterToolCall, chatId: string, inventoryUpdates: InventoryUpdateRequest[], sourceMessageIds: string[], deltaImminentProposals: DeltaImminentProposal[], imageContextMessageId?: string, captureSources?: (files: SourceFile[]) => Promise<void>) {
+  async function runToolCall(toolCall: OpenRouterToolCall, chatId: string, inventoryUpdates: InventoryUpdateRequest[], sourceMessageIds: string[], deltaImminentProposals: DeltaImminentProposal[], memorySession: MemoryManagementSession, imageContextMessageId?: string, captureSources?: (files: SourceFile[]) => Promise<void>) {
+    if (memoryManagementTools.some((tool) => tool.function.name === toolCall.function.name)) {
+      if (!project || !memoryManagementEnabled()) return { error: "Memory management is unavailable." };
+      return runMemoryManagementTool(project.id, toolCall.function.name, toolCall.function.arguments, memorySession);
+    }
     if (sourceTools.some((tool) => tool.function.name === toolCall.function.name)) {
       if (sourceFilesMode !== "lookup") return { error: "Source lookup is disabled." };
       return project ? runSourceTool(project.id, toolCall.function.name, toolCall.function.arguments, captureSources) : { error: "No project selected." };
@@ -902,6 +931,8 @@ export function ChatScreen({
     let nextMessages = [...messagesToSend];
     let usage: OpenRouterUsage | undefined;
     let memoryHandledByTool = false;
+    let memoryManagementTurn = false;
+    const memorySession: MemoryManagementSession = new Map();
     const deltaImminentProposals: DeltaImminentProposal[] = [];
     for (let index = 0; index < 8; index += 1) {
       const response = await openRouterRequest(openRouterPayload(nextMessages, false, imageContextMessageId, index === 0 && Boolean(imageContextMessageId), forceTurnFinalizer), undefined, requests);
@@ -917,7 +948,7 @@ export function ChatScreen({
           nextMessages = [...nextMessages, { role: "assistant", content: assistantMessage?.content ?? "" }, { role: "user", content: "Complete your response using finalize_turn." }];
           continue;
         }
-        return { messages: nextMessages, assistantMessage, usage, memoryHandledByTool, deltaImminentProposal: deltaImminentProposals[deltaImminentProposals.length - 1] };
+        return { messages: nextMessages, assistantMessage, usage, memoryHandledByTool, memoryManagementTurn, deltaImminentProposal: deltaImminentProposals[deltaImminentProposals.length - 1] };
       }
       nextMessages = [
         ...nextMessages,
@@ -936,14 +967,15 @@ export function ChatScreen({
         toolEvents.push(event);
         let result: Awaited<ReturnType<typeof runToolCall>>;
         try {
-          result = await runToolCall(toolCall, chatId, inventoryUpdates, sourceMessageIds, deltaImminentProposals, imageContextMessageId, async (files) => { event.sources = await sourceAuditVersions(files); });
+          result = await runToolCall(toolCall, chatId, inventoryUpdates, sourceMessageIds, deltaImminentProposals, memorySession, imageContextMessageId, async (files) => { event.sources = await sourceAuditVersions(files); });
           event.result = JSON.stringify(auditSafeValue(result), null, 2);
         } catch (error) {
           event.result = JSON.stringify({ error: error instanceof Error ? error.message : String(error) });
           throw error;
         }
         if (toolCall.function.name === "save_memory" && result && typeof result === "object" && ("saved" in result || "proposedForApproval" in result || "duplicate" in result)) memoryHandledByTool = true;
-        if (toolCall.function.name === "finalize_turn" && result && typeof result === "object" && "finalizedTurn" in result) return { messages: nextMessages, assistantMessage, usage, memoryHandledByTool, deltaImminentProposal: deltaImminentProposals[deltaImminentProposals.length - 1], finalizedTurn: result.finalizedTurn };
+        if (memoryManagementTools.some((tool) => tool.function.name === toolCall.function.name)) { memoryHandledByTool = true; memoryManagementTurn = true; }
+        if (toolCall.function.name === "finalize_turn" && result && typeof result === "object" && "finalizedTurn" in result) return { messages: nextMessages, assistantMessage, usage, memoryHandledByTool, memoryManagementTurn, deltaImminentProposal: deltaImminentProposals[deltaImminentProposals.length - 1], finalizedTurn: result.finalizedTurn };
         nextMessages.push({
           role: "tool",
           tool_call_id: toolCall.id,
@@ -958,7 +990,7 @@ export function ChatScreen({
         });
       }
     }
-    return { messages: nextMessages, usage, memoryHandledByTool, deltaImminentProposal: deltaImminentProposals[deltaImminentProposals.length - 1] };
+    return { messages: nextMessages, usage, memoryHandledByTool, memoryManagementTurn, deltaImminentProposal: deltaImminentProposals[deltaImminentProposals.length - 1] };
   }
 
   async function completeWithTools(messagesToSend: OpenRouterMessage[], toolLog: string[], toolEvents: MainChatAuditToolEvent[], inventoryUpdates: InventoryUpdateRequest[], chatId: string, sourceMessageIds: string[], imageContextMessageId?: string, forceTurnFinalizer = false, requests?: MainChatAuditRequest[]) {
@@ -970,6 +1002,7 @@ export function ChatScreen({
       inputTokens: resolved.usage?.prompt_tokens,
       outputTokens: resolved.usage?.completion_tokens,
       memoryHandledByTool: resolved.memoryHandledByTool,
+      memoryManagementTurn: resolved.memoryManagementTurn,
       deltaImminentProposal: resolved.deltaImminentProposal,
       finalizedTurn: resolved.finalizedTurn
     };
@@ -1069,7 +1102,7 @@ export function ChatScreen({
       let createdDeltaChatId: string | undefined;
       let deltaUserMessageId: string | undefined;
       if (!deltaChat) {
-        const deltaChatId = await createChat(project.id, text);
+        const deltaChatId = await createChat(project.id, text, { compactionEnabled, timelineContinuityEnabled });
         createdDeltaChatId = deltaChatId;
         deltaChat = await db.chats.get(deltaChatId);
         if (!deltaChat) return;
@@ -1142,6 +1175,7 @@ export function ChatScreen({
       alert("Choose a model before sending.");
       return;
     }
+    await prepareMemoryManagement();
     if (!(await requireToolCapableModel())) return;
     let images: { dataUrl: string; mimeType: string }[] = [];
     let attachedFileDetails = "";
@@ -1160,7 +1194,7 @@ export function ChatScreen({
     let createdChatId: string | undefined;
     let requestFailed = false;
     if (!chatId || !branchId) {
-      chatId = await createChat(project.id, text);
+      chatId = await createChat(project.id, text, { compactionEnabled, timelineContinuityEnabled });
       createdChatId = chatId;
       const created = await db.chats.get(chatId);
       branchId = created?.activeBranchId;
@@ -1172,6 +1206,7 @@ export function ChatScreen({
       userMessageId = (await addMessage(chatId, branchId, "user", text)).id;
     }
     if (chatId && branchId) {
+      await db.chats.update(chatId, { compactionEnabled, timelineContinuityEnabled });
       if (userMessageId && (attachedImages.length || attachedFiles.length)) {
         const timestamp = now();
         await db.attachments.bulkAdd([...attachedImages, ...attachedFiles].map((file) => ({
@@ -1206,6 +1241,7 @@ export function ChatScreen({
           `Characters: ${charactersMode}`,
           `Source files: ${sourceFilesMode}`,
           `Compaction memory: ${compactionEnabled ? "on" : "off"}`,
+          `Timeline continuity: ${timelineContinuityEnabled ? "on" : "off"}`,
           `Project memories: ${project.memoryMode !== "manual" ? project.memoryMode : "manual/off"}`,
           `Auto inventory: ${inventoryToolEnabled("inventory") ? "on" : "off"}`,
           `Confirm inventory: ${confirmInventoryUpdates ? "on" : "off"}`,
@@ -1235,6 +1271,8 @@ export function ChatScreen({
       const orderedHistory = allHistory.sort((a, b) => a.sequence - b.sequence);
       const contextHistory = orderedHistory.filter((message) => message.id !== reply.id);
       const historyLimit = effectiveHistoryNoLimit ? undefined : optionalNumber(maxHistory);
+      await updateTimeline(chatId, requests, contextHistory, historyLimit);
+      const timelineContext = timelineContinuityEnabled ? formatTimelineContinuity(await timelineEntries(project.id)) : "";
       const compactionMemory = activeChat && historyLimit
         ? await updateCompactionMemory(activeChat, contextHistory, historyLimit, false, requests)
         : activeChat?.compactionMemory ?? "";
@@ -1252,14 +1290,16 @@ export function ChatScreen({
         includeWorld && project.worldSetting ? `World setting:\n${project.worldSetting}` : "",
         characterDetails,
         compactionEnabled && historyLimit && compactionMemory ? `Compaction memory:\n${compactionMemory}` : "",
+        timelineContext,
         await sourceLibraryContext(),
         attachedFileDetails,
         images.length ? "An image is attached to the latest user message. First call save_image_context exactly once with a detailed concise visual extraction. It is hidden from the user. Then answer the user normally from the image." : "",
         project.memoryMode !== "manual" ? "Memory saving is available through save_memory. When the user explicitly asks you to remember or save something as project memory, call save_memory and only confirm the outcome after its tool result. Do not claim that you cannot save project memory while this tool is available." : "",
         memoryDetails.text,
+        memoryManagementEnabled() ? memoryManagementInstruction : "",
         inventoryDetails
       ].filter(Boolean);
-      const historyContent = chatHistoryContent(preparedHistory, userMessageId, images);
+      const historyContent = chatHistoryContent(preparedHistory, userMessageId, images, compactionEnabled);
       const requestMessages: OpenRouterMessage[] = [
         ...(systemParts.length ? [{ role: "system" as const, content: systemParts.join("\n\n") }] : []),
         ...historyContent
@@ -1276,6 +1316,7 @@ export function ChatScreen({
         inventoryDetails,
         compactionMemory,
         compactionIncluded: Boolean(compactionEnabled && historyLimit && compactionMemory),
+        timelineContext,
         imageCount: images.length,
         attachedFileCount: attachedFiles.length,
         toolEvents
@@ -1335,7 +1376,7 @@ export function ChatScreen({
     const clean = nextBody.trim();
     if (!clean) return message;
     const timestamp = now();
-    await db.transaction("rw", db.messages, db.stars, db.attachments, db.chats, async () => {
+    await db.transaction("rw", [db.messages, db.stars, db.attachments, db.chats, db.timelineEntries], async () => {
       await db.messages.update(message.id, {
         body: clean,
         contextCondensation: undefined,
@@ -1358,7 +1399,8 @@ export function ChatScreen({
           await db.messages.delete(nextMessage.id);
         }
       }
-      if (compactionEnabled) await db.chats.update(message.chatId, { compactionNeedsRebuild: true, updatedAt: timestamp });
+      await invalidateTimelineMessages([message.id]);
+      await db.chats.update(message.chatId, { compactionNeedsRebuild: true, updatedAt: timestamp });
     });
     await onRefresh();
     return { ...message, body: clean, updatedAt: timestamp, estimatedTokens: true };
@@ -1373,6 +1415,7 @@ export function ChatScreen({
       alert("Choose a model before regenerating.");
       return;
     }
+    await prepareMemoryManagement();
     if (!(await requireToolCapableModel())) return;
     if (message.role !== "user") {
       alert("Only user messages can be resent.");
@@ -1383,6 +1426,7 @@ export function ChatScreen({
     const chatId = message.chatId;
     const branchId = message.branchId;
     const timestamp = now();
+    await db.chats.update(chatId, { compactionEnabled, timelineContinuityEnabled });
     const activeChat = await db.chats.get(chatId);
     const characterDetails = await characterLibraryContext();
     const inventoryDetails = await inventoryContext(chatId);
@@ -1392,6 +1436,8 @@ export function ChatScreen({
       .toArray();
     const orderedHistory = allHistory.sort((a, b) => a.sequence - b.sequence);
     const historyLimit = effectiveHistoryNoLimit ? undefined : optionalNumber(maxHistory);
+    await updateTimeline(chatId, requests, orderedHistory, historyLimit);
+    const timelineContext = timelineContinuityEnabled ? formatTimelineContinuity(await timelineEntries(project.id, db, { chatId, sequence: promptMessage.sequence })) : "";
     const compactionMemory = activeChat && historyLimit
       ? await updateCompactionMemory(activeChat, orderedHistory, historyLimit, true, requests)
       : activeChat?.compactionMemory ?? "";
@@ -1409,12 +1455,14 @@ export function ChatScreen({
       includeWorld && project.worldSetting ? `World setting:\n${project.worldSetting}` : "",
       characterDetails,
       compactionEnabled && historyLimit && compactionMemory ? `Compaction memory:\n${compactionMemory}` : "",
-        await sourceLibraryContext(),
+      timelineContext,
+      await sourceLibraryContext(),
       resendImages.length ? "An image is attached to the latest user message. First call save_image_context exactly once with a detailed concise visual extraction. It is hidden from the user. Then answer the user normally from the image." : "",
       memoryDetails.text,
+      memoryManagementEnabled() ? memoryManagementInstruction : "",
       inventoryDetails
     ].filter(Boolean);
-    const historyContent = chatHistoryContent(preparedHistory, promptMessage.id, resendImages);
+    const historyContent = chatHistoryContent(preparedHistory, promptMessage.id, resendImages, compactionEnabled);
     const requestMessages: OpenRouterMessage[] = [
       ...(systemParts.length ? [{ role: "system" as const, content: systemParts.join("\n\n") }] : []),
       ...historyContent
@@ -1437,6 +1485,7 @@ export function ChatScreen({
         `Characters: ${charactersMode}`,
         `Source files: ${sourceFilesMode}`,
         `Compaction memory: ${compactionEnabled ? "on" : "off"}`,
+        `Timeline continuity: ${timelineContinuityEnabled ? "on" : "off"}`,
         `Project memories: ${project.memoryMode !== "manual" ? project.memoryMode : "manual/off"}`,
         `Auto inventory: ${inventoryToolEnabled("inventory") ? "on" : "off"}`,
         `Confirm inventory: ${confirmInventoryUpdates ? "on" : "off"}`,
@@ -1458,13 +1507,14 @@ export function ChatScreen({
       inventoryDetails,
       compactionMemory,
       compactionIncluded: Boolean(compactionEnabled && historyLimit && compactionMemory),
+      timelineContext,
       imageCount: resendImages.length,
       attachedFileCount: 0,
       toolEvents
     });
     let reply: Message | undefined;
     const worldIsAi = activeChat?.world?.timeMode === "ai";
-    await db.transaction("rw", db.messages, db.stars, db.attachments, db.chats, async () => {
+    await db.transaction("rw", [db.messages, db.stars, db.attachments, db.chats, db.timelineEntries], async () => {
       const laterIds = await db.messages
         .where("[chatId+branchId+sequence]")
         .between([chatId, branchId, promptMessage.sequence + 1], [chatId, branchId, Dexie.maxKey])
@@ -1699,6 +1749,7 @@ export function ChatScreen({
 
   return (
     <div className="chat-screen">
+      {timelineStatus && <small className="timeline-chat-status" role="status">{timelineStatus}</small>}
       {!chat && messages.length === 0 && <EmptyState title="Ready when you are" body="Start a new project chat from the composer." />}
       <VirtualMessageList
         projectId={project.id}
@@ -1772,8 +1823,21 @@ export function ChatScreen({
                 <label className="compact-check"><input type="checkbox" checked={inventoryEnabled} onChange={(event) => setInventoryEnabled(event.target.checked)} /> Enable inventory</label>
                 {inventoryEnabled && <div className="inline-setting-pair"><label className="compact-check"><input type="checkbox" checked={autoManageInventory} onChange={(event) => setAutoManageInventory(event.target.checked)} /> Auto manage Inventory</label><label className="compact-check"><input type="checkbox" checked={confirmInventoryUpdates} onChange={(event) => setConfirmInventoryUpdates(event.target.checked)} /> Use confirmation</label></div>}
                 <label className="compact-check"><input type="checkbox" checked={gearEnabled} onChange={(event) => setGearEnabled(event.target.checked)} /> Enable gear</label>
-                <label className="compact-check"><input type="checkbox" checked={compactionEnabled} onChange={(event) => setCompactionEnabled(event.target.checked)} /> Compaction memory</label>
-                <button type="button" onClick={() => { closeChatSettings(); onRoute("compaction"); }}><BookOpen size={18} /> Open compaction memory</button>
+                <label className="compact-check"><input type="checkbox" checked={compactionEnabled} onChange={(event) => setCompactionEnabled(event.target.checked)} /> Memory compaction</label>
+                <label className="compact-check"><input type="checkbox" checked={timelineContinuityEnabled} onChange={(event) => setTimelineContinuityEnabled(event.target.checked)} /> Timeline continuity</label>
+                <small>Timeline continuity uses the shared project record and saves completed turns as they leave your message history window. With no history limit, use Update timeline to capture entries. Both controls are independent.</small>
+                <button type="button" disabled={!project} onClick={() => {
+                  setChatSettingsOpen(false);
+                  setModelMenuOpen(false);
+                  window.history.replaceState({ ...window.history.state, mirrorChatSettings: false, mirrorRoute: "timeline" }, "", window.location.href);
+                  onRoute("timeline");
+                }}><BookOpen size={16} /> Open Timeline continuity</button>
+                <button type="button" disabled={!chat} onClick={() => {
+                  setChatSettingsOpen(false);
+                  setModelMenuOpen(false);
+                  window.history.replaceState({ ...window.history.state, mirrorChatSettings: false, mirrorRoute: "compaction" }, "", window.location.href);
+                  onRoute("compaction");
+                }}><BookOpen size={18} /> Open compaction memory</button>
                 <label className="compact-check"><input type="checkbox" checked={streamingEnabled} onChange={(event) => setStreamingEnabled(event.target.checked)} /> Streaming</label>
                 <label className="range-row"><span>Temperature <b>{temperature || "0"}</b></span><input type="range" min={0} max={2} step={0.05} value={temperature || "0"} onChange={(event) => setTemperature(event.target.value)} /></label>
                 <label className="range-row"><span>Top P <b>{topP || "0"}</b></span><input type="range" min={0} max={1} step={0.05} value={topP || "0"} onChange={(event) => setTopP(event.target.value)} /></label>

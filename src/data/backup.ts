@@ -46,6 +46,13 @@ function scheduleAutomaticRecovery() {
   if (automaticRecoveryTimer !== undefined) window.clearTimeout(automaticRecoveryTimer);
   automaticRecoveryTimer = window.setTimeout(() => {
     automaticRecoveryTimer = undefined;
+    const pending = pendingSnapshots.get(db);
+    if (pending) {
+      // A write occurred after the in-flight snapshot began. Capture it once
+      // that snapshot finishes instead of losing it or overlapping full scans.
+      void pending.then(scheduleAutomaticRecovery, scheduleAutomaticRecovery);
+      return;
+    }
     void createRecoverySnapshot().catch(() => undefined);
   }, 5_000);
 }
@@ -227,16 +234,26 @@ export async function listRecoverySnapshots(): Promise<RecoverySnapshot[]> {
   return snapshots.map(({ backup: _backup, ...snapshot }) => snapshot).sort((left, right) => left.slot.localeCompare(right.slot));
 }
 
-export async function createRecoverySnapshot(database = db): Promise<RecoverySnapshot> {
+const pendingSnapshots = new WeakMap<MirrorDatabase, Promise<RecoverySnapshot>>();
+
+export function createRecoverySnapshot(database = db): Promise<RecoverySnapshot> {
+  const pending = pendingSnapshots.get(database);
+  if (pending) return pending;
+  const operation = writeRecoverySnapshot(database).finally(() => pendingSnapshots.delete(database));
+  pendingSnapshots.set(database, operation);
+  return operation;
+}
+
+async function writeRecoverySnapshot(database: MirrorDatabase): Promise<RecoverySnapshot> {
   if (automaticRecoveryTimer !== undefined && typeof window !== "undefined") {
     window.clearTimeout(automaticRecoveryTimer);
     automaticRecoveryTimer = undefined;
   }
   const backup = await createFullBackup(database);
-  await validateBackup(backup, database);
-  const snapshots = await recoveryDb.snapshots.toArray();
-  const newest = [...snapshots].sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
-  const slot: RecoverySlot = newest?.slot === "A" ? "B" : "A";
+  // Read just the index key: loading both previous backups clones the entire
+  // database twice, including encoded attachments, on every project save.
+  const [newestSlot] = await recoveryDb.snapshots.orderBy("createdAt").reverse().limit(1).primaryKeys();
+  const slot: RecoverySlot = newestSlot === "A" ? "B" : "A";
   const snapshot: RecoverySnapshotRow = { slot, createdAt: backup.createdAt, schemaVersion: backup.schemaVersion, tableCounts: backup.tableCounts, backup };
   await recoveryDb.snapshots.put(snapshot);
   const saved = await recoveryDb.snapshots.get(slot);

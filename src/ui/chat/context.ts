@@ -158,10 +158,10 @@ function clarifyLeadingOocForModel(text: string) {
     : text;
 }
 
-export function chatHistoryContent(history: Message[], currentMessageId: string | undefined, currentImages: { dataUrl: string; mimeType: string }[]) {
+export function chatHistoryContent(history: Message[], currentMessageId: string | undefined, currentImages: { dataUrl: string; mimeType: string }[], useCondensation = true) {
   return history.map((message) => ({
     role: (message.role === "system" ? "system" : message.role === "assistant" ? "assistant" : "user") as OpenRouterMessage["role"],
-    content: message.id === currentMessageId && currentImages.length ? openRouterContent(clarifyLeadingOocForModel(message.body), currentImages) : messageHistoryText(message, message.id !== currentMessageId)
+    content: message.id === currentMessageId && currentImages.length ? openRouterContent(clarifyLeadingOocForModel(message.body), currentImages) : messageHistoryText(message, useCondensation && message.id !== currentMessageId)
   }));
 }
 

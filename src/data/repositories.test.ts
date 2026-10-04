@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { db } from "./db";
 import { defaultDeltaBases, defaultSettings, sampleProject } from "./defaults";
-import { addDeltaMessage, applyDeltaDamage, applyInventoryChange, createChat, createMemory, deltaCarryProfile, formatDeltaTemplateTag, generatedDeltaStats, getCharacterBio, getCharacterIdentity, getCharacterStats, messagesForIncrementalCompaction, normaliseInventoryName, searchMemories, validatePointBuy } from "./repositories";
+import { addDeltaMessage, applyDeltaDamage, applyInventoryChange, createChat, createMemory, deltaCarryProfile, formatDeltaTemplateTag, generatedDeltaStats, findCharacters, getCharacterBio, getCharacterIdentity, getCharacterStats, messagesForIncrementalCompaction, normaliseInventoryName, searchMemories, validatePointBuy } from "./repositories";
 import { Character, DeltaRollReceipt, Message } from "../types";
 
 describe("local data rules", () => {
@@ -95,6 +95,26 @@ describe("local data rules", () => {
         CHA: 8
       }
     });
+  });
+
+  it("looks up complete characters while excluding other projects", async () => {
+    const project = sampleProject();
+    await db.projects.add(project);
+    const character: Character = {
+      id: "full-character", projectId: project.id, name: "Alice", normalisedName: "alice",
+      age: "30", gender: "woman", personality: "patient", misc: "Blue coat", bio: "A travelling medic.",
+      statsEnabled: true, str: 10, dex: 12, con: 10, int: 14, wis: 13, cha: 10, createdAt: 1, updatedAt: 1
+    };
+    await db.characters.bulkAdd([character, { ...character, id: "foreign-character", projectId: "other-project", bio: "Private other project bio" }]);
+    await db.characterBonuses.add({ id: "lookup-bonus", characterId: character.id, name: "training", stat: "DEX", value: 2, createdAt: 1, updatedAt: 1 });
+    const result = await findCharacters(project.id, "Alice");
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      id: character.id, name: "Alice", character: "Alice",
+      identity: { age: "30", gender: "woman", personality: "patient", misc: "Blue coat" },
+      bio: "A travelling medic.", stats: { DEX: 14, INT: 14 }
+    });
+    expect(await findCharacters(project.id, "missing")).toEqual([]);
   });
 
   it("validates 27 point-buy limits", () => {

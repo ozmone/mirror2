@@ -1,5 +1,6 @@
 @import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;550;650;750&family=Lora:wght@400;600&family=Nunito:wght@400;600;700&display=swap");
 
+
 :root {
   color-scheme: dark;
 
@@ -6243,3 +6244,45 @@ button:has(.lucide-save):hover:not(:disabled),
 .context-mode-setting { display: flex; flex-wrap: wrap; gap: 12px 24px; min-width: 0; margin: 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; }
 .context-mode-setting legend { padding: 0 4px; }
 .context-mode-setting input[type="radio"] { width: auto; margin: 0; accent-color: var(--accent); }
+
+.timeline-page { gap: 8px; }
+.timeline-heading { display: flex; align-items: center; gap: 8px; color: var(--text); }
+.timeline-heading > svg { color: var(--accent); }
+.timeline-heading h2 { font-size: 1rem; margin: 0; }
+.timeline-heading > span { color: var(--muted); font-size: .75rem; font-variant-numeric: tabular-nums; }
+.timeline-description, .timeline-empty { margin: 0; color: var(--text-2); font-size: .8rem; line-height: 1.5; }
+.timeline-empty { padding: 18px 0; max-width: 54ch; }
+.timeline-toolbar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 5px; }
+.timeline-page button { min-height: 28px; padding: 4px 8px; font-size: .75rem; gap: 5px; box-shadow: none; }
+.timeline-search { display: flex; align-items: center; gap: 6px; flex: 1 1 160px; min-width: 0; color: var(--muted); }
+.timeline-search input { min-height: 30px; padding: 5px 8px; font-size: .8rem; width: 100%; min-width: 0; }
+.timeline-meta, .timeline-feedback { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--text-2); font-size: .7rem; }
+.timeline-meta button, .timeline-entry-footer button { background: transparent; border-color: transparent; }
+.timeline-list { list-style: none; margin: 8px 0 0 5px; padding: 0 0 0 17px; border-left: 1px solid var(--accent-line); }
+.timeline-entry { position: relative; padding: 0 0 17px 0; }
+.timeline-entry:last-child { padding-bottom: 3px; }
+.timeline-inclusion { position: absolute; left: -23px; top: 4px; width: 13px; height: 13px; min-height: 0; margin: 0; padding: 0; accent-color: var(--accent); cursor: pointer; }
+.timeline-entry-excluded .timeline-entry-text, .timeline-entry-excluded .timeline-entry-text strong { color: var(--muted); }
+.timeline-entry-excluded .timeline-entry-text { opacity: .65; }
+.timeline-marker { position: absolute; left: -21px; top: 6px; width: 7px; height: 7px; border: 1px solid var(--accent); border-radius: 50%; background: var(--canvas); box-shadow: 0 0 0 3px var(--canvas); }
+.timeline-entry-text { margin: 0; font-size: .86rem; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.timeline-entry-text strong { color: var(--text); font-weight: 650; }
+.timeline-collapsed { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; overflow: hidden; }
+.timeline-entry-footer { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 3px; color: var(--muted); font-size: .68rem; }
+.timeline-entry-footer button { padding: 2px 4px; min-height: 24px; font-size: .68rem; color: var(--text-2); }
+.timeline-entry-footer .timeline-source { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: min(60vw, 280px); }
+.timeline-entry-controls { margin-left: auto; display: flex; align-items: center; gap: 3px; }
+.timeline-entry-footer .danger { color: var(--danger); }
+.timeline-entry-menu { position: relative; }
+.timeline-entry-menu summary { display: flex; align-items: center; justify-content: flex-end; cursor: pointer; list-style: none; min-height: 24px; padding: 2px 5px; }
+.timeline-entry-menu summary::-webkit-details-marker { display: none; }
+.timeline-entry-menu > div { position: absolute; right: 0; z-index: 2; display: flex; gap: 3px; padding: 3px; border: 1px solid var(--line-soft); border-radius: var(--radius-sm); background: var(--surface-solid); }
+.timeline-editor { display: grid; gap: 7px; padding: 10px; border: 1px solid var(--accent-line); border-radius: var(--radius-sm); background: var(--surface); }
+.timeline-editor label { font-size: .75rem; }
+.timeline-editor input, .timeline-editor textarea { min-height: 30px; padding: 6px 8px; font-size: .85rem; }
+.timeline-editor textarea { min-height: 90px; }
+.timeline-inline-actions { display: flex; gap: 6px; }
+.timeline-review-error { margin: 0; color: var(--warning); font-size: .75rem; overflow-wrap: anywhere; }
+.timeline-chat-status { padding: 4px 12px; color: var(--text-2); font-size: .72rem; }
+@media (prefers-reduced-motion: no-preference) { .timeline-updating { animation: timeline-spin 1.5s linear infinite; } }
+@keyframes timeline-spin { to { transform: rotate(360deg); } }

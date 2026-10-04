@@ -8,6 +8,7 @@ type ToolReply = {
   inputTokens?: number;
   outputTokens?: number;
   memoryHandledByTool?: boolean;
+  memoryManagementTurn?: boolean;
   finalizedTurn?: { prose: string; metadata: WorldReplyMetadata };
   deltaImminentProposal?: Omit<NonNullable<Message["deltaBrief"]>, "status">;
 };
@@ -73,6 +74,7 @@ export async function completeReply(options: ReplyOptions, database = db) {
     outputTokens = completed.outputTokens;
     memoryHandledByTool = Boolean(completed.memoryHandledByTool);
     extra = {
+      memoryManagementTurn: completed.memoryManagementTurn,
       deltaBrief: proposal ? { ...proposal, status: "pending", avoidLabel: proposal.avoidLabel || "Escape", avoidPrompt: proposal.avoidPrompt || "What do you do to avoid the engagement?" } : undefined,
       worldState: completed.finalizedTurn?.metadata
     };

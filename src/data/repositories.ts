@@ -300,8 +300,9 @@ export async function createProject(name: string) {
   return project;
 }
 
-export async function createChat(projectId: string, firstMessage: string) {
+export async function createChat(projectId: string, firstMessage: string, continuity?: Pick<Chat, "timelineContinuityEnabled" | "compactionEnabled">) {
   const timestamp = now();
+  const settings = await db.settings.get("settings");
   const chatId = uid();
   const branchId = uid();
   await db.transaction("rw", db.chats, db.branches, db.messages, async () => {
@@ -317,6 +318,8 @@ export async function createChat(projectId: string, firstMessage: string) {
       updatedAt: timestamp,
       archived: false,
       compactionMemory: "",
+      compactionEnabled: continuity?.compactionEnabled ?? settings?.compactionEnabled ?? false,
+      timelineContinuityEnabled: continuity?.timelineContinuityEnabled ?? settings?.timelineContinuityEnabled ?? false,
       world: defaultWorldState()
     });
     await addMessage(chatId, branchId, "user", firstMessage, undefined, 0);
@@ -600,10 +603,13 @@ export async function applyInventoryChange(projectId: string, chatId: string, ki
 export async function findCharacters(projectId: string, nameQuery: string, limit = 8) {
   const query = normaliseTag(nameQuery);
   const all = await db.characters.where("projectId").equals(projectId).toArray();
-  return all
-    .filter((character) => character.normalisedName.includes(query))
-    .slice(0, limit)
-    .map((character) => ({ id: character.id, name: character.name }));
+  const matches = all.filter((character) => character.normalisedName.includes(query)).slice(0, limit);
+  return Promise.all(matches.map(async (character) => ({
+    id: character.id, name: character.name,
+    ...(await getCharacterIdentity(projectId, character.id)),
+    ...(await getCharacterBio(projectId, character.id)),
+    ...(await getCharacterStats(projectId, character.id))
+  })));
 }
 
 export async function getCharacterIdentity(projectId: string, characterId: string) {

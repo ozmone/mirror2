@@ -30,9 +30,6 @@ import {
   findCharacters,
   formatDeltaTemplateTag,
   generatedStatsPatch,
-  getCharacterBio,
-  getCharacterIdentity,
-  getCharacterStats,
   normaliseInventoryName,
   upsertDeltaAllyCache
 } from "../../data/repositories";
@@ -409,12 +406,6 @@ export function DeltaModeWorkspace({
       }
       case "find_characters":
         return findCharacters(project.id, stringArg("nameQuery"));
-      case "get_character_identity":
-        return stringArg("characterId") ? getCharacterIdentity(project.id, stringArg("characterId")) : { error: "characterId is required." };
-      case "get_character_bio":
-        return stringArg("characterId") ? getCharacterBio(project.id, stringArg("characterId")) : { error: "characterId is required." };
-      case "get_character_stats":
-        return stringArg("characterId") ? getCharacterStats(project.id, stringArg("characterId")) : { error: "characterId is required." };
       case "set_delta_engagement_name": {
         const title = stringArg("title").slice(0, 96);
         if (!title) return { error: "An engagement title is required." };

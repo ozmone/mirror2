@@ -27,6 +27,7 @@ import {
   PendingMemory,
   Project,
   SourceFile,
+  TimelineEntry,
   Star
 } from "../types";
 import { defaultSettings, sampleProject } from "./defaults";
@@ -60,6 +61,7 @@ export class MirrorDatabase extends Dexie {
   deltaActionMacros!: Table<DeltaActionMacro, string>;
   characterActionSlots!: Table<CharacterActionSlot, string>;
   characterActionMacros!: Table<CharacterActionMacro, string>;
+  timelineEntries!: Table<TimelineEntry, string>;
 
   constructor(name = "mirror-2") {
     super(name);
@@ -442,6 +444,15 @@ export class MirrorDatabase extends Dexie {
       // Existing installs predate live replies being the default. Promote them so a
       // provider's full completion never has to finish before the UI can update.
       await transaction.table("settings").update("settings", { streamingEnabled: true, updatedAt: Date.now() });
+    });
+    this.version(16).stores({
+      timelineEntries: "id, [projectId+orderIndex], projectId, sourceChatId, *sourceMessageIds"
+    }).upgrade(async (transaction) => {
+      const settings = await transaction.table("settings").get("settings");
+      await transaction.table("chats").toCollection().modify((chat) => {
+        chat.compactionEnabled ??= settings?.compactionEnabled ?? false;
+        chat.timelineContinuityEnabled ??= false;
+      });
     });
   }
 }

@@ -36,6 +36,7 @@ export type RouteName =
   | "characters"
   | "characterProfile"
   | "memories"
+  | "timeline"
   | "compaction"
   | "api"
   | "data"
@@ -70,6 +71,7 @@ export interface AppSettings extends Timestamped {
   /** Distinguishes a deliberate unlimited-history choice from legacy missing settings. */
   historySettingsInitialized?: boolean;
   compactionEnabled?: boolean;
+  timelineContinuityEnabled?: boolean;
   includeWorld?: boolean;
   includeInstructions?: boolean;
   includeCharacters?: boolean;
@@ -127,6 +129,9 @@ export interface Chat extends Timestamped {
   activeBranchId: string;
   archived: boolean;
   compactionMemory: string;
+  compactionEnabled?: boolean;
+  timelineContinuityEnabled?: boolean;
+  timelineError?: string;
   compactedThroughSequence?: number;
   compactionNeedsRebuild?: boolean;
   compactionHistoryLimit?: number;
@@ -185,6 +190,8 @@ export interface Message extends Timestamped {
   body: string;
   contextCondensation?: string;
   contextCondensationSourceUpdatedAt?: number;
+  /** Administrative memory lookups/deletions must not become story continuity. */
+  memoryManagementTurn?: boolean;
   attachmentContext?: string;
   modelId?: string;
   inputTokens?: number;
@@ -240,7 +247,7 @@ export interface SourceAuditVersion {
 }
 
 export interface MainChatAuditRequest {
-  purpose: "reply" | "compaction" | "memory review";
+  purpose: "reply" | "compaction" | "memory review" | "timeline continuity";
   capturedAt: number;
   payload: Record<string, unknown>;
   usage?: { prompt_tokens?: number; completion_tokens?: number };
@@ -708,6 +715,23 @@ export interface PendingMemory extends Timestamped {
   reason: string;
   confidence: number;
   sourceMessageIds: string[];
+}
+
+/** Empty bodies mark reviewed turns with no new event; deleted entries stay suppressed. */
+export interface TimelineEntry extends Timestamped {
+  projectId: string;
+  orderIndex: number;
+  title: string;
+  body: string;
+  sourceChatId?: string;
+  sourceBranchId?: string;
+  sourceMessageIds: string[];
+  sourceSequence?: number;
+  manuallyEdited?: boolean;
+  /** Missing means included, for existing and newly captured timeline entries. */
+  includedInContext?: boolean;
+  deleted?: boolean;
+  stale?: boolean;
 }
 
 export interface ModelLibraryEntry extends Timestamped {

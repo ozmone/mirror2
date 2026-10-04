@@ -10,6 +10,7 @@ import {
   Eye,
   Folder,
   GripVertical,
+  GitCommitHorizontal,
   Image as ImageIcon,
   KeyRound,
   Menu,
@@ -60,6 +61,7 @@ import { buildSourceChunks } from "../data/sources";
 import { formatTracker, formatWorldTime, syncRealtimeWorld } from "../data/world";
 import { Ability, AbilityModifiers, AbilityScores, AppSettings, Character, CharacterActionMacro, CharacterActionSlot, CharacterBonus, CharacterGearSlot, Chat, DeltaAllyCacheEntry, DeltaBaseTemplate, DeltaEffectDefinition, DeltaEffectPolarity, DeltaEntity, DeltaIconAsset, DeltaJobTemplate, DeltaMapSize, DeltaMessage, DeltaPrefixTemplate, DeltaSavingThrowTiming, DeltaSession, GearBodyType, GearSlotName, InventoryItem, InventoryKind, InventoryLog, Memory, Message, ModelLibraryEntry, PendingMemory, Project, RouteName, SidebarSpacing, SidebarWidth, SourceFile, WorldState } from "../types";
 import { formatDate, normaliseTag, now, splitTags, uid } from "../utils";
+import { TimelinePage } from "./timeline/TimelinePage";
 import { ChatScreen } from "./chat/ChatScreen";
 import { DeltaActionTree } from "./delta/DeltaActionTree";
 import { DeltaModeWorkspace } from "./delta/DeltaModeWorkspace";
@@ -154,6 +156,7 @@ const routeLabels: Record<RouteName, string> = {
   characters: "Characters",
   characterProfile: "Character Profile",
   memories: "Memories",
+  timeline: "Timeline continuity",
   compaction: "Compaction Memory",
   api: "API",
   data: "Data",
@@ -362,6 +365,9 @@ export function App() {
   const selectedProject = projects.find((project) => project.id === selectedProjectId);
   const editingProject = projects.find((project) => project.id === (editingProjectId ?? selectedProjectId));
   const selectedChat = chats.find((chat) => chat.id === selectedChatId);
+  const selectionRef = useRef({ projectId: selectedProjectId, chatId: selectedChatId });
+  selectionRef.current = { projectId: selectedProjectId, chatId: selectedChatId };
+  const refreshGeneration = useRef(0);
 
   useEffect(() => {
     routeRef.current = route;
@@ -486,28 +492,31 @@ export function App() {
   }, [deltaProjectSettingsOpen, deltaOpen, gearOpen, inventoryOpen, drawerOpen]);
 
   async function refresh() {
+    const generation = ++refreshGeneration.current;
+    const { projectId, chatId } = selectionRef.current;
     const [nextSettings, nextProjects, unsortedChats] = await Promise.all([
       db.settings.get("settings"),
       db.projects.orderBy("orderIndex").toArray(),
-      selectedProjectId ? db.chats.where("projectId").equals(selectedProjectId).toArray() : Promise.resolve([])
+      projectId ? db.chats.where("projectId").equals(projectId).toArray() : Promise.resolve([])
     ]);
     const nextChats = unsortedChats.sort((a, b) => b.updatedAt - a.updatedAt);
-    setSettings(nextSettings ?? defaultSettings());
-    setProjects(nextProjects);
-    setChats(nextChats);
     const nextModels = await db.modelLibrary.orderBy("orderIndex").toArray();
-    setModels(nextModels);
-    setSelectedModelId((current) => nextSettings?.defaultModelId || current || nextModels[0]?.modelId || "");
-    const activeChat = selectedChatId ? await db.chats.get(selectedChatId) : undefined;
+    const activeChat = chatId ? await db.chats.get(chatId) : undefined;
+    let nextMessages: Message[] = [];
     if (activeChat) {
       const rows = await db.messages
         .where("[chatId+branchId+sequence]")
         .between([activeChat.id, activeChat.activeBranchId, Dexie.minKey], [activeChat.id, activeChat.activeBranchId, Dexie.maxKey])
         .toArray();
-      setMessages(rows.sort((a, b) => a.sequence - b.sequence));
-    } else {
-      setMessages([]);
+      nextMessages = rows.sort((a, b) => a.sequence - b.sequence);
     }
+    if (generation !== refreshGeneration.current || projectId !== selectionRef.current.projectId || chatId !== selectionRef.current.chatId) return;
+    setSettings(nextSettings ?? defaultSettings());
+    setProjects(nextProjects);
+    setChats(nextChats);
+    setModels(nextModels);
+    setSelectedModelId((current) => nextSettings?.defaultModelId || current || nextModels[0]?.modelId || "");
+    setMessages(nextMessages);
   }
 
   useEffect(() => {
@@ -550,16 +559,18 @@ export function App() {
   const projectChats = useMemo(() => chats.filter((chat) => chat.projectId === selectedProjectId), [chats, selectedProjectId]);
   const title = route === "chat"
     ? selectedProject?.name ?? "Choose a project"
-    : selectedProject && ["stars", "archives", "archiveEntries", "characters", "characterProfile", "memories", "compaction"].includes(route)
+    : selectedProject && ["stars", "archives", "archiveEntries", "characters", "characterProfile", "memories", "timeline", "compaction"].includes(route)
       ? `${selectedProject.name} / ${routeLabels[route]}`
       : routeLabels[route];
 
   if (!ready) return <div className="loading">Mirror 2.0</div>;
 
   async function selectChat(id: string) {
+    const generation = ++refreshGeneration.current;
     const activeChat = await db.chats.get(id);
-    setSelectedChatId(id);
+    if (generation !== refreshGeneration.current) return;
     if (!activeChat) {
+      setSelectedChatId(undefined);
       setMessages([]);
       return;
     }
@@ -570,6 +581,10 @@ export function App() {
         .toArray(),
       db.chats.where("projectId").equals(activeChat.projectId).toArray()
     ]);
+    if (generation !== refreshGeneration.current) return;
+    selectionRef.current = { projectId: activeChat.projectId, chatId: id };
+    setSelectedProjectId(activeChat.projectId);
+    setSelectedChatId(id);
     setChats(nextChats.sort((a, b) => b.updatedAt - a.updatedAt));
     setMessages(rows.sort((a, b) => a.sequence - b.sequence));
   }
@@ -586,8 +601,8 @@ export function App() {
   async function deleteChat(id: string) {
     const chat = await db.chats.get(id);
     if (!chat) return;
-    if (!confirm(`Delete chat thread "${chat.title}"? This removes its messages and stars.`)) return;
-    await db.transaction("rw", [db.chats, db.branches, db.messages, db.stars, db.attachments, db.inventoryItems, db.inventoryLogs, db.deltaSessions, db.deltaMessages, db.deltaEntities, db.deltaAllyCache, db.deltaActionMacros], async () => {
+    if (!confirm(`Delete chat thread "${chat.title}"? This removes its messages, stars, and linked Timeline continuity entries.`)) return;
+    await db.transaction("rw", [db.chats, db.branches, db.messages, db.stars, db.attachments, db.inventoryItems, db.inventoryLogs, db.deltaSessions, db.deltaMessages, db.deltaEntities, db.deltaAllyCache, db.deltaActionMacros, db.timelineEntries], async () => {
       const deltaSessionIds = (await db.deltaSessions.where("chatId").equals(id).primaryKeys()) as string[];
       const messageIds = (await db.messages.where("chatId").equals(id).primaryKeys()) as string[];
       await db.stars.where("chatId").equals(id).delete();
@@ -859,6 +874,10 @@ export function App() {
               setSelectedModelId(modelId);
               await refresh();
             }}
+            onModelSelected={(modelId) => {
+              setSelectedModelId(modelId);
+              setSettings((current) => ({ ...current, defaultModelId: modelId }));
+            }}
           />
         )}
         {route === "projects" && <ProjectsPage projects={projects} selectedProjectId={selectedProjectId} onSelect={setSelectedProjectId} onEdit={(id) => { setEditingProjectId(id); setProjectEditInitialTab("general"); setRoute("projectEdit"); }} onRefresh={refresh} />}
@@ -867,6 +886,7 @@ export function App() {
         {route === "archives" && <ArchivesPage project={selectedProject} />}
         {route === "characters" && <CharactersPage project={selectedProject} onOpenProfile={(id) => { setProfileCharacterId(id); setRoute("characterProfile"); }} />}
         {route === "characterProfile" && selectedProject && profileCharacterId && <CharacterProfilePage project={selectedProject} characterId={profileCharacterId} chatId={selectedChat?.id} onBack={() => setRoute("characters")} onDeleted={() => { setProfileCharacterId(undefined); setRoute("characters"); }} />}
+        {route === "timeline" && <TimelinePage key={selectedProjectId} project={selectedProject} settings={settings} selectedModelId={selectedModelId} onOpenChat={async (id) => { await selectChat(id); setRoute("chat"); }} />}
         {route === "memories" && <MemoriesPage project={selectedProject} />}
         {route === "compaction" && selectedChat && <CompactionPage chat={selectedChat} onRefresh={refresh} />}
         {route === "settings" && <SettingsPage settings={settings} onRefresh={refresh} />}
@@ -1269,7 +1289,7 @@ function Drawer(props: {
           <DrawerSection title="Selected project">
             <div className="selected-project-row"><div className="selected-project-display"><ProjectIcon name={selectedProject.iconName} color={selectedProject.iconColor} /> <span>{selectedProject.name}</span></div><button className="icon-button" onClick={() => props.onRoute("projectEdit")} aria-label={`Open ${selectedProject.name} settings`} title="Project settings"><Settings size={18} /></button></div>
             <div className="drawer-project-tools">
-            {(["stars", "characters", "archives", "memories"] as RouteName[]).map((route) => (
+            {(["stars", "characters", "archives", "memories", "timeline"] as RouteName[]).map((route) => (
               <button className="nav-row" key={route} onClick={() => props.onRoute(route)}>
                 {routeIcon(route)} {routeLabels[route]}
               </button>
@@ -1334,6 +1354,7 @@ function routeIcon(route: RouteName) {
     characters: <UserRound size={18} />,
     archives: <Archive size={18} />,
     memories: <BookOpen size={18} />,
+    timeline: <GitCommitHorizontal size={18} />,
     projects: <Archive size={18} />,
     projectEdit: <Settings size={18} />
   };

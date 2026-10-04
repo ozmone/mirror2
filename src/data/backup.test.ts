@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { createFullBackup, decodeBackupValue, encodeBackupValue, replaceWithFullBackup } from "./backup";
+import { createFullBackup, createRecoverySnapshot, decodeBackupValue, encodeBackupValue, replaceWithFullBackup, restoreRecoverySnapshot } from "./backup";
 import { MirrorDatabase } from "./db";
 
 const databases: MirrorDatabase[] = [];
@@ -13,6 +13,18 @@ afterEach(async () => {
 });
 
 describe("full database backups", () => {
+  it("coalesces concurrent recovery snapshots and preserves restorable data", async () => {
+    const database = new MirrorDatabase(`backup-test-${crypto.randomUUID()}`);
+    databases.push(database);
+    await database.characterBonuses.put({ id: "bonus", characterId: "character", name: "Lucky", stat: "CHA", value: 1, createdAt: 1, updatedAt: 1 });
+    const first = createRecoverySnapshot(database);
+    expect(createRecoverySnapshot(database)).toBe(first);
+    const snapshot = await first;
+    await database.characterBonuses.clear();
+    await restoreRecoverySnapshot(snapshot.slot, database);
+    expect(await database.characterBonuses.count()).toBe(1);
+    expect((await createRecoverySnapshot(database)).slot).not.toBe(snapshot.slot);
+  });
   it("includes every runtime table, blobs, gear, and data omitted by the old exporter", async () => {
     const database = new MirrorDatabase(`backup-test-${crypto.randomUUID()}`);
     databases.push(database);
