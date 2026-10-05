@@ -28,6 +28,24 @@ it("keeps unchecked entries visible and persists their AI exclusion across remou
   expect(formatTimelineContinuity(await timelineEntries(project.id))).toContain("Arrival: Mara");
 });
 
+it("approves and denies suggestions without sending pending content to the AI", async () => {
+  const project = sampleProject();
+  await db.projects.put(project);
+  await addTimelineEntry(project.id, "Discovery", "The journal was found.", db, true);
+  await addTimelineEntry(project.id, "Departure", "They left.", db, true);
+  render(<TimelinePage project={project} settings={defaultSettings()} selectedModelId="" onOpenChat={vi.fn()} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Approve Discovery" }));
+  await screen.findByRole("checkbox", { name: "Include Discovery in AI context" });
+  expect(formatTimelineContinuity(await timelineEntries(project.id))).toContain("The journal was found.");
+  expect(formatTimelineContinuity(await timelineEntries(project.id))).not.toContain("They left.");
+  fireEvent.click(screen.getByRole("button", { name: "Deny Departure" }));
+  await screen.findByText("Suggestion denied.");
+  expect(await timelineEntries(project.id)).toHaveLength(1);
+  fireEvent.click(screen.getByRole("button", { name: "Undo removal" }));
+  await screen.findByRole("button", { name: "Approve Departure" });
+  expect(formatTimelineContinuity(await timelineEntries(project.id))).not.toContain("They left.");
+});
+
 it("adds, edits, searches, reorders, removes, and restores entries without timestamps", async () => {
   const project = sampleProject();
   await db.projects.put(project);

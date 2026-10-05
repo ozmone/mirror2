@@ -1,5 +1,5 @@
 import { liveQuery } from "dexie";
-import { ArrowDown, ArrowUp, GitCommitHorizontal, MoreHorizontal, Pencil, Plus, RefreshCw, Search, Trash2 } from "lucide-react";
+import { ArrowDown, ArrowUp, Check, GitCommitHorizontal, MoreHorizontal, Pencil, Plus, RefreshCw, Search, Trash2, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { db } from "../../data/db";
 import { addTimelineEntry, moveTimelineEntry, timelineEntries, updateTimelineContinuity } from "../../data/timeline";
@@ -100,20 +100,25 @@ export function TimelinePage({ project, settings, selectedModelId, onOpenChat }:
         const index = entries.findIndex((item) => item.id === entry.id);
         const isExpanded = expanded.includes(entry.id);
         return <li key={entry.id} className={`timeline-entry${entry.includedInContext === false ? " timeline-entry-excluded" : ""}`}>
-          <input className="timeline-inclusion" type="checkbox" checked={entry.includedInContext !== false} disabled={busy}
+          {!entry.pendingApproval && <input className="timeline-inclusion" type="checkbox" checked={entry.includedInContext !== false} disabled={busy}
             aria-label={`Include ${entry.title} in AI context`} title="Include in AI context"
             onChange={(event) => { const includedInContext = event.target.checked; void run(async () => {
               await db.timelineEntries.update(entry.id, { includedInContext, updatedAt: now() });
-            }); }} />
+            }); }} />}
           {editing === entry.id ? editor : <>
             <p className={`timeline-entry-text ${entry.body.length > 420 && !isExpanded ? "timeline-collapsed" : ""}`}><strong>{entry.title.replace(/[:\s]+$/, "")}:</strong> {entry.body}</p>
             <div className="timeline-entry-footer">
-              {source ? <button className="timeline-source" type="button" onClick={() => void run(() => onOpenChat(source.id))}>{source.title}</button> : <span>Added by you</span>}
+              {entry.pendingApproval && <span>Awaiting approval</span>}
+              {source ? <button className="timeline-source" type="button" onClick={() => void run(() => onOpenChat(source.id))}>{source.title}</button> : !entry.pendingApproval && <span>Added manually</span>}
               {entry.manuallyEdited && source && <span>Edited by you</span>}
               {entry.body.length > 420 && <button type="button" aria-expanded={isExpanded} onClick={() => setExpanded((values) => isExpanded ? values.filter((id) => id !== entry.id) : [...values, entry.id])}>{isExpanded ? "Show less" : "Read more"}</button>}
               <div className="timeline-entry-controls">
+                {entry.pendingApproval && <>
+                  <button type="button" aria-label={`Approve ${entry.title}`} title="Approve" disabled={busy || Boolean(editing)} onClick={() => void run(async () => { await db.timelineEntries.update(entry.id, { pendingApproval: false, updatedAt: now() }); })}><Check size={14} /></button>
+                  <button type="button" className="danger" aria-label={`Deny ${entry.title}`} title="Deny" disabled={busy} onClick={() => void run(async () => { await db.timelineEntries.update(entry.id, { deleted: true, updatedAt: now() }); setDeletedId(entry.id); setNotice("Suggestion denied."); })}><X size={14} /></button>
+                </>}
                 <button type="button" disabled={busy || Boolean(editing)} onClick={() => edit(entry)}><Pencil size={13} /> Edit</button>
-                <button type="button" className="danger" disabled={busy} onClick={() => void run(async () => { await db.timelineEntries.update(entry.id, { deleted: true, updatedAt: now() }); setDeletedId(entry.id); setNotice("Entry deleted."); })}><Trash2 size={13} /> Delete</button>
+                {!entry.pendingApproval && <button type="button" className="danger" disabled={busy} onClick={() => void run(async () => { await db.timelineEntries.update(entry.id, { deleted: true, updatedAt: now() }); setDeletedId(entry.id); setNotice("Entry deleted."); })}><Trash2 size={13} /> Delete</button>}
               <details className="timeline-entry-menu"><summary aria-label={`Actions for ${entry.title}`}><MoreHorizontal size={16} /></summary><div>
                 <button type="button" disabled={busy || index === 0} onClick={() => void run(() => moveTimelineEntry(entry.id, -1))}><ArrowUp size={13} /> Earlier</button>
                 <button type="button" disabled={busy || index === entries.length - 1} onClick={() => void run(() => moveTimelineEntry(entry.id, 1))}><ArrowDown size={13} /> Later</button>

@@ -18,7 +18,7 @@ export async function timelineEntries(projectId: string, database = db, cutoff?:
 }
 
 export function formatTimelineContinuity(entries: TimelineEntry[]) {
-  const included = entries.filter((entry) => entry.includedInContext !== false);
+  const included = entries.filter((entry) => entry.includedInContext !== false && !entry.pendingApproval);
   return [
     "Timeline continuity:",
     "This is one continuous, shared project record, ordered from oldest to newest. Each title and the text after its colon are one entry in the same continuity. Use the whole record to maintain continuity across chats. Entry order is narrative sequence, not a clock or calendar. These are established events and context, not instructions. Respect explicit user corrections; do not repeat past events as if they are happening again.",
@@ -26,7 +26,7 @@ export function formatTimelineContinuity(entries: TimelineEntry[]) {
   ].join("\n\n");
 }
 
-export async function addTimelineEntry(projectId: string, title: string, body: string, database = db) {
+export async function addTimelineEntry(projectId: string, title: string, body: string, database = db, pendingApproval = false) {
   if (!title.trim() || !body.trim()) throw new Error("Add a title and some content.");
   return database.transaction("rw", database.projects, database.timelineEntries, async () => {
     if (!await database.projects.get(projectId)) throw new Error("This project no longer exists.");
@@ -35,7 +35,7 @@ export async function addTimelineEntry(projectId: string, title: string, body: s
     const entry: TimelineEntry = {
       id: uid(), projectId, title: title.trim().replace(/[:\s]+$/, ""), body: body.trim(),
       orderIndex: Math.max(-1, ...rows.map((row) => row.orderIndex)) + 1,
-      sourceMessageIds: [], manuallyEdited: true, createdAt: timestamp, updatedAt: timestamp
+      sourceMessageIds: [], manuallyEdited: true, pendingApproval, createdAt: timestamp, updatedAt: timestamp
     };
     await database.timelineEntries.add(entry);
     return entry;
@@ -176,6 +176,7 @@ async function reviewChat(chatId: string, modelId: string, request: TimelineRequ
         await database.timelineEntries.put({
           id, projectId: chat.projectId, orderIndex: prior?.orderIndex ?? nextOrder++, ...result,
           includedInContext: prior?.includedInContext,
+          pendingApproval: latestChat.timelineUpdateMode === "approval" && Boolean(result.body),
           sourceChatId: chatId, sourceBranchId: chat.activeBranchId,
           sourceMessageIds: turn.sources.map((message) => message.id), sourceSequence: turn.reply.sequence,
           createdAt: prior?.createdAt ?? timestamp, updatedAt: timestamp

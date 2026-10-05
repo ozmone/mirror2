@@ -72,6 +72,7 @@ export interface AppSettings extends Timestamped {
   historySettingsInitialized?: boolean;
   compactionEnabled?: boolean;
   timelineContinuityEnabled?: boolean;
+  timelineUpdateMode?: "automatic" | "approval" | "manual";
   includeWorld?: boolean;
   includeInstructions?: boolean;
   includeCharacters?: boolean;
@@ -131,6 +132,7 @@ export interface Chat extends Timestamped {
   compactionMemory: string;
   compactionEnabled?: boolean;
   timelineContinuityEnabled?: boolean;
+  timelineUpdateMode?: "automatic" | "approval" | "manual";
   timelineError?: string;
   compactedThroughSequence?: number;
   compactionNeedsRebuild?: boolean;
@@ -730,6 +732,7 @@ export interface TimelineEntry extends Timestamped {
   manuallyEdited?: boolean;
   /** Missing means included, for existing and newly captured timeline entries. */
   includedInContext?: boolean;
+  pendingApproval?: boolean;
   deleted?: boolean;
   stale?: boolean;
 }

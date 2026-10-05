@@ -795,6 +795,19 @@ small {
   margin-top: auto;
 }
 
+.openrouter-balance {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 12px var(--sidebar-row-pad) 4px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.openrouter-balance-copy { display: grid; gap: 4px; min-width: 0; flex: 1; }
+.openrouter-balance-copy span { color: var(--muted); font-size: 0.68rem; }
+.openrouter-balance-copy strong { color: var(--text-2); font-size: 0.78rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+
 .nav-project {
   position: relative;
 }
@@ -6283,6 +6296,5 @@ button:has(.lucide-save):hover:not(:disabled),
 .timeline-editor textarea { min-height: 90px; }
 .timeline-inline-actions { display: flex; gap: 6px; }
 .timeline-review-error { margin: 0; color: var(--warning); font-size: .75rem; overflow-wrap: anywhere; }
-.timeline-chat-status { padding: 4px 12px; color: var(--text-2); font-size: .72rem; }
 @media (prefers-reduced-motion: no-preference) { .timeline-updating { animation: timeline-spin 1.5s linear infinite; } }
 @keyframes timeline-spin { to { transform: rotate(360deg); } }

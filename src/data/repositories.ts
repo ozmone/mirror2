@@ -300,7 +300,7 @@ export async function createProject(name: string) {
   return project;
 }
 
-export async function createChat(projectId: string, firstMessage: string, continuity?: Pick<Chat, "timelineContinuityEnabled" | "compactionEnabled">) {
+export async function createChat(projectId: string, firstMessage: string, continuity?: Pick<Chat, "timelineContinuityEnabled" | "compactionEnabled" | "timelineUpdateMode">) {
   const timestamp = now();
   const settings = await db.settings.get("settings");
   const chatId = uid();
@@ -320,6 +320,7 @@ export async function createChat(projectId: string, firstMessage: string, contin
       compactionMemory: "",
       compactionEnabled: continuity?.compactionEnabled ?? settings?.compactionEnabled ?? false,
       timelineContinuityEnabled: continuity?.timelineContinuityEnabled ?? settings?.timelineContinuityEnabled ?? false,
+      timelineUpdateMode: continuity?.timelineUpdateMode ?? settings?.timelineUpdateMode ?? "automatic",
       world: defaultWorldState()
     });
     await addMessage(chatId, branchId, "user", firstMessage, undefined, 0);

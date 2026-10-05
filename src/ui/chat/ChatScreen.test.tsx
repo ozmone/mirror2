@@ -4,7 +4,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { db } from "../../data/db";
 import { defaultSettings, sampleProject } from "../../data/defaults";
 import { createChat, createMemory } from "../../data/repositories";
-import { addTimelineEntry, timelineEntries } from "../../data/timeline";
+import { addTimelineEntry, formatTimelineContinuity, timelineEntries } from "../../data/timeline";
 import type { Chat, Message, Project } from "../../types";
 import { ChatScreen } from "./ChatScreen";
 
@@ -29,11 +29,11 @@ it("replaces the settings history entry when opening compaction without going ba
   expect(screen.queryByRole("button", { name: "Close chat settings" })).not.toBeInTheDocument();
 });
 
-async function setup(timelineContinuityEnabled = false, memoryMode: Project["memoryMode"] = "manual", historyLimit?: number) {
+async function setup(timelineContinuityEnabled = false, memoryMode: Project["memoryMode"] = "manual", historyLimit?: number, timelineUpdateMode: Chat["timelineUpdateMode"] = "automatic") {
   const project = { ...sampleProject(), worldSetting: "Unique world setting", instructions: "Unique instructions", memoryMode };
   await db.projects.put(project);
   const id = await createChat(project.id, "Initial");
-  await db.chats.update(id, { timelineContinuityEnabled });
+  await db.chats.update(id, { timelineContinuityEnabled, timelineUpdateMode });
   await db.messages.where("chatId").equals(id).delete();
   const chat = (await db.chats.get(id))!;
   render(<Harness project={project} chat={chat} historyLimit={historyLimit} />);
@@ -207,8 +207,9 @@ it("saves Timeline continuity and memory compaction independently for the curren
   expect(screen.getByRole("checkbox", { name: "Memory compaction" })).toBeChecked();
   fireEvent.click(screen.getByRole("checkbox", { name: "Memory compaction" }));
   fireEvent.click(screen.getByRole("checkbox", { name: "Timeline continuity" }));
+  fireEvent.change(screen.getByRole("combobox", { name: "Timeline updates" }), { target: { value: "manual" } });
   fireEvent.click(screen.getByRole("button", { name: "Save" }));
-  await waitFor(async () => expect(await db.chats.get(chat.id)).toMatchObject({ compactionEnabled: false, timelineContinuityEnabled: true }));
+  await waitFor(async () => expect(await db.chats.get(chat.id)).toMatchObject({ compactionEnabled: false, timelineContinuityEnabled: true, timelineUpdateMode: "manual" }));
   expect(await db.chats.get(otherId)).toMatchObject({ compactionEnabled: true, timelineContinuityEnabled: false });
   expect((await db.settings.get("settings"))?.compactionEnabled).toBe(true);
 });
@@ -284,6 +285,41 @@ it.each([10, 0])("does not auto-capture recent turns with history limit %s, but 
   expect(await timelineEntries(chat.projectId)).toHaveLength(1);
 });
 
+it("manual timeline mode skips background review even when history overflows", async () => {
+  const chat = await setup(true, "manual", 10, "manual");
+  await seedTimelineHistory(chat);
+  await addTimelineEntry(chat.projectId, "Existing", "The archive is open.");
+  const fetch = vi.fn(async (_url: string, options: RequestInit) => {
+    const payload = JSON.parse(String(options.body));
+    expect(payload.messages[0].content).toContain("Existing: The archive is open.");
+    expect(payload.messages[0].content).not.toMatch(/^Update Timeline continuity/);
+    return new Response(JSON.stringify({ choices: [{ message: { content: "Continuing the scene." } }] }));
+  });
+  vi.stubGlobal("fetch", fetch);
+  send();
+  await waitFor(async () => expect((await db.messages.where("chatId").equals(chat.id).sortBy("sequence")).slice(-1)[0]?.requestInfo?.audit?.postResponseMemory).toBeDefined());
+  expect(fetch).toHaveBeenCalledTimes(1);
+  expect(await timelineEntries(chat.projectId)).toHaveLength(1);
+});
+
+it.each(["manual", "approval"] as const)("adds explicitly requested timeline events through tools in %s mode", async (mode) => {
+  const chat = await setup(true, "manual", 10, mode);
+  vi.stubGlobal("fetch", vi.fn(async (_url: string, options: RequestInit) => {
+    const payload = JSON.parse(String(options.body));
+    const toolResult = payload.messages.find((message: { role: string }) => message.role === "tool");
+    if (toolResult) expect(JSON.parse(toolResult.content)).toMatchObject({ added: mode === "manual", pendingApproval: mode === "approval" });
+    return new Response(JSON.stringify({ choices: [{ message: toolResult ? { content: "Timeline request handled." } : { tool_calls: [{ id: "add-event", type: "function", function: { name: "add_timeline_entry", arguments: JSON.stringify({ title: "Discovery", body: "Mara found the missing journal." }) } }] } }] }));
+  }));
+  fireEvent.change(screen.getByPlaceholderText("Message this project"), { target: { value: "Add the discovery of the journal to the timeline." } });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  await screen.findByText("Timeline request handled.");
+  const entries = await timelineEntries(chat.projectId);
+  expect(entries).toHaveLength(1);
+  expect(entries[0]).toMatchObject({ pendingApproval: mode === "approval", body: "Mara found the missing journal." });
+  expect(formatTimelineContinuity(entries).includes("Mara found")).toBe(mode === "manual");
+  await waitFor(async () => expect((await db.messages.where("chatId").equals(chat.id).sortBy("sequence")).slice(-1)[0]?.memoryManagementTurn).toBe(true));
+});
+
 it("keeps a successful reply when timeline review fails and exposes a retryable error", async () => {
   const chat = await setup(true, "manual", 10);
   await seedTimelineHistory(chat);
@@ -298,7 +334,7 @@ it("keeps a successful reply when timeline review fails and exposes a retryable 
   await waitFor(async () => expect((await db.chats.get(chat.id))?.timelineError).toBeTruthy());
   expect(await timelineEntries(chat.projectId)).toHaveLength(0);
   expect((await db.messages.where("chatId").equals(chat.id).sortBy("sequence")).slice(-1)[0]).toMatchObject({ status: "complete", body: "A completed scene." });
-  await screen.findByText(/Timeline continuity needs an update:/);
+  expect(screen.queryByText(/Timeline continuity needs an update:|Updating Timeline continuity/)).not.toBeInTheDocument();
 });
 
 it("disabling compaction excludes stored compaction and condensed messages and stops automatic condensation", async () => {

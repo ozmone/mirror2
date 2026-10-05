@@ -45,6 +45,8 @@ Entries support search, source-chat links, manual additions, edits, earlier/late
 
 Each timeline entry has visible **Edit** and **Delete** buttons; the three-dot menu contains ordering controls. Deletion offers **Undo removal** on the page.
 
+Chat settings offer **Timeline updates: Automatic / Approve first / Manual**. Automatic retains the history-window capture behavior. Approve first queues AI-written entries with compact approve/deny controls on the timeline page; pending entries are excluded from AI context and memory lookup. Manual disables background timeline reviews while keeping existing checked continuity available. The page's **Update timeline** button remains an explicit catch-up action in all modes, honoring approval mode. With continuity enabled, a tool-capable model can use `add_timeline_entry` when explicitly asked in chat to add an event; approval mode queues it, while Manual and Automatic save it directly. User-written entries are saved directly. Changing modes does not auto-approve existing suggestions. Approving/denying is local and does not make an AI request; approval mode still incurs capture requests.
+
 With a model that supports tools, ask in chat to delete a saved memory or Timeline continuity entry. The AI uses `find_memory_entries` to find exact records, then `delete_memory_entry` to remove only those records from the current project. Lookup includes pending memory suggestions. Existing records can be managed even when automatic capture is disabled. The app rejects guessed IDs, entries from other projects, and entries changed since lookup. Administrative memory tool turns are excluded from timeline capture and automatic memory saving. Memory compaction and the original chat messages are untouched.
 
 ## Code ownership

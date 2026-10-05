@@ -16,7 +16,7 @@ import { db } from "../../data/db";
 import { defaultMemoryInstruction } from "../../data/defaults";
 import { deleteMessages } from "../../data/deletion";
 import { hasMemoryManagementEntries, memoryManagementInstruction, runMemoryManagementTool, type MemoryManagementSession } from "../../data/memoryManagement";
-import { formatTimelineContinuity, invalidateTimelineMessages, timelineEntries, timelineHistoryBoundary, updateTimelineContinuity } from "../../data/timeline";
+import { addTimelineEntry, formatTimelineContinuity, invalidateTimelineMessages, timelineEntries, timelineHistoryBoundary, updateTimelineContinuity } from "../../data/timeline";
 import {
   addMessage,
   applyInventoryChange,
@@ -34,7 +34,7 @@ import { AppSettings, Chat, DeltaMapSize, InventoryUpdateRequest, MainChatAuditR
 import { estimateTokens, now, uid } from "../../utils";
 import { isDeltaModeRequest, normaliseDeltaMapSize } from "../delta/config";
 import { abstractDeltaRosterName, fitComposerTextarea, formatInventoryKg, keepComposerVisible, useSavedNotice } from "../delta/workspaceSupport";
-import { characterTools, deltaImminentTools, finalizeTurnTool, imageContextTools, inventoryTools, memoryManagementTools, memoryTools, sourceTools, type OpenRouterMessage, type OpenRouterResponse, type OpenRouterToolCall, type OpenRouterUsage } from "../openRouter";
+import { characterTools, deltaImminentTools, finalizeTurnTool, imageContextTools, inventoryTools, memoryManagementTools, memoryTools, sourceTools, timelineTools, type OpenRouterMessage, type OpenRouterResponse, type OpenRouterToolCall, type OpenRouterUsage } from "../openRouter";
 import { auditSafeValue, recordModelRequest, sourceAuditVersions } from "../responseAudit";
 import { EmptyState } from "../shared/appElements";
 import { VirtualMessageList } from "./MessageList";
@@ -133,7 +133,7 @@ export function ChatScreen({
   const [toolRequirementOpen, setToolRequirementOpen] = useState(false);
   const [compactionEnabled, setCompactionEnabled] = useState(chat?.compactionEnabled ?? settings.compactionEnabled ?? false);
   const [timelineContinuityEnabled, setTimelineContinuityEnabled] = useState(chat ? chat.timelineContinuityEnabled ?? false : settings.timelineContinuityEnabled ?? false);
-  const [timelineStatus, setTimelineStatus] = useState("");
+  const [timelineUpdateMode, setTimelineUpdateMode] = useState<NonNullable<Chat["timelineUpdateMode"]>>(chat ? chat.timelineUpdateMode ?? "automatic" : settings.timelineUpdateMode ?? "automatic");
   const memoryManagementAvailability = useRef({ projectId: "", available: false });
   const [streamingEnabled, setStreamingEnabled] = useState(settings.streamingEnabled ?? true);
   const [autoManageInventory, setAutoManageInventory] = useState(settings.autoManageInventory ?? false);
@@ -175,10 +175,11 @@ export function ChatScreen({
     setHistoryNoLimit(Boolean(chat?.infiniteHistoryLocked) || Boolean(settings.historySettingsInitialized && !settings.maxHistoryMessages));
     setCompactionEnabled(chat?.compactionEnabled ?? settings.compactionEnabled ?? false);
     setTimelineContinuityEnabled(chat ? chat.timelineContinuityEnabled ?? false : settings.timelineContinuityEnabled ?? false);
+    setTimelineUpdateMode(chat ? chat.timelineUpdateMode ?? "automatic" : settings.timelineUpdateMode ?? "automatic");
     setStreamingEnabled(settings.streamingEnabled ?? true);
     setAutoManageInventory(settings.autoManageInventory ?? false);
     setConfirmInventoryUpdates(settings.confirmInventoryUpdates ?? true);
-  }, [settings, selectedModelId, chat?.id, chat?.infiniteHistoryLocked, chat?.compactionEnabled, chat?.timelineContinuityEnabled]);
+  }, [settings, selectedModelId, chat?.id, chat?.infiniteHistoryLocked, chat?.compactionEnabled, chat?.timelineContinuityEnabled, chat?.timelineUpdateMode]);
   useEffect(() => {
     setInventoryEnabled(project?.inventoryEnabled ?? false);
     setGearEnabled(project?.gearEnabled ?? false);
@@ -232,7 +233,7 @@ export function ChatScreen({
       maxTokens: optionalNumber(maxTokens),
       maxHistoryMessages: effectiveHistoryNoLimit ? undefined : optionalNumber(maxHistory),
       historySettingsInitialized: true,
-      ...(!chat ? { compactionEnabled, timelineContinuityEnabled } : {}),
+      ...(!chat ? { compactionEnabled, timelineContinuityEnabled, timelineUpdateMode } : {}),
       includeWorld,
       includeInstructions,
       includeCharacters,
@@ -245,7 +246,7 @@ export function ChatScreen({
       updatedAt: timestamp
     });
     if (project) await db.projects.update(project.id, { inventoryEnabled, gearEnabled, updatedAt: timestamp });
-    if (chat) await db.chats.update(chat.id, { compactionEnabled, timelineContinuityEnabled, world: world.timeMode === "realtime" ? { ...world, realtimeUpdatedAt: timestamp } : world, ...(lockInfiniteHistory ? { infiniteHistoryLocked: true } : {}), updatedAt: timestamp });
+    if (chat) await db.chats.update(chat.id, { compactionEnabled, timelineContinuityEnabled, timelineUpdateMode, world: world.timeMode === "realtime" ? { ...world, realtimeUpdatedAt: timestamp } : world, ...(lockInfiniteHistory ? { infiniteHistoryLocked: true } : {}), updatedAt: timestamp });
     setInfiniteWarningOpen(false);
     showSaved();
     await onSettingsSaved(draftModelId);
@@ -338,6 +339,7 @@ export function ChatScreen({
       ...(project?.inventoryEnabled && autoManageInventory ? [...inventoryTools] : []),
       ...(project && project.memoryMode !== "manual" ? [...memoryTools] : []),
       ...(memoryManagementEnabled() ? [...memoryManagementTools] : []),
+      ...(timelineContinuityEnabled ? [...timelineTools] : []),
       ...(imageContextMessageId ? [...imageContextTools] : []),
       ...(forceTurnFinalizer ? [finalizeTurnTool] : [])
     ];
@@ -546,16 +548,14 @@ export function ChatScreen({
   }
 
   async function updateTimeline(chatId: string, requests: MainChatAuditRequest[], history: Message[], historyLimit?: number) {
-    if (!timelineContinuityEnabled) return;
+    if (!timelineContinuityEnabled || timelineUpdateMode === "manual") return;
     const beforeSequence = timelineHistoryBoundary(history, historyLimit);
     if (beforeSequence === undefined) return;
     const signal = activeSendRef.current?.controller.signal ?? new AbortController().signal;
-    setTimelineStatus("Updating Timeline continuity…");
     try {
       await updateTimelineContinuity(chatId, draftModelId, (payload) => openRouterRequest(payload, signal, requests, "timeline continuity"), db, beforeSequence);
-      setTimelineStatus("");
-    } catch (error) {
-      setTimelineStatus(`Timeline continuity needs an update: ${error instanceof Error ? error.message : "Please retry from the timeline page."}`);
+    } catch {
+      // The timeline service stores errors for its page; keep chat uninterrupted.
     }
   }
 
@@ -902,6 +902,16 @@ export function ChatScreen({
   }
 
   async function runToolCall(toolCall: OpenRouterToolCall, chatId: string, inventoryUpdates: InventoryUpdateRequest[], sourceMessageIds: string[], deltaImminentProposals: DeltaImminentProposal[], memorySession: MemoryManagementSession, imageContextMessageId?: string, captureSources?: (files: SourceFile[]) => Promise<void>) {
+    if (toolCall.function.name === "add_timeline_entry") {
+      if (!project || !timelineContinuityEnabled) return { error: "Timeline continuity is disabled." };
+      const args = JSON.parse(toolCall.function.arguments) as { title?: unknown; body?: unknown } | null;
+      if (!args || typeof args.title !== "string" || typeof args.body !== "string" || !args.title.replace(/[:\s]+$/, "") || !args.body.trim() || args.title.length > 160 || args.body.length > 4000) return { error: "Provide a title (1–160 characters) and content (1–4000 characters)." };
+      const activeChat = await db.chats.get(chatId);
+      if (!activeChat || activeChat.projectId !== project.id || !activeChat.timelineContinuityEnabled) return { error: "This chat is unavailable or Timeline continuity is disabled." };
+      const pendingApproval = activeChat.timelineUpdateMode === "approval";
+      const entry = await addTimelineEntry(project.id, args.title, args.body, db, pendingApproval);
+      return { added: !pendingApproval, pendingApproval, entryId: entry.id };
+    }
     if (memoryManagementTools.some((tool) => tool.function.name === toolCall.function.name)) {
       if (!project || !memoryManagementEnabled()) return { error: "Memory management is unavailable." };
       return runMemoryManagementTool(project.id, toolCall.function.name, toolCall.function.arguments, memorySession);
@@ -975,6 +985,7 @@ export function ChatScreen({
         }
         if (toolCall.function.name === "save_memory" && result && typeof result === "object" && ("saved" in result || "proposedForApproval" in result || "duplicate" in result)) memoryHandledByTool = true;
         if (memoryManagementTools.some((tool) => tool.function.name === toolCall.function.name)) { memoryHandledByTool = true; memoryManagementTurn = true; }
+        if (toolCall.function.name === "add_timeline_entry") { memoryHandledByTool = true; memoryManagementTurn = true; }
         if (toolCall.function.name === "finalize_turn" && result && typeof result === "object" && "finalizedTurn" in result) return { messages: nextMessages, assistantMessage, usage, memoryHandledByTool, memoryManagementTurn, deltaImminentProposal: deltaImminentProposals[deltaImminentProposals.length - 1], finalizedTurn: result.finalizedTurn };
         nextMessages.push({
           role: "tool",
@@ -1102,7 +1113,7 @@ export function ChatScreen({
       let createdDeltaChatId: string | undefined;
       let deltaUserMessageId: string | undefined;
       if (!deltaChat) {
-        const deltaChatId = await createChat(project.id, text, { compactionEnabled, timelineContinuityEnabled });
+        const deltaChatId = await createChat(project.id, text, { compactionEnabled, timelineContinuityEnabled, timelineUpdateMode });
         createdDeltaChatId = deltaChatId;
         deltaChat = await db.chats.get(deltaChatId);
         if (!deltaChat) return;
@@ -1194,7 +1205,7 @@ export function ChatScreen({
     let createdChatId: string | undefined;
     let requestFailed = false;
     if (!chatId || !branchId) {
-      chatId = await createChat(project.id, text, { compactionEnabled, timelineContinuityEnabled });
+      chatId = await createChat(project.id, text, { compactionEnabled, timelineContinuityEnabled, timelineUpdateMode });
       createdChatId = chatId;
       const created = await db.chats.get(chatId);
       branchId = created?.activeBranchId;
@@ -1206,7 +1217,7 @@ export function ChatScreen({
       userMessageId = (await addMessage(chatId, branchId, "user", text)).id;
     }
     if (chatId && branchId) {
-      await db.chats.update(chatId, { compactionEnabled, timelineContinuityEnabled });
+      await db.chats.update(chatId, { compactionEnabled, timelineContinuityEnabled, timelineUpdateMode });
       if (userMessageId && (attachedImages.length || attachedFiles.length)) {
         const timestamp = now();
         await db.attachments.bulkAdd([...attachedImages, ...attachedFiles].map((file) => ({
@@ -1291,6 +1302,7 @@ export function ChatScreen({
         characterDetails,
         compactionEnabled && historyLimit && compactionMemory ? `Compaction memory:\n${compactionMemory}` : "",
         timelineContext,
+        timelineContinuityEnabled ? "Timeline updates: use add_timeline_entry only when the user explicitly asks to add an event to the timeline. This works in Manual mode. Summarize the event from available context, even if it spans multiple turns. Do not claim to have reviewed history you cannot see. Only confirm the tool's actual result; pendingApproval means it still needs the user's approval on the timeline page." : "",
         await sourceLibraryContext(),
         attachedFileDetails,
         images.length ? "An image is attached to the latest user message. First call save_image_context exactly once with a detailed concise visual extraction. It is hidden from the user. Then answer the user normally from the image." : "",
@@ -1426,7 +1438,7 @@ export function ChatScreen({
     const chatId = message.chatId;
     const branchId = message.branchId;
     const timestamp = now();
-    await db.chats.update(chatId, { compactionEnabled, timelineContinuityEnabled });
+    await db.chats.update(chatId, { compactionEnabled, timelineContinuityEnabled, timelineUpdateMode });
     const activeChat = await db.chats.get(chatId);
     const characterDetails = await characterLibraryContext();
     const inventoryDetails = await inventoryContext(chatId);
@@ -1456,6 +1468,7 @@ export function ChatScreen({
       characterDetails,
       compactionEnabled && historyLimit && compactionMemory ? `Compaction memory:\n${compactionMemory}` : "",
       timelineContext,
+      timelineContinuityEnabled ? "Timeline updates: use add_timeline_entry only when the user explicitly asks to add an event to the timeline. This works in Manual mode. Summarize the event from available context, even if it spans multiple turns. Do not claim to have reviewed history you cannot see. Only confirm the tool's actual result; pendingApproval means it still needs the user's approval on the timeline page." : "",
       await sourceLibraryContext(),
       resendImages.length ? "An image is attached to the latest user message. First call save_image_context exactly once with a detailed concise visual extraction. It is hidden from the user. Then answer the user normally from the image." : "",
       memoryDetails.text,
@@ -1749,7 +1762,6 @@ export function ChatScreen({
 
   return (
     <div className="chat-screen">
-      {timelineStatus && <small className="timeline-chat-status" role="status">{timelineStatus}</small>}
       {!chat && messages.length === 0 && <EmptyState title="Ready when you are" body="Start a new project chat from the composer." />}
       <VirtualMessageList
         projectId={project.id}
@@ -1825,7 +1837,10 @@ export function ChatScreen({
                 <label className="compact-check"><input type="checkbox" checked={gearEnabled} onChange={(event) => setGearEnabled(event.target.checked)} /> Enable gear</label>
                 <label className="compact-check"><input type="checkbox" checked={compactionEnabled} onChange={(event) => setCompactionEnabled(event.target.checked)} /> Memory compaction</label>
                 <label className="compact-check"><input type="checkbox" checked={timelineContinuityEnabled} onChange={(event) => setTimelineContinuityEnabled(event.target.checked)} /> Timeline continuity</label>
-                <small>Timeline continuity uses the shared project record and saves completed turns as they leave your message history window. With no history limit, use Update timeline to capture entries. Both controls are independent.</small>
+                {timelineContinuityEnabled && <label>Timeline updates<select aria-label="Timeline updates" value={timelineUpdateMode} onChange={(event) => setTimelineUpdateMode(event.target.value as NonNullable<Chat["timelineUpdateMode"]>)}>
+                  <option value="automatic">Automatic</option><option value="approval">Approve first</option><option value="manual">Manual</option>
+                </select><small>{timelineUpdateMode === "manual" ? "No background timeline reviews. Ask the AI to add an event, add one yourself, or use Update timeline." : timelineUpdateMode === "approval" ? "AI entries wait for your approval on the timeline page before being used as context." : "Completed turns are captured as they leave the message history window."}</small></label>}
+                <small>Timeline continuity uses checked, approved entries from the shared project record. Automatic and approval updates follow the history window; with unlimited history, use Update timeline. Memory compaction is independent.</small>
                 <button type="button" disabled={!project} onClick={() => {
                   setChatSettingsOpen(false);
                   setModelMenuOpen(false);

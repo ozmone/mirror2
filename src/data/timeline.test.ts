@@ -95,6 +95,19 @@ it("captures completed turns once, formats one colon-linked record, and preserve
   expect(await timelineEntries(project.id, database)).toEqual([]);
 });
 
+it("queues approval-mode reviews outside AI context and does not recreate denied suggestions", async () => {
+  const { database, chat, project } = await setup();
+  await database.chats.update(chat.id, { timelineUpdateMode: "approval" });
+  const request = vi.fn(async () => result());
+  await updateTimelineContinuity(chat.id, "model", request, database);
+  const entries = await timelineEntries(project.id, database);
+  expect(entries[0].pendingApproval).toBe(true);
+  expect(formatTimelineContinuity(entries)).not.toContain("Mara");
+  await database.timelineEntries.update(entries[0].id, { deleted: true });
+  await updateTimelineContinuity(chat.id, "model", request, database);
+  expect(request).toHaveBeenCalledTimes(1);
+});
+
 it("does not capture disabled, incomplete, cancelled, or inactive-branch turns", async () => {
   const { database, chat, messages } = await setup();
   const request = vi.fn(async () => result());

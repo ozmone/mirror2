@@ -1,4 +1,5 @@
 import Dexie from "dexie";
+import { OpenRouterBalance } from "./OpenRouterBalance";
 import {
   Archive,
   BookOpen,
@@ -825,6 +826,7 @@ export function App() {
         </section>
       )}
       <Drawer
+        apiKey={settings.apiKey}
         open={drawerOpen}
         projects={projects}
         selectedProjectId={selectedProjectId}
@@ -1207,6 +1209,7 @@ function InventoryLogList({ logs, onRefresh }: { logs: InventoryLog[]; onRefresh
 }
 
 function Drawer(props: {
+  apiKey?: string;
   open: boolean;
   projects: Project[];
   selectedProjectId?: string;
@@ -1332,6 +1335,7 @@ function Drawer(props: {
           <button className="nav-row" onClick={() => props.onRoute("settings")}>
             <Settings size={18} /> App Settings
           </button>
+          <OpenRouterBalance apiKey={props.apiKey} visible={props.open} />
         </div>
       </aside>
     </>

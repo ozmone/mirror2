@@ -41,7 +41,7 @@ export async function runMemoryManagementTool(projectId: string, name: string, r
       rows.push(...pending.map((memory) => ({ id: memory.id, module: "pending" as const, text: memory.text })));
     }
     if (module === "all" || module === "timeline") {
-      rows.push(...(await timelineEntries(projectId, database)).filter((entry) => entry.includedInContext !== false).map((entry) => ({ id: entry.id, module: "timeline" as const, title: entry.title, text: entry.body })));
+      rows.push(...(await timelineEntries(projectId, database)).filter((entry) => entry.includedInContext !== false && !entry.pendingApproval).map((entry) => ({ id: entry.id, module: "timeline" as const, title: entry.title, text: entry.body })));
     }
     const terms = args.query.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
     const matches = rows.filter((entry) => terms.every((term) => `${entry.title ?? ""} ${entry.text}`.toLocaleLowerCase().includes(term)));
