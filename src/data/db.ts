@@ -454,6 +454,19 @@ export class MirrorDatabase extends Dexie {
         chat.timelineContinuityEnabled ??= false;
       });
     });
+    this.version(17).stores({}).upgrade(async (transaction) => {
+      await transaction.table("deltaSessions").toCollection().modify((session) => {
+        delete session.mapSize;
+        delete session.mapTiles;
+      });
+      await transaction.table("deltaEntities").toCollection().modify((entity) => {
+        delete entity.mapRow;
+        delete entity.mapColumn;
+      });
+      await transaction.table("messages").toCollection().modify((message) => {
+        if (message.deltaBrief) delete message.deltaBrief.mapSize;
+      });
+    });
   }
 }
 

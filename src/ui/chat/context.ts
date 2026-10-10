@@ -1,6 +1,5 @@
 import { db } from "../../data/db";
-import { DeltaBriefRoster, DeltaMapSize, Message } from "../../types";
-import { normaliseDeltaMapSize } from "../delta/config";
+import { DeltaBriefRoster, Message } from "../../types";
 import { deltaRosterParticipants, extractJsonObject } from "../delta/workspaceSupport";
 import { type OpenRouterMessage } from "../openRouter";
 
@@ -12,18 +11,17 @@ export function optionalNumber(value: string) {
 
 export function parseDeltaBriefPacket(text: string) {
   try {
-    const parsed = JSON.parse(extractJsonObject(text)) as { brief?: unknown; handoffContext?: unknown; playerCharacterName?: unknown; roster?: unknown; team?: unknown; neutral?: unknown; enemies?: unknown; mapSize?: unknown; avoidLabel?: unknown; avoidPrompt?: unknown };
+    const parsed = JSON.parse(extractJsonObject(text)) as { brief?: unknown; handoffContext?: unknown; playerCharacterName?: unknown; roster?: unknown; team?: unknown; neutral?: unknown; enemies?: unknown; avoidLabel?: unknown; avoidPrompt?: unknown };
     return {
       brief: typeof parsed.brief === "string" ? parsed.brief.trim() : "",
       handoffContext: typeof parsed.handoffContext === "string" ? parsed.handoffContext.trim() : "",
       playerCharacterName: typeof parsed.playerCharacterName === "string" ? parsed.playerCharacterName.trim() : "",
       roster: normaliseDeltaBriefRoster(parsed.roster ?? { team: parsed.team, neutral: parsed.neutral, enemies: parsed.enemies }),
-      mapSize: normaliseDeltaMapSize(parsed.mapSize),
       avoidLabel: typeof parsed.avoidLabel === "string" ? parsed.avoidLabel.trim() : "",
       avoidPrompt: typeof parsed.avoidPrompt === "string" ? parsed.avoidPrompt.trim() : ""
     };
   } catch {
-    return { brief: "", handoffContext: "", playerCharacterName: "", roster: normaliseDeltaBriefRoster(undefined), mapSize: "M" as DeltaMapSize, avoidLabel: "", avoidPrompt: "" };
+    return { brief: "", handoffContext: "", playerCharacterName: "", roster: normaliseDeltaBriefRoster(undefined), avoidLabel: "", avoidPrompt: "" };
   }
 }
 
@@ -242,7 +240,6 @@ export type DeltaImminentProposal = {
   handoffContext?: string;
   playerCharacterName?: string;
   roster: DeltaBriefRoster;
-  mapSize: DeltaMapSize;
   avoidLabel?: string;
   avoidPrompt?: string;
 };

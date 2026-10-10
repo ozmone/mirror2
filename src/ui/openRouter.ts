@@ -174,11 +174,10 @@ export const deltaImminentTools = [
           neutral: { type: "array", items: { type: "string" }, description: "Concrete neutral participants physically involved. Use an empty list when there are none." },
           enemies: { type: "array", items: { type: "string" }, description: "Every opposing participant physically involved. Use canonical names where known; otherwise use concrete visible identities such as Scarred enforcer, Woman with shotgun, or Grey wolf. Distinguish multiples concretely. Never use unknown, mysterious, unidentified, figure, shape, presence, or creature as an abstract identity." },
           playerCharacterName: { type: "string", description: "Likely player-controlled character name, if known." },
-          mapSize: { type: "string", enum: ["S", "M", "L", "XL", "XXL"], description: "Choose the engagement map boundary from the immediate scene: S = 30m, M = 50m, L = 80m, XL = 100m, XXL = 200m. This is the actual scene boundary, not a zoom level. Choose the smallest size that fairly contains the engagement and likely movement." },
           avoidLabel: { type: "string", description: "Button label for avoiding the engagement, usually Escape for danger or Cancel for a proposed mission." },
           avoidPrompt: { type: "string", description: "Short UI question asking what the player does to avoid or cancel the engagement." }
         },
-        required: ["brief", "team", "neutral", "enemies", "mapSize"]
+        required: ["brief", "team", "neutral", "enemies"]
       }
     }
   }
@@ -200,36 +199,6 @@ export const deltaEntityTools = [
     }
   },
   {
-    type: "function",
-    function: {
-      name: "set_delta_map",
-      description: "Stage the active engagement's terrain map once, using only non-open tiles. Coordinates are one-based row/column positions within the fixed map boundary. Do not use this to place entities.",
-      parameters: {
-        type: "object",
-        properties: {
-          tiles: {
-            type: "array",
-            description: "Only terrain/access tiles that differ from open ground.",
-            items: {
-              type: "object",
-              properties: {
-                row: { type: "number", description: "One-based grid row." },
-                column: { type: "number", description: "One-based grid column." },
-                kind: { type: "string", enum: ["solid", "half", "special", "access"] },
-                label: { type: "string", description: "Concrete terrain/object label, such as warehouse shelf, flooded channel, or security door." },
-                color: { type: "string", description: "For special terrain only: a readable hex color chosen to suit the hazard, such as #3f83c5 for water or #5e9d68 for gas." },
-                accessState: { type: "string", enum: ["open", "closed", "locked"], description: "For access only." }
-              },
-              required: ["row", "column", "kind"]
-            }
-          }
-        },
-        required: ["tiles"]
-      }
-    }
-  },
-  {
-    type: "function",
     function: {
       name: "list_delta_job_categories",
       description: "List available Delta JOB categories for generated entities. Use this before selecting a JOB when categories exist.",
@@ -254,7 +223,7 @@ export const deltaEntityTools = [
     type: "function",
     function: {
       name: "create_delta_entity",
-      description: "Create one current Delta entity only for a person, creature, or active participant. Never create entities from position/range/cover/status phrases; put those details in statusText, distanceFromPlayer, elevation, or map coordinates instead. Use saved characterId for known saved characters; otherwise apply readable PREFIX, BASE, and optional JOB labels from the project templates so generated stats are created. Do not invent hidden template IDs.",
+      description: "Create one current Delta entity only for a person, creature, or active participant. Never create entities from position/range/cover/status phrases; put those details in statusText, distanceFromPlayer, or elevation. Use saved characterId for known saved characters; otherwise apply readable PREFIX, BASE, and optional JOB labels from the project templates so generated stats are created. Do not invent hidden template IDs.",
       parameters: {
         type: "object",
         properties: {
@@ -267,9 +236,7 @@ export const deltaEntityTools = [
           jobCategory: { type: "string", description: "Optional readable JOB category used only to look up modifiers." },
           statusText: { type: "string" },
           distanceFromPlayer: { type: "string" },
-          elevation: { type: "string" },
-          mapRow: { type: "number", description: "One-based map row for this entity's current position." },
-          mapColumn: { type: "number", description: "One-based map column for this entity's current position." }
+          elevation: { type: "string" }
         },
         required: ["name", "side"]
       }
@@ -396,9 +363,7 @@ export const deltaEntityTools = [
           maxHp: { type: "number", description: "Maximum HP only when it must be corrected." },
           initiative: { type: "number", description: "Initiative result used to order the entity list." },
           distanceFromPlayer: { type: "string" },
-          elevation: { type: "string" },
-          mapRow: { type: "number", description: "One-based map row for this entity's current position." },
-          mapColumn: { type: "number", description: "One-based map column for this entity's current position." }
+          elevation: { type: "string" }
         },
         required: ["entityId"]
       }

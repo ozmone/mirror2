@@ -21,7 +21,6 @@ import {
 } from "../../data/repositories";
 import { BubbleMode, Character, InventoryUpdateRequest, Message, ModelLibraryEntry } from "../../types";
 import { estimateTokens, now, uid } from "../../utils";
-import { deltaMapPreviewSizes } from "../delta/DeltaMapPrototype";
 import { formatInventoryKg } from "../delta/workspaceSupport";
 import { retrievedSourceNames, summarizeAuditUsage } from "../responseAudit";
 import { LoadingSignal } from "../shared/LoadingSignal";
@@ -265,7 +264,6 @@ function MessageRow({
                   {visibleDeltaRoster.enemies.length > 0 && <div><dt>Enemies</dt><dd>{visibleDeltaRoster.enemies.join(", ")}</dd></div>}
                 </dl>
               )}
-              <span className="delta-brief-map-size">Map size: <b>{message.deltaBrief.mapSize ?? "M"}</b> ({deltaMapPreviewSizes[message.deltaBrief.mapSize ?? "M"].metres}m)</span>
             </div>
             <div className="delta-brief-actions">
               {message.deltaBrief.avoidLabel && (

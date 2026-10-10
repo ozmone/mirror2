@@ -81,16 +81,9 @@ if ("serviceWorker" in navigator) {
     navigator.serviceWorker
       .register("./sw.js", { updateViaCache: "none" })
       .then((registration) => {
-        const notifyUpdate = () => window.dispatchEvent(new CustomEvent("mirror:update-available"));
-        if (registration.waiting) notifyUpdate();
-        registration.addEventListener("updatefound", () => {
-          const installing = registration.installing;
-          if (!installing) return;
-          installing.addEventListener("statechange", () => {
-            if (installing.state === "installed" && navigator.serviceWorker.controller) notifyUpdate();
-          });
-        });
-        return registration.update();
+        // Register the worker for offline support. Updates are installed only
+        // when the user explicitly requests one from the app.
+        return undefined;
       })
       .catch(() => undefined);
   });

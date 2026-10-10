@@ -188,7 +188,7 @@ export function deltaRosterParticipants(text: string) {
       .replace(/\s+/g, " ")
       .trim();
   const participants: { name: string; side: DeltaRelationship }[] = [];
-  const anchorsMatch = /DELTA CONTINUITY ANCHORS:\s*\n([\s\S]*?)(?=\n\n(?:PLAYER CHARACTER|MAP SIZE|PLAYER CHARACTER ID):|$)/i.exec(text);
+  const anchorsMatch = /DELTA CONTINUITY ANCHORS:\s*\n([\s\S]*?)(?=\n\n(?:PLAYER CHARACTER|PLAYER CHARACTER ID):|$)/i.exec(text);
   const anchors = anchorsMatch?.[1] ?? text;
   for (const line of anchors.split(/\r?\n/)) {
     const match = /^\s*(player|your\s+team|team|allies?|ally|neutrals?|neutral|hostiles?|hostile|enemies|enemy)(?:\s+present)?\s*:\s*(.+)$/i.exec(line);

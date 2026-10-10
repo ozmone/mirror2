@@ -60,7 +60,7 @@ import {
 } from "../data/repositories";
 import { buildSourceChunks } from "../data/sources";
 import { formatTracker, formatWorldTime, syncRealtimeWorld } from "../data/world";
-import { Ability, AbilityModifiers, AbilityScores, AppSettings, Character, CharacterActionMacro, CharacterActionSlot, CharacterBonus, CharacterGearSlot, Chat, DeltaAllyCacheEntry, DeltaBaseTemplate, DeltaEffectDefinition, DeltaEffectPolarity, DeltaEntity, DeltaIconAsset, DeltaJobTemplate, DeltaMapSize, DeltaMessage, DeltaPrefixTemplate, DeltaSavingThrowTiming, DeltaSession, GearBodyType, GearSlotName, InventoryItem, InventoryKind, InventoryLog, Memory, Message, ModelLibraryEntry, PendingMemory, Project, RouteName, SidebarSpacing, SidebarWidth, SourceFile, WorldState } from "../types";
+import { Ability, AbilityModifiers, AbilityScores, AppSettings, Character, CharacterActionMacro, CharacterActionSlot, CharacterBonus, CharacterGearSlot, Chat, DeltaAllyCacheEntry, DeltaBaseTemplate, DeltaEffectDefinition, DeltaEffectPolarity, DeltaEntity, DeltaIconAsset, DeltaJobTemplate, DeltaMessage, DeltaPrefixTemplate, DeltaSavingThrowTiming, DeltaSession, GearBodyType, GearSlotName, InventoryItem, InventoryKind, InventoryLog, Memory, Message, ModelLibraryEntry, PendingMemory, Project, RouteName, SidebarSpacing, SidebarWidth, SourceFile, WorldState } from "../types";
 import { formatDate, normaliseTag, now, splitTags, uid } from "../utils";
 import { TimelinePage } from "./timeline/TimelinePage";
 import { ChatScreen } from "./chat/ChatScreen";
@@ -641,7 +641,7 @@ export function App() {
     await refresh();
   }
 
-  async function openDeltaMode(chatOverride?: Chat, startContext = "", mapSize?: DeltaMapSize) {
+  async function openDeltaMode(chatOverride?: Chat, startContext = "") {
     const activeChat = chatOverride ?? selectedChat;
     const activeProject = activeChat ? projects.find((project) => project.id === activeChat.projectId) : selectedProject;
     if (!activeProject || !activeChat) return;
@@ -651,11 +651,6 @@ export function App() {
       : await db.deltaSessions.where("chatId").equals(activeChat.id).and((item) => item.active).first()
         ?? await db.deltaSessions.where("chatId").equals(activeChat.id).and((item) => !item.active).reverse().sortBy("updatedAt").then((items) => items[0]);
     if (!session) return;
-    if (startContext && mapSize && session.mapSize !== mapSize) {
-      const updatedAt = now();
-      await db.deltaSessions.update(session.id, { mapSize, updatedAt });
-      session = { ...session, mapSize, updatedAt };
-    }
     const activeEntities = await db.deltaEntities.where("sessionId").equals(session.id).toArray();
     const linkedEntityNames = new Set(activeEntities.filter((entity) => entity.characterId).map((entity) => entity.name.trim().toLowerCase()));
     const malformedEntityIds = activeEntities
@@ -705,10 +700,9 @@ export function App() {
 
   async function applyUpdate() {
     const registration = await navigator.serviceWorker?.getRegistration?.("./");
-    if (!registration?.waiting) {
-      location.reload();
-      return;
-    }
+    if (!registration) return;
+    if (!registration.waiting) await registration.update();
+    if (!registration.waiting) return;
     navigator.serviceWorker.addEventListener("controllerchange", () => location.reload(), { once: true });
     registration.waiting.postMessage({ type: "SKIP_WAITING" });
   }
@@ -871,7 +865,7 @@ export function App() {
             selectedModelId={selectedModelId}
             models={models}
             deltaLocked={Boolean(selectedChatActiveDelta)}
-            onOpenDelta={(chatOverride, startContext, mapSize) => openDeltaMode(chatOverride, startContext, mapSize)}
+            onOpenDelta={(chatOverride, startContext) => openDeltaMode(chatOverride, startContext)}
             onSettingsSaved={async (modelId) => {
               setSelectedModelId(modelId);
               await refresh();
@@ -1335,7 +1329,7 @@ function Drawer(props: {
           <button className="nav-row" onClick={() => props.onRoute("settings")}>
             <Settings size={18} /> App Settings
           </button>
-          <OpenRouterBalance apiKey={props.apiKey} visible={props.open} />
+          <OpenRouterBalance apiKey={props.apiKey} />
         </div>
       </aside>
     </>
@@ -2691,9 +2685,18 @@ function CharacterEditor({ project, character, chatId, onSaved, onRefresh, onBac
 
   async function addImages(files: FileList | null) {
     if (!files?.length) return;
+    const imageFile = Array.from(files).find((file) => file.type.startsWith("image/"));
+    if (!imageFile) return;
     const timestamp = now();
-    const imageFiles = Array.from(files).filter((file) => file.type.startsWith("image/"));
-    await db.attachments.bulkAdd(imageFiles.map((file) => ({ id: uid(), ownerType: "character" as const, ownerId: character.id, mimeType: file.type, size: file.size, blob: file, createdAt: timestamp, updatedAt: timestamp })));
+    await db.transaction("rw", db.attachments, async () => {
+      await db.attachments.where("[ownerType+ownerId]").equals(["character", character.id]).delete();
+      await db.attachments.add({ id: uid(), ownerType: "character", ownerId: character.id, mimeType: imageFile.type, size: imageFile.size, blob: imageFile, createdAt: timestamp, updatedAt: timestamp });
+    });
+    await loadAttachments();
+  }
+  async function removeImage(id: string) {
+    await db.attachments.delete(id);
+    setViewerIndex(undefined);
     await loadAttachments();
   }
   async function previewTool(division: "identity" | "bio" | "stats") {
@@ -2744,8 +2747,8 @@ function CharacterEditor({ project, character, chatId, onSaved, onRefresh, onBac
           <label>Identity: Personality<textarea value={draft.personality} onChange={(event) => setDraft({ ...draft, personality: event.target.value })} /></label>
           <label>Identity: Misc<textarea value={draft.misc} onChange={(event) => setDraft({ ...draft, misc: event.target.value })} /></label>
           <label>Bio:<textarea className="large-entry" value={draft.bio} onChange={(event) => setDraft({ ...draft, bio: event.target.value })} /></label>
-          <label className="file-pick"><ImageIcon size={18} /> Add images<input type="file" accept="image/*" multiple onChange={(event) => addImages(event.target.files)} /></label>
-          <ImageStrip attachments={attachments} onOpen={setViewerIndex} />
+          <label className="file-pick"><ImageIcon size={18} /> Replace character image<input type="file" accept="image/*" onChange={(event) => { void addImages(event.target.files); event.currentTarget.value = ""; }} /></label>
+          {attachments.length > 0 ? <div className="character-image-manage">{attachments.map((attachment, index) => <div className="character-image-manage-item" key={attachment.id}><button type="button" onClick={() => setViewerIndex(index)} aria-label="Open image"><img src={attachment.url} alt="Character" /></button><button type="button" className="attachment-remove" onClick={() => void removeImage(attachment.id)} aria-label="Remove character image"><X size={13} /></button></div>)}</div> : <p className="muted-pad">No character image attached.</p>}
           <label className="compact-check"><input type="checkbox" checked={draft.statsEnabled} onChange={(event) => setDraft({ ...draft, statsEnabled: event.target.checked })} /> Enable ability scores</label>
           {draft.statsEnabled && <PointBuyEditor project={project} draft={draft} bonuses={bonuses} gearStatBonuses={gearStatBonuses} onDraft={setDraft} />}
           {draft.statsEnabled && <CharacterCarryPreview project={project} character={draft} bonuses={bonuses} gearStatBonuses={gearStatBonuses} inventoryWeightKg={carryInventoryWeightKg} gearWeightKg={carryGearWeightKg} unweighedItemCount={unweighedItemCount} />}

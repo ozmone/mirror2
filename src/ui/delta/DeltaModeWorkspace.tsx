@@ -4,7 +4,6 @@ import {
   Archive,
   Download,
   Edit3,
-  Map as MapIcon,
   Pencil,
   Save,
   Settings,
@@ -44,8 +43,6 @@ import type {
   DeltaEntity,
   DeltaFinishPacket,
   DeltaLootItem,
-  DeltaMapTile,
-  DeltaMapTileKind,
   DeltaMessage,
   DeltaRollReceipt,
   DeltaSession,
@@ -55,7 +52,6 @@ import { formatDate, now, uid } from "../../utils";
 import { characterTools, deltaEntityTools, inventoryTools, type OpenRouterMessage, type OpenRouterResponse, type OpenRouterToolCall } from "../openRouter";
 import { DeltaActionTree } from "./DeltaActionTree";
 import { DeltaVerifiedRollRow } from "./DeltaVerifiedRollRow";
-import { DeltaMapPrototype, deltaMapPreviewSizes } from "./DeltaMapPrototype";
 import { DeltaTurnText, cinematicMarker, cleanDeltaCinematic, deltaRevealLines, deltaRevealStepMs, splitDeltaCinematic } from "./DeltaTurnText";
 import { deltaRelationshipLabel, deltaRelationships, entityDisplayNames, formatEntityNameList, normaliseDeltaRelationship, type DeltaRelationship } from "./display";
 import { deltaDiceImages } from "./config";
@@ -118,7 +114,7 @@ export function DeltaModeWorkspace({
   onRefresh: () => Promise<void>;
 }) {
   const [body, setBody] = useState("");
-  const [activeTool, setActiveTool] = useState<"entities" | "map" | "inventory" | "history" | "actions" | undefined>();
+  const [activeTool, setActiveTool] = useState<"entities" | "inventory" | "history" | "actions" | undefined>();
   const [archiveSettingsOpen, setArchiveSettingsOpen] = useState(false);
   const [actionsEditMode, setActionsEditMode] = useState(false);
   const [entitySettingsOpen, setEntitySettingsOpen] = useState(false);
@@ -376,11 +372,6 @@ export function DeltaModeWorkspace({
   async function runDeltaTool(toolCall: OpenRouterToolCall, turnNumber?: number) {
     const args = deltaToolArgs(toolCall);
     const stringArg = (key: string) => typeof args[key] === "string" ? String(args[key]).trim() : "";
-    const mapCoordinate = (key: "mapRow" | "mapColumn") => {
-      const value = Number(args[key]);
-      const limit = deltaMapPreviewSizes[session.mapSize ?? "M"].cells;
-      return Number.isInteger(value) && value >= 1 && value <= limit ? value : undefined;
-    };
     switch (toolCall.function.name) {
       case "update_inventory_item": {
         if (!project.inventoryEnabled || !settings.autoManageInventory) return { error: "Inventory auto-management is disabled." };
@@ -412,44 +403,6 @@ export function DeltaModeWorkspace({
         await db.deltaSessions.update(session.id, { title, updatedAt: now() });
         return { title };
       }
-      case "set_delta_map": {
-        const { cells } = deltaMapPreviewSizes[session.mapSize ?? "M"];
-        const rawTiles = Array.isArray(args.tiles) ? args.tiles : [];
-        const tilesByCoordinate = new Map<string, DeltaMapTile>();
-        const errors: string[] = [];
-        for (const rawTile of rawTiles) {
-          if (!rawTile || typeof rawTile !== "object") {
-            errors.push("A map tile was not an object.");
-            continue;
-          }
-          const candidate = rawTile as Record<string, unknown>;
-          const row = Math.floor(Number(candidate.row));
-          const column = Math.floor(Number(candidate.column));
-          const kind = typeof candidate.kind === "string" ? candidate.kind.trim().toLowerCase() as DeltaMapTileKind : undefined;
-          if (!Number.isInteger(row) || !Number.isInteger(column) || row < 1 || row > cells || column < 1 || column > cells || !["solid", "half", "special", "access"].includes(kind ?? "")) {
-            errors.push(`Ignored invalid tile at ${String(candidate.row)}, ${String(candidate.column)}.`);
-            continue;
-          }
-          const label = typeof candidate.label === "string" ? candidate.label.trim().slice(0, 80) : "";
-          const color = typeof candidate.color === "string" && /^#[0-9a-f]{6}$/i.test(candidate.color.trim()) ? candidate.color.trim() : undefined;
-          const accessState = candidate.accessState === "open" || candidate.accessState === "locked" || candidate.accessState === "closed" ? candidate.accessState : "closed";
-          if (kind === "special" && (!label || !color)) {
-            errors.push(`Ignored special tile at ${row}, ${column}: special terrain needs a label and hex color.`);
-            continue;
-          }
-          tilesByCoordinate.set(`${row}:${column}`, {
-            row,
-            column,
-            kind: kind as DeltaMapTileKind,
-            ...(label ? { label } : {}),
-            ...(kind === "special" && color ? { color } : {}),
-            ...(kind === "access" ? { accessState } : {})
-          });
-        }
-        const mapTiles = [...tilesByCoordinate.values()];
-        await db.deltaSessions.update(session.id, { mapTiles, updatedAt: now() });
-        return { staged: mapTiles.length, mapSize: session.mapSize ?? "M", cells, ...(errors.length ? { errors } : {}) };
-      }
       case "list_delta_job_categories": {
         const counts = jobCategories(project.deltaJobs ?? []);
         return counts.map(([category, count]) => ({ category, count }));
@@ -476,8 +429,6 @@ export function DeltaModeWorkspace({
             rejectedName: entityName
           };
         }
-        const mapRow = mapCoordinate("mapRow");
-        const mapColumn = mapCoordinate("mapColumn");
         const existingEntity = await db.deltaEntities
           .where("sessionId")
           .equals(session.id)
@@ -494,7 +445,6 @@ export function DeltaModeWorkspace({
               : {};
           const next: Partial<DeltaEntity> = {
             ...patch,
-            ...(mapRow !== undefined && mapColumn !== undefined ? { mapRow, mapColumn } : {}),
             updatedAt: now()
           };
           if (Object.keys(next).length > 1) await db.deltaEntities.update(existingEntity.id, next);
@@ -505,7 +455,6 @@ export function DeltaModeWorkspace({
             templateTag: next.templateTag ?? existingEntity.templateTag ?? "",
             stats: { STR: next.str ?? existingEntity.str, DEX: next.dex ?? existingEntity.dex, CON: next.con ?? existingEntity.con, INT: next.int ?? existingEntity.int, WIS: next.wis ?? existingEntity.wis, CHA: next.cha ?? existingEntity.cha },
             hp: { current: next.currentHp ?? existingEntity.currentHp, max: next.maxHp ?? existingEntity.maxHp },
-            mapPosition: mapRow !== undefined && mapColumn !== undefined ? { row: mapRow, column: mapColumn } : undefined
           };
         }
         const timestamp = now();
@@ -521,7 +470,6 @@ export function DeltaModeWorkspace({
           statusText: stringArg("statusText"),
           distanceFromPlayer: stringArg("distanceFromPlayer"),
           elevation: stringArg("elevation"),
-          ...(mapRow !== undefined && mapColumn !== undefined ? { mapRow, mapColumn } : {}),
           orderIndex: await db.deltaEntities.where("sessionId").equals(session.id).count(),
           createdAt: timestamp,
           updatedAt: timestamp
@@ -803,7 +751,6 @@ export function DeltaModeWorkspace({
           initiative: typeof args.initiative === "number" && Number.isFinite(args.initiative) ? args.initiative : entity.initiative,
           distanceFromPlayer: stringArg("distanceFromPlayer") || entity.distanceFromPlayer,
           elevation: stringArg("elevation") || entity.elevation,
-          ...(mapCoordinate("mapRow") !== undefined && mapCoordinate("mapColumn") !== undefined ? { mapRow: mapCoordinate("mapRow"), mapColumn: mapCoordinate("mapColumn") } : {}),
           updatedAt: now()
         };
         await db.deltaEntities.update(entity.id, next);
@@ -988,8 +935,6 @@ export function DeltaModeWorkspace({
       ].filter(Boolean).join("\n\n")
       : "";
     const linkedCharacters = await linkedCharacterContext();
-    const mapSize = session.mapSize ?? "M";
-    const mapDefinition = session.mapTiles?.map((tile) => `${tile.row},${tile.column}: ${tile.kind}${tile.label ? ` (${tile.label})` : ""}${tile.kind === "special" && tile.color ? ` color=${tile.color}` : ""}${tile.kind === "access" ? ` ${tile.accessState ?? "closed"}` : ""}`).join("; ") || "(not staged)";
     const context = [
       deltaPrompt,
       `Project: ${project.name}`,
@@ -999,7 +944,6 @@ export function DeltaModeWorkspace({
       `Current entity list:\n${currentEntities.map((entity) => `- ${entity.id}: ${entity.name}, ${entity.side}, state=${entity.engagementState ?? (entity.currentHp === 0 ? "ko" : "active")}, HP=${entity.currentHp ?? entity.maxHp ?? "?"}/${entity.maxHp ?? "?"}${entity.characterId ? `, characterId=${entity.characterId}` : ""}${entity.templateTag ? `, ${entity.templateTag}` : ""}${entity.statusText ? `, ${entity.statusText}` : ""}${entityPositionLabel(entity) ? `, ${entityPositionLabel(entity)}` : ""}`).join("\n") || "(none)"}`,
       options.turnActorId ? `Current turn actor: ${currentEntities.find((entity) => entity.id === options.turnActorId)?.name ?? options.turnActorId}` : "",
       inventoryDetails,
-      `Map boundary: ${mapSize}, ${deltaMapPreviewSizes[mapSize].metres}m, ${deltaMapPreviewSizes[mapSize].cells} x ${deltaMapPreviewSizes[mapSize].cells} tiles. Current non-open terrain: ${mapDefinition}`,
       `Chat-scoped ally cache:\n${allyCache.map((entry) => `- ${entry.name}${entry.templateTag ? `, ${entry.templateTag}` : ""}`).join("\n") || "(none)"}`,
       `Available PREFIX labels: ${effectiveDeltaPrefixes(project.deltaPrefixes).map((item) => item.label).join(", ") || "(none)"}`,
       `Available BASE labels: ${effectiveDeltaBases(project.deltaBases).map((item) => item.label).join(", ") || "(none)"}`,
@@ -1009,7 +953,7 @@ export function DeltaModeWorkspace({
         ? "Dialogue scope for this request: respond only to direct speech in the latest player entry currently being processed. Once posted, that dialogue is answered and must not be answered again on later turns."
         : "Dialogue scope for this request: do not answer, paraphrase, continue, or add another cinematic response to player dialogue from any earlier message. That dialogue has already been handled. Resolve only the current roll, action, or current entity turn.",
       options.stageEngagement
-        ? "Current phase: opening a new engagement. Before any transcript response, call set_delta_engagement_name and set_delta_map. The map must use only valid one-based coordinates inside the fixed grid; include only non-open tiles. Special terrain needs a concrete label and hex color. Then create or reconcile the entities from the handoff, assign every participating entity a unique valid mapRow/mapColumn on an open or passable tile, and mark the selected player entity before calling for initiative. Do not treat continuity labels such as Situation, Location, Objective, Map, or Terrain as entities."
+        ? "Current phase: opening a new engagement. Before any transcript response, call set_delta_engagement_name, create or reconcile the entities from the handoff, and mark the selected player entity before calling for initiative. Do not treat continuity labels such as Situation, Location, Objective, or Terrain as entities."
         : ""
     ].filter(Boolean).join("\n\n");
     const requestMessages: OpenRouterMessage[] = [
@@ -2041,7 +1985,6 @@ export function DeltaModeWorkspace({
         <nav className="delta-toolbar" aria-label="Delta tools">
           {!isArchivedSession && <>
             <button className={activeTool === "entities" ? "picked" : ""} onClick={() => requestSettingsNavigation(() => setActiveTool(activeTool === "entities" ? undefined : "entities"))} aria-label="Entity list"><UserRound size={18} /></button>
-            <button className={activeTool === "map" ? "picked" : ""} onClick={() => requestSettingsNavigation(() => setActiveTool(activeTool === "map" ? undefined : "map"))} aria-label="Map"><MapIcon size={18} /></button>
             <button onClick={() => requestSettingsNavigation(onOpenInventory)} aria-label="Inventory"><ShoppingBag size={18} /></button>
           </>}
           <button className={`delta-archive-button ${activeTool === "history" ? "picked" : ""}`} onClick={() => requestSettingsNavigation(() => setActiveTool(activeTool === "history" ? undefined : "history"))} aria-label="Archive"><Archive size={16} /><span>Archive</span></button>
@@ -2057,7 +2000,7 @@ export function DeltaModeWorkspace({
           </div>
         </div>}
         {activeTool && activeTool !== "actions" && (
-          <section className={`delta-tool-panel ${activeTool === "map" ? "delta-map-tool-panel" : ""}`}>
+          <section className="delta-tool-panel">
             {activeTool === "entities" && (
               <>
                 <div className="section-title">
@@ -2180,7 +2123,6 @@ export function DeltaModeWorkspace({
                 )}
               </>
             )}
-            {activeTool === "map" && <DeltaMapPrototype entities={orderedEntities} tiles={session.mapTiles ?? []} size={session.mapSize ?? "M"} />}
             {activeTool === "history" && (
               <div className="stack">
                 <div className="section-title"><h2>Archive</h2><div className="split-actions"><span>{archivedSessions.length}</span><button className={`icon-button ${archiveSettingsOpen ? "picked" : ""}`} onClick={() => setArchiveSettingsOpen(!archiveSettingsOpen)} aria-label="Archive settings" title="Archive settings"><Settings size={16} /></button></div></div>

@@ -217,7 +217,6 @@ export interface Message extends Timestamped {
     playerCharacterId?: string;
     playerCharacterName?: string;
     roster?: DeltaBriefRoster;
-    mapSize?: DeltaMapSize;
     avoidLabel?: string;
     avoidPrompt?: string;
     startedAt?: number;
@@ -310,19 +309,6 @@ export interface DeltaBriefRoster {
   enemies: string[];
 }
 
-export type DeltaMapSize = "S" | "M" | "L" | "XL" | "XXL";
-
-export type DeltaMapTileKind = "solid" | "half" | "special" | "access";
-
-export interface DeltaMapTile {
-  row: number;
-  column: number;
-  kind: DeltaMapTileKind;
-  label?: string;
-  color?: string;
-  accessState?: "open" | "closed" | "locked";
-}
-
 export interface DeltaModeSettings {
   modelId?: string;
   temperature?: number;
@@ -338,8 +324,6 @@ export interface DeltaSession extends Timestamped {
   chatId: string;
   projectId: string;
   title: string;
-  mapSize?: DeltaMapSize;
-  mapTiles?: DeltaMapTile[];
   active: boolean;
   archivedAt?: number;
   initiativeStarted?: boolean;
@@ -436,8 +420,6 @@ export interface DeltaEntity extends Timestamped {
   statusText?: string;
   distanceFromPlayer?: string;
   elevation?: string;
-  mapRow?: number;
-  mapColumn?: number;
   str?: number;
   dex?: number;
   con?: number;

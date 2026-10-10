@@ -30,9 +30,9 @@ import {
 } from "../../data/repositories";
 import { runSourceTool } from "../../data/sources";
 import { applyWorldReply, defaultWorldState, extractWorldMetadata, formatWorldCalendar, worldInstruction } from "../../data/world";
-import { AppSettings, Chat, DeltaMapSize, InventoryUpdateRequest, MainChatAuditRequest, MainChatAuditToolEvent, MainChatMemoryReviewAudit, MainChatRequestAudit, Message, Project, RouteName, SourceFile, WorldReplyMetadata, WorldState, WorldTracker } from "../../types";
+import { AppSettings, Chat, InventoryUpdateRequest, MainChatAuditRequest, MainChatAuditToolEvent, MainChatMemoryReviewAudit, MainChatRequestAudit, Message, Project, RouteName, SourceFile, WorldReplyMetadata, WorldState, WorldTracker } from "../../types";
 import { estimateTokens, now, uid } from "../../utils";
-import { isDeltaModeRequest, normaliseDeltaMapSize } from "../delta/config";
+import { isDeltaModeRequest } from "../delta/config";
 import { abstractDeltaRosterName, fitComposerTextarea, formatInventoryKg, keepComposerVisible, useSavedNotice } from "../delta/workspaceSupport";
 import { characterTools, deltaImminentTools, finalizeTurnTool, imageContextTools, inventoryTools, memoryManagementTools, memoryTools, sourceTools, timelineTools, type OpenRouterMessage, type OpenRouterResponse, type OpenRouterToolCall, type OpenRouterUsage } from "../openRouter";
 import { auditSafeValue, recordModelRequest, sourceAuditVersions } from "../responseAudit";
@@ -99,7 +99,7 @@ export function ChatScreen({
   selectedModelId: string;
   models: { modelId: string; cosmeticName: string; inputPricePerMillionUsd?: number; outputPricePerMillionUsd?: number }[];
   deltaLocked: boolean;
-  onOpenDelta: (chat: Chat, startContext: string, mapSize?: DeltaMapSize) => Promise<void>;
+  onOpenDelta: (chat: Chat, startContext: string) => Promise<void>;
   onSettingsSaved: (modelId: string) => Promise<void>;
   onModelSelected: (modelId: string) => void;
 }) {
@@ -893,7 +893,6 @@ export function ChatScreen({
       handoffContext,
       playerCharacterName,
       roster,
-      mapSize: normaliseDeltaMapSize(args.mapSize),
       avoidLabel: typeof args.avoidLabel === "string" ? args.avoidLabel.trim() : "",
       avoidPrompt: typeof args.avoidPrompt === "string" ? args.avoidPrompt.trim() : ""
     };
@@ -1020,7 +1019,7 @@ export function ChatScreen({
   }
   async function createDeltaBrief(command: string, activeChat: Chat) {
     const activeProject = project;
-    if (!activeProject) return { brief: command, handoffContext: command, playerCharacterName: "", roster: normaliseDeltaBriefRoster(undefined), mapSize: "M" as DeltaMapSize };
+    if (!activeProject) return { brief: command, handoffContext: command, playerCharacterName: "", roster: normaliseDeltaBriefRoster(undefined) };
     const history = await db.messages
       .where("[chatId+branchId+sequence]")
       .between([activeChat.id, activeChat.activeBranchId, Dexie.minKey], [activeChat.id, activeChat.activeBranchId, Dexie.maxKey])
@@ -1029,7 +1028,7 @@ export function ChatScreen({
     const fallbackSource = [...recent].reverse().find((message) => message.role === "assistant")?.body || command;
     const fallbackBrief = fallbackSource.length > 1400 ? `${fallbackSource.slice(0, 1400).trim()}...` : fallbackSource;
     const fallbackHandoff = recent.map((message) => `${message.role}: ${message.body}`).join("\n\n").slice(-1800);
-    if (!settings.apiKey?.trim() || !draftModelId) return { brief: fallbackBrief, handoffContext: fallbackHandoff, playerCharacterName: "", roster: deltaBriefRosterFromContext(fallbackHandoff), mapSize: "M" as DeltaMapSize };
+    if (!settings.apiKey?.trim() || !draftModelId) return { brief: fallbackBrief, handoffContext: fallbackHandoff, playerCharacterName: "", roster: deltaBriefRosterFromContext(fallbackHandoff) };
     try {
       const response = await openRouterRequest({
         model: draftModelId,
@@ -1038,7 +1037,7 @@ export function ChatScreen({
             role: "system",
             content: [
               "Create a concise immersive Delta Mode imminent scene beat from the recent chat context. Return only valid JSON.",
-              "Shape: {\"brief\":\"\",\"handoffContext\":\"\",\"playerCharacterName\":\"\",\"roster\":{\"team\":[],\"neutral\":[],\"enemies\":[]},\"mapSize\":\"M\",\"avoidLabel\":\"\",\"avoidPrompt\":\"\"}",
+              "Shape: {\"brief\":\"\",\"handoffContext\":\"\",\"playerCharacterName\":\"\",\"roster\":{\"team\":[],\"neutral\":[],\"enemies\":[]},\"avoidLabel\":\"\",\"avoidPrompt\":\"\"}",
               "brief: write one to three compact sentences in the same third-person narrative style as the user's roleplay. Continue the exact moment. State the immediate place, what is physically happening, and what pressure forces the engagement. Prefer useful concrete facts over lighting, scent, tension, mood, or movie-trailer atmosphere.",
               "brief: do not carry the participant roster inside prose when the roster rows communicate it more clearly. Do not introduce known characters, summarize a mission, or speak to the user.",
               "brief: do not introduce known characters back to the user with roles or biographies. Use names naturally. If Jaeger or another known character is present, include a brief immersive reaction, gesture, or line when context supports it.",
@@ -1049,7 +1048,6 @@ export function ChatScreen({
               "handoffContext: terse non-roster continuity anchors only. Use Location:, Objective:, Situation:, and Constraint: lines. Preserve exact names, codes, item labels, locations, factions, immediate physical situation, and constraints.",
               "handoffContext length: maximum 8 short lines.",
               "playerCharacterName: the likely player-controlled character name if the context implies one; otherwise use the lead/protagonist character name; otherwise empty.",
-              "mapSize: choose exactly one map boundary based on the immediate scene: S (30m), M (50m), L (80m), XL (100m), or XXL (200m). It is the engagement boundary, not a zoom level. Choose the smallest fair scene boundary.",
               "avoidLabel: use Cancel for a proposed mission/commitment, Escape for immediate danger, or empty if avoidance does not make sense.",
               "avoidPrompt: short question for what the player does to avoid or cancel the engagement."
             ].join("\n")
@@ -1068,10 +1066,10 @@ export function ChatScreen({
       });
       const json = await response.json() as OpenRouterResponse;
       const packet = parseDeltaBriefPacket(json.choices?.[0]?.message?.content ?? "");
-      return { brief: packet.brief || fallbackBrief, handoffContext: packet.handoffContext || fallbackHandoff, playerCharacterName: packet.playerCharacterName, roster: packet.roster, mapSize: packet.mapSize, avoidLabel: packet.avoidLabel, avoidPrompt: packet.avoidPrompt };
+      return { brief: packet.brief || fallbackBrief, handoffContext: packet.handoffContext || fallbackHandoff, playerCharacterName: packet.playerCharacterName, roster: packet.roster, avoidLabel: packet.avoidLabel, avoidPrompt: packet.avoidPrompt };
     } catch (error) {
       if (activeSendRef.current?.controller.signal.aborted) throw error;
-      return { brief: fallbackBrief, handoffContext: fallbackHandoff, playerCharacterName: "", roster: deltaBriefRosterFromContext(fallbackHandoff), mapSize: "M" as DeltaMapSize };
+      return { brief: fallbackBrief, handoffContext: fallbackHandoff, playerCharacterName: "", roster: deltaBriefRosterFromContext(fallbackHandoff) };
     }
   }
   function stopActiveSend() {
@@ -1151,7 +1149,6 @@ export function ChatScreen({
             handoffContext: brief.handoffContext,
             playerCharacterName: brief.playerCharacterName,
             roster: brief.roster,
-            mapSize: brief.mapSize,
             avoidLabel: brief.avoidLabel,
             avoidPrompt: brief.avoidPrompt
           },
@@ -1199,6 +1196,10 @@ export function ChatScreen({
     }
     setAttachmentError("");
     setBody("");
+    // The outgoing message now owns these files. Clear the composer immediately so
+    // attachments do not appear both above the composer and in the message list.
+    setAttachedImages([]);
+    setAttachedFiles([]);
     let chatId = chat?.id;
     let branchId = chat?.activeBranchId;
     let userMessageId: string | undefined;
@@ -1662,7 +1663,6 @@ export function ChatScreen({
           handoffContext: brief.handoffContext,
           playerCharacterName: brief.playerCharacterName,
           roster: brief.roster,
-          mapSize: brief.mapSize,
           avoidLabel: undefined,
           avoidPrompt: undefined
         },
@@ -1709,9 +1709,8 @@ export function ChatScreen({
       `DELTA BRIEF:\n${brief.brief}`,
       handoffContext ? `DELTA CONTINUITY ANCHORS:\n${handoffContext}` : "",
       selectedPlayerName ? `PLAYER CHARACTER:\n${selectedPlayerName}` : "",
-      `MAP SIZE:\n${brief.mapSize ?? "M"}`,
       selectedCharacterId ? `PLAYER CHARACTER ID:\n${selectedCharacterId}` : ""
-    ].filter(Boolean).join("\n\n"), brief.mapSize ?? "M");
+    ].filter(Boolean).join("\n\n"));
   }
 
   const editMessageRef = useRef(editMessage);
