@@ -376,6 +376,11 @@ small {
   box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.02), var(--shadow-soft);
 }
 
+:root[data-display-mode="pc"] .app-shell {
+  width: 100vw;
+  max-width: none;
+}
+
 .update-banner {
   position: absolute;
   z-index: 20;
@@ -404,6 +409,80 @@ small {
 .update-banner button {
   min-height: 30px;
   padding-inline: 10px;
+}
+
+.recovery-reminder {
+  position: fixed;
+  z-index: 100;
+  right: max(14px, env(safe-area-inset-right));
+  bottom: max(14px, env(safe-area-inset-bottom));
+  display: grid;
+  gap: 9px;
+  width: min(330px, calc(100vw - 28px));
+  padding: 12px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, #72c797 54%, var(--line));
+  border-radius: var(--radius-sm);
+  background: var(--glass-strong);
+  box-shadow: var(--shadow-soft);
+}
+
+.recovery-reminder-copy {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+}
+
+.recovery-reminder-copy > svg {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: #72c797;
+}
+
+.recovery-reminder-copy div {
+  display: grid;
+  gap: 2px;
+}
+
+.recovery-reminder-copy strong {
+  font-size: 0.82rem;
+}
+
+.recovery-reminder-copy span {
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.recovery-reminder-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.recovery-reminder-actions button:first-child {
+  min-height: 30px;
+  border-color: color-mix(in srgb, #72c797 58%, var(--line));
+  background: color-mix(in srgb, #72c797 20%, transparent);
+}
+
+.recovery-reminder-actions .icon-button {
+  width: 30px;
+  min-height: 30px;
+  padding: 0;
+}
+
+.recovery-reminder-timer {
+  height: 2px;
+  overflow: hidden;
+  background: var(--line-soft);
+}
+
+.recovery-reminder-timer span {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: #72c797;
+  transition: transform 1s linear;
 }
 
 .loading,
@@ -647,7 +726,7 @@ small {
   transform: translateX(-102%);
   transition: transform 170ms ease;
   padding: calc(var(--sidebar-padding-y) + env(safe-area-inset-top)) var(--sidebar-padding-x) calc(var(--sidebar-padding-y) + env(safe-area-inset-bottom));
-  overflow-y: auto;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   background: var(--glass-strong);
@@ -663,6 +742,7 @@ small {
 .drawer-head {
   min-height: var(--sidebar-head-height);
   padding-bottom: var(--sidebar-head-pad);
+  flex: 0 0 auto;
 }
 
 .drawer-head div {
@@ -678,6 +758,14 @@ small {
 .drawer-section {
   border-top: 1px solid var(--line-soft);
   padding: var(--sidebar-section-pad) 0;
+  flex: 0 0 auto;
+}
+
+.drawer-chats {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .drawer-section .section-title {
@@ -793,14 +881,15 @@ small {
   border-top: 1px solid var(--line-soft);
   padding-top: var(--sidebar-section-pad);
   margin-top: auto;
+  flex: 0 0 auto;
 }
 
 .openrouter-balance {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-top: 8px;
-  padding: 12px var(--sidebar-row-pad) 4px;
+  margin-top: 4px;
+  padding: 6px var(--sidebar-row-pad) 0;
   border-top: 1px solid var(--line-soft);
 }
 

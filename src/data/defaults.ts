@@ -60,6 +60,7 @@ export const defaultSettings = (): AppSettings => {
     createdAt: now,
     updatedAt: now,
     theme: "onyx",
+    displayMode: "mobile",
     accent: "sage",
     font: "system",
     fontSize: "standard",

@@ -27,6 +27,7 @@ import {
   PendingMemory,
   Project,
   SourceFile,
+  ChatSource,
   TimelineEntry,
   Star
 } from "../types";
@@ -50,6 +51,7 @@ export class MirrorDatabase extends Dexie {
   modelLibrary!: Table<ModelLibraryEntry, string>;
   migrationMetadata!: Table<MigrationMetadata, string>;
   sourceFiles!: Table<SourceFile, string>;
+  chatSources!: Table<ChatSource, string>;
   inventoryItems!: Table<InventoryItem, string>;
   inventoryLogs!: Table<InventoryLog, string>;
   deltaSessions!: Table<DeltaSession, string>;
@@ -466,6 +468,9 @@ export class MirrorDatabase extends Dexie {
       await transaction.table("messages").toCollection().modify((message) => {
         if (message.deltaBrief) delete message.deltaBrief.mapSize;
       });
+    });
+    this.version(18).stores({
+      chatSources: "id, [chatId+branchId], [chatId+updatedAt], projectId, chatId, branchId, internal, kind"
     });
   }
 }

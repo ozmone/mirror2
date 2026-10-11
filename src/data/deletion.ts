@@ -28,7 +28,7 @@ export async function deleteProject(projectId: string, database = db) {
   const tables = [database.projects, database.chats, database.branches, database.messages, database.stars,
     database.attachments, database.archives, database.archiveEntries, database.characters, database.characterBonuses,
     database.characterGearSlots, database.characterActionSlots, database.characterActionMacros, database.memories,
-    database.pendingMemories, database.sourceFiles, database.inventoryItems, database.inventoryLogs,
+    database.pendingMemories, database.sourceFiles, database.chatSources, database.inventoryItems, database.inventoryLogs,
     database.deltaSessions, database.deltaMessages, database.deltaEntities, database.deltaAllyCache,
     database.deltaActionMacros, database.deltaEffects, database.deltaIcons, database.timelineEntries];
   await database.transaction("rw", tables, async () => {
@@ -52,7 +52,7 @@ export async function deleteProject(projectId: string, database = db) {
     await database.deltaAllyCache.where("chatId").anyOf(chatIds).delete();
     await database.deltaActionMacros.where("chatId").anyOf(chatIds).delete();
     await database.chats.bulkDelete(chatIds);
-    for (const table of [database.stars, database.memories, database.pendingMemories, database.sourceFiles,
+    for (const table of [database.stars, database.memories, database.pendingMemories, database.sourceFiles, database.chatSources,
       database.inventoryItems, database.inventoryLogs, database.deltaEffects, database.deltaIcons, database.timelineEntries]) {
       await table.where("projectId").equals(projectId).delete();
     }

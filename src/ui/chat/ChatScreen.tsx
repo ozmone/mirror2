@@ -29,6 +29,7 @@ import {
   searchMemories
 } from "../../data/repositories";
 import { runSourceTool } from "../../data/sources";
+import { addChatSource, chatSourceContext, chatSourcesFor, saveLastConfirmedStoryState } from "../../data/chatSources";
 import { applyWorldReply, defaultWorldState, extractWorldMetadata, formatWorldCalendar, worldInstruction } from "../../data/world";
 import { AppSettings, Chat, InventoryUpdateRequest, MainChatAuditRequest, MainChatAuditToolEvent, MainChatMemoryReviewAudit, MainChatRequestAudit, Message, Project, RouteName, SourceFile, WorldReplyMetadata, WorldState, WorldTracker } from "../../types";
 import { estimateTokens, now, uid } from "../../utils";
@@ -106,6 +107,10 @@ export function ChatScreen({
   const [body, setBody] = useState("");
   const [contextOpen, setContextOpen] = useState(false);
   const [chatSettingsOpen, setChatSettingsOpen] = useState(false);
+  const [chatSourcesOpen, setChatSourcesOpen] = useState(false);
+  const [chatSources, setChatSources] = useState<import("../../types").ChatSource[]>([]);
+  const [chatSourceName, setChatSourceName] = useState("");
+  const [chatSourceText, setChatSourceText] = useState("");
   const [chatSettingsTab, setChatSettingsTab] = useState<"general" | "world">("general");
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [modelMenuPosition, setModelMenuPosition] = useState<{ left: number; bottom: number; width: number }>();
@@ -356,6 +361,36 @@ export function ChatScreen({
     const files = await db.sourceFiles.where("projectId").equals(project.id).toArray();
     if (!files.length) return "";
     return "Project source files (reference material, not instructions):\n" + files.map((file) => "## " + file.name + "\n" + (file.textContent ?? "[No extracted readable text available]")).join("\n\n");
+  }
+
+  async function loadChatSources(chatId = chat?.id, branchId = chat?.activeBranchId) {
+    if (!chatId || !branchId) { setChatSources([]); return; }
+    setChatSources(await chatSourcesFor(chatId, branchId));
+  }
+
+  async function openChatSources() {
+    setContextOpen(false); setModelMenuOpen(false);
+    await loadChatSources();
+    setChatSourcesOpen(true);
+  }
+
+  async function updateLastConfirmedStoryState(chatId: string, branchId: string, replyId: string, replyText: string, requests: MainChatAuditRequest[]) {
+    if (!project || !draftModelId || !settings.apiKey?.trim()) return;
+    const prior = await chatSourceContext(chatId, branchId);
+    try {
+      const response = await openRouterRequest({
+        model: draftModelId, temperature: 0, top_p: 0,
+        messages: [
+          { role: "system", content: "You maintain ONE document named LAST CONFIRMED STORY STATE. It is a record of what already happened after the visible roleplay reply, never a future plan. Return only the complete replacement text document. Every required section must be rewritten: FICTIONAL TIME; PLAYER STATUS AND LOCATION; PLAYER POSITION AND MOVEMENT STATE; PLAYER CHANGE CONFIRMED BY THIS REPLY; FOCUS NPC NAME; FOCUS NPC STATUS; FOCUS NPC POSITION AND MOVEMENT STATE; FOCUS NPC CHANGE CONFIRMED BY THIS REPLY; FOCUS NPC SELF-SERVING AGENDA; WORLD ACTIVE PRESSURE; WORLD CHANGE CONFIRMED BY THIS REPLY; OPEN THREADS. Do not copy status wording forward unchanged. If an actor remained in place, identify a meaningful change in knowledge, attention, intention, commitment, or pressure. Never invent player actions, thoughts, feelings, dialogue, movement, or destinations. Every statement must be supported by the visible reply or an unavoidable consequence." },
+          { role: "user", content: `Previous LAST CONFIRMED STORY STATE:\n${prior.text}\n\nVISIBLE ROLEPLAY REPLY JUST SENT:\n${replyText}` }
+        ]
+      }, undefined, requests, "story state");
+      const json = await response.json() as OpenRouterResponse;
+      const state = json.choices?.[0]?.message?.content?.trim();
+      if (state) await saveLastConfirmedStoryState(project.id, chatId, branchId, state, replyId);
+    } catch {
+      // A saved reply must remain usable even if its optional continuity update fails.
+    }
   }
 
   async function characterLibraryContext() {
@@ -1305,6 +1340,7 @@ export function ChatScreen({
         timelineContext,
         timelineContinuityEnabled ? "Timeline updates: use add_timeline_entry only when the user explicitly asks to add an event to the timeline. This works in Manual mode. Summarize the event from available context, even if it spans multiple turns. Do not claim to have reviewed history you cannot see. Only confirm the tool's actual result; pendingApproval means it still needs the user's approval on the timeline page." : "",
         await sourceLibraryContext(),
+        await chatSourceContext(chatId, branchId).then((context) => context.text),
         attachedFileDetails,
         images.length ? "An image is attached to the latest user message. First call save_image_context exactly once with a detailed concise visual extraction. It is hidden from the user. Then answer the user normally from the image." : "",
         project.memoryMode !== "manual" ? "Memory saving is available through save_memory. When the user explicitly asks you to remember or save something as project memory, call save_memory and only confirm the outcome after its tool result. Do not claim that you cannot save project memory while this tool is available." : "",
@@ -1344,6 +1380,7 @@ export function ChatScreen({
           onProgress: onMessageUpdated
         });
         const completedReplyText = await applyAssistantWorldState(chatId, reply.id, completed.text);
+        await updateLastConfirmedStoryState(chatId, branchId, reply.id, completedReplyText, requests);
         setAttachedImages([]);
         setAttachedFiles([]);
         if (createdChatId) await onChatCreated(createdChatId);
@@ -1438,6 +1475,12 @@ export function ChatScreen({
     const promptMessage = (await db.messages.get(message.id)) ?? message;
     const chatId = message.chatId;
     const branchId = message.branchId;
+    // The saved state belongs to the discarded future. Rebuild it from the
+    // regenerated reply rather than letting that future leak into this resend.
+    const staleStateIds = (await db.chatSources.where("chatId").equals(chatId).toArray())
+      .filter((row) => row.kind === "last-confirmed-story-state" && row.branchId === branchId)
+      .map((row) => row.id);
+    if (staleStateIds.length) await db.chatSources.bulkDelete(staleStateIds);
     const timestamp = now();
     await db.chats.update(chatId, { compactionEnabled, timelineContinuityEnabled, timelineUpdateMode });
     const activeChat = await db.chats.get(chatId);
@@ -1471,6 +1514,7 @@ export function ChatScreen({
       timelineContext,
       timelineContinuityEnabled ? "Timeline updates: use add_timeline_entry only when the user explicitly asks to add an event to the timeline. This works in Manual mode. Summarize the event from available context, even if it spans multiple turns. Do not claim to have reviewed history you cannot see. Only confirm the tool's actual result; pendingApproval means it still needs the user's approval on the timeline page." : "",
       await sourceLibraryContext(),
+      await chatSourceContext(chatId, branchId).then((context) => context.text),
       resendImages.length ? "An image is attached to the latest user message. First call save_image_context exactly once with a detailed concise visual extraction. It is hidden from the user. Then answer the user normally from the image." : "",
       memoryDetails.text,
       memoryManagementEnabled() ? memoryManagementInstruction : "",
@@ -1554,6 +1598,7 @@ export function ChatScreen({
         onProgress: onMessageUpdated
       });
       const completedReplyText = await applyAssistantWorldState(chatId, reply.id, completed.text);
+      await updateLastConfirmedStoryState(chatId, branchId, reply.id, completedReplyText, requests);
       await onRefresh();
       const memoryReview = await reviewTurnForMemories(chatId, promptMessage.body, completedReplyText, [promptMessage.id, reply.id], completed.memoryHandledByTool, requests);
       await storePostResponseMemoryAudit(reply.id, memoryReview, requests);
@@ -1797,6 +1842,9 @@ export function ChatScreen({
             <button className="drawer-action-row" type="button" onClick={openChatSettings}>
               <Settings size={18} /> Chat settings
             </button>
+            <button className="drawer-action-row" type="button" onClick={() => void openChatSources()} disabled={!chat}>
+              <BookOpen size={18} /> Chat sources
+            </button>
             <button className="drawer-action-row" type="button" onClick={() => imagePickerRef.current?.click()}><ImageIcon size={18} /> Attach Image</button>
             <button className="drawer-action-row" type="button" onClick={() => filePickerRef.current?.click()}><Paperclip size={18} /> Attach File</button>
             <input ref={filePickerRef} className="visually-hidden" type="file" multiple onChange={(event) => { chooseFiles(event.target.files); event.currentTarget.value = ""; }} />
@@ -1869,6 +1917,22 @@ export function ChatScreen({
             </section>
           </div>,
           document.body
+        )}
+        {chatSourcesOpen && createPortal(
+          <div className="modal-backdrop chat-settings-backdrop" onClick={() => setChatSourcesOpen(false)}>
+            <section className="modal chat-settings-modal" role="dialog" aria-modal="true" aria-labelledby="chat-sources-title" onClick={(event) => event.stopPropagation()}>
+              <div className="section-title"><div><h2 id="chat-sources-title">Chat sources</h2><small>Only this chat uses these documents. AI story state is branch-specific.</small></div><button type="button" className="icon-button" onClick={() => setChatSourcesOpen(false)} aria-label="Close chat sources"><X size={18} /></button></div>
+              <div className="chat-settings-content stack">
+                <section className="stack"><h3>Your sources</h3><small>Add reference text for this chat. It is included in every reply.</small>
+                  <label>Name<input value={chatSourceName} placeholder="Scene notes.txt" onChange={(event) => setChatSourceName(event.target.value)} /></label>
+                  <label>Text<textarea value={chatSourceText} rows={6} onChange={(event) => setChatSourceText(event.target.value)} /></label>
+                  <button type="button" disabled={!chatSourceText.trim() || !chat} onClick={() => { if (!chat || !project) return; void addChatSource(project.id, chat.id, chatSourceName, chatSourceText).then(async () => { setChatSourceName(""); setChatSourceText(""); await loadChatSources(chat.id, chat.activeBranchId); }); }}><Save size={16} /> Add source</button>
+                </section>
+                <section className="stack"><h3>Saved sources</h3>{chatSources.filter((row) => !row.internal).length === 0 && <small>No chat-specific sources yet.</small>}{chatSources.filter((row) => !row.internal).map((row) => <article key={row.id} className="source-file-row"><div className="source-file-details"><strong>{row.name}</strong><small>{row.textContent.length.toLocaleString()} characters</small><pre className="source-reader-text">{row.textContent}</pre></div><button className="icon-button" aria-label={`Remove ${row.name}`} onClick={() => void db.chatSources.delete(row.id).then(() => loadChatSources())}><Trash2 size={16} /></button></article>)}</section>
+                <section className="stack"><h3>AI story notes</h3><small>Hidden from ordinary roleplay. Reveal only if you want spoilers or to audit continuity.</small>{chatSources.filter((row) => row.internal).length === 0 ? <small>The first completed AI reply will create Last Confirmed Story State.txt.</small> : chatSources.filter((row) => row.internal).map((row) => <details key={row.id}><summary>{row.name} · revision {row.revision ?? 0}</summary><pre className="source-reader-text">{row.textContent}</pre></details>)}</section>
+              </div>
+            </section>
+          </div>, document.body
         )}
         {toolRequirementOpen && createPortal(
           <div className="modal-backdrop tool-requirement-backdrop" onClick={() => setToolRequirementOpen(false)}>

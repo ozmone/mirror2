@@ -39,34 +39,6 @@ class RecoveryDatabase extends Dexie {
 }
 
 const recoveryDb = new RecoveryDatabase();
-let automaticRecoveryInstalled = false;
-let automaticRecoveryTimer: number | undefined;
-
-function scheduleAutomaticRecovery() {
-  if (automaticRecoveryTimer !== undefined) window.clearTimeout(automaticRecoveryTimer);
-  automaticRecoveryTimer = window.setTimeout(() => {
-    automaticRecoveryTimer = undefined;
-    const pending = pendingSnapshots.get(db);
-    if (pending) {
-      // A write occurred after the in-flight snapshot began. Capture it once
-      // that snapshot finishes instead of losing it or overlapping full scans.
-      void pending.then(scheduleAutomaticRecovery, scheduleAutomaticRecovery);
-      return;
-    }
-    void createRecoverySnapshot().catch(() => undefined);
-  }, 5_000);
-}
-
-/** Starts one debounced recovery snapshot after successful live-database writes. */
-export function installAutomaticRecoverySnapshots(database = db) {
-  if (automaticRecoveryInstalled || typeof window === "undefined") return;
-  automaticRecoveryInstalled = true;
-  for (const table of database.tables) {
-    table.hook("creating", function () { this.onsuccess = scheduleAutomaticRecovery; });
-    table.hook("updating", function () { this.onsuccess = scheduleAutomaticRecovery; });
-    table.hook("deleting", function () { this.onsuccess = scheduleAutomaticRecovery; });
-  }
-}
 
 function tableNames(database: MirrorDatabase) {
   return database.tables.map((table) => table.name).sort();
@@ -245,10 +217,6 @@ export function createRecoverySnapshot(database = db): Promise<RecoverySnapshot>
 }
 
 async function writeRecoverySnapshot(database: MirrorDatabase): Promise<RecoverySnapshot> {
-  if (automaticRecoveryTimer !== undefined && typeof window !== "undefined") {
-    window.clearTimeout(automaticRecoveryTimer);
-    automaticRecoveryTimer = undefined;
-  }
   const backup = await createFullBackup(database);
   // Read just the index key: loading both previous backups clones the entire
   // database twice, including encoded attachments, on every project save.

@@ -1,4 +1,5 @@
 export type ThemeName = "onyx" | "ivory" | "blue" | "green";
+export type DisplayMode = "mobile" | "pc";
 export type AccentName =
   | "sage"
   | "violet"
@@ -50,6 +51,7 @@ export interface Timestamped {
 
 export interface AppSettings extends Timestamped {
   theme: ThemeName;
+  displayMode?: DisplayMode;
   accent: AccentName;
   font: FontName;
   fontSize: FontSizeName;
@@ -248,7 +250,7 @@ export interface SourceAuditVersion {
 }
 
 export interface MainChatAuditRequest {
-  purpose: "reply" | "compaction" | "memory review" | "timeline continuity";
+  purpose: "reply" | "compaction" | "memory review" | "timeline continuity" | "story state";
   capturedAt: number;
   payload: Record<string, unknown>;
   usage?: { prompt_tokens?: number; completion_tokens?: number };
@@ -521,6 +523,20 @@ export interface SourceFile extends Timestamped {
   /** Deterministic slices of the original file, generated locally for retrieval. */
   sourceChunks?: SourceChunk[];
   sourceIndexUpdatedAt?: number;
+}
+
+/** A local text document scoped to one chat; internal documents are not project sources. */
+export interface ChatSource extends Timestamped {
+  id: string;
+  projectId: string;
+  chatId: string;
+  branchId?: string;
+  name: string;
+  textContent: string;
+  internal: boolean;
+  kind: "source" | "last-confirmed-story-state";
+  confirmedReplyId?: string;
+  revision?: number;
 }
 
 export interface SourceChunk {

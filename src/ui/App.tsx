@@ -3,6 +3,7 @@ import { OpenRouterBalance } from "./OpenRouterBalance";
 import {
   Archive,
   BookOpen,
+  Check,
   ChevronLeft,
   ChevronRight,
   Database,
@@ -35,7 +36,7 @@ import {
 } from "lucide-react";
 import type React from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { createFullBackup, createRecoverySnapshot, installAutomaticRecoverySnapshots, listRecoverySnapshots, mergeFullBackup, parseAndValidateBackup, replaceWithFullBackup, restoreRecoverySnapshot, type RecoverySlot, type RecoverySnapshot } from "../data/backup";
+import { createFullBackup, createRecoverySnapshot, listRecoverySnapshots, mergeFullBackup, parseAndValidateBackup, replaceWithFullBackup, restoreRecoverySnapshot, type RecoverySlot, type RecoverySnapshot } from "../data/backup";
 import { importCastSources, isCastSource } from "../data/castImport";
 import { db, ensureSeedData } from "../data/db";
 import { defaultDeltaJobs, defaultDeltaNpcStats, defaultDeltaSystemPrompt, defaultSettings, effectiveDeltaSystemPrompt } from "../data/defaults";
@@ -522,7 +523,6 @@ export function App() {
 
   useEffect(() => {
     ensureSeedData().then(async () => {
-      installAutomaticRecoverySnapshots();
       const first = await db.projects.orderBy("orderIndex").first();
       setSelectedProjectId(first?.id);
       setReady(true);
@@ -544,6 +544,7 @@ export function App() {
 
   useEffect(() => {
     document.documentElement.dataset.theme = settings.theme;
+    document.documentElement.dataset.displayMode = settings.displayMode === "pc" ? "pc" : "mobile";
     document.documentElement.dataset.font = settings.font;
     document.documentElement.dataset.sidebarSpacing = normaliseSidebarSpacing(settings.sidebarSpacing ?? (settings as AppSettings & { sidebarSize?: unknown }).sidebarSize);
     document.documentElement.dataset.sidebarWidth = normaliseSidebarWidth(settings.sidebarWidth);
@@ -603,12 +604,13 @@ export function App() {
     const chat = await db.chats.get(id);
     if (!chat) return;
     if (!confirm(`Delete chat thread "${chat.title}"? This removes its messages, stars, and linked Timeline continuity entries.`)) return;
-    await db.transaction("rw", [db.chats, db.branches, db.messages, db.stars, db.attachments, db.inventoryItems, db.inventoryLogs, db.deltaSessions, db.deltaMessages, db.deltaEntities, db.deltaAllyCache, db.deltaActionMacros, db.timelineEntries], async () => {
+    await db.transaction("rw", [db.chats, db.branches, db.messages, db.stars, db.attachments, db.chatSources, db.inventoryItems, db.inventoryLogs, db.deltaSessions, db.deltaMessages, db.deltaEntities, db.deltaAllyCache, db.deltaActionMacros, db.timelineEntries], async () => {
       const deltaSessionIds = (await db.deltaSessions.where("chatId").equals(id).primaryKeys()) as string[];
       const messageIds = (await db.messages.where("chatId").equals(id).primaryKeys()) as string[];
       await db.stars.where("chatId").equals(id).delete();
       await deleteMessages(messageIds);
       await db.branches.where("chatId").equals(id).delete();
+      await db.chatSources.where("chatId").equals(id).delete();
       await db.inventoryItems.where("chatId").equals(id).delete();
       await db.inventoryLogs.where("chatId").equals(id).delete();
       if (deltaSessionIds.length) {
@@ -716,6 +718,7 @@ export function App() {
           <button className="icon-button" onClick={() => setUpdateAvailable(false)} aria-label="Dismiss update notice"><X size={16} /></button>
         </div>
       )}
+      <RecoveryBackupReminder active={ready} />
       <Header
         title={title}
         subtitle={route === "chat" ? selectedChat?.title : undefined}
@@ -1296,7 +1299,7 @@ function Drawer(props: {
         ) : (
           <p className="muted-pad">Choose a project before starting a chat.</p>
         )}
-        <DrawerSection title="Chats">
+        <DrawerSection title="Chats" className="drawer-chats">
           {props.chats.length === 0 && <p className="muted-pad">No chats yet.</p>}
           {orderedChats.map((chat) => (
             <div className="nav-chat" key={chat.id}>
@@ -1336,10 +1339,10 @@ function Drawer(props: {
   );
 }
 
-function DrawerSection({ title, action, children }: { title: string; action?: React.ReactNode; children: React.ReactNode }) {
+function DrawerSection({ title, action, className, children }: { title: string; action?: React.ReactNode; className?: string; children: React.ReactNode }) {
   const [collapsed, setCollapsed] = useState(false);
   return (
-    <section className="drawer-section">
+    <section className={`drawer-section ${className ?? ""}`}>
       <div className="section-title"><button className="drawer-section-toggle" onClick={() => setCollapsed((current) => !current)} aria-expanded={!collapsed}><h2>{title}</h2><ChevronRight className={collapsed ? "" : "expanded"} size={15} /></button>{action}</div>
       {!collapsed && children}
     </section>
@@ -2118,6 +2121,11 @@ function SettingsPage({ settings, onRefresh }: { settings: AppSettings; onRefres
               <option value="green">Green</option>
             </select>
           </label>
+          <div className="settings-field settings-field-wide">
+            <span>Layout</span>
+            <InlineSegment label="Layout" value={draft.displayMode ?? "mobile"} options={["mobile", "pc"]} labels={{ mobile: "Mobile", pc: "PC" }} onChange={(displayMode) => setDraft({ ...draft, displayMode })} />
+            <small>PC uses the full window width for chat. Your sidebar width stays the same.</small>
+          </div>
           <div className="settings-field settings-field-wide">
             <span>Accent</span>
             <div className="swatches settings-accent-swatches">{accents.map((accent) => <button key={accent.name} className={draft.accent === accent.name ? "picked" : ""} style={{ background: accent.value }} aria-label={`${accent.name} accent${draft.accent === accent.name ? " (selected)" : ""}`} aria-pressed={draft.accent === accent.name} onClick={() => setDraft({ ...draft, accent: accent.name })} />)}</div>
@@ -3251,6 +3259,70 @@ function StarsPage({ project }: { project?: Project }) {
       ))}
       {openStar && <div className="modal-backdrop" onClick={() => setOpenStar(undefined)}><section className="star-modal" onClick={(event) => event.stopPropagation()}><small>{openStar.role} - {formatDate(openStar.updatedAt)}</small><div className="star-modal-body"><MarkdownText text={openStar.bodyCopy} /></div><div className="split-actions"><button onClick={() => setOpenStar(undefined)}>Close</button><button className="danger" onClick={() => removeStar(openStar.id)}><Trash2 size={18} /> Delete star</button></div></section></div>}
     </Page>
+  );
+}
+
+const RECOVERY_REMINDER_DELAY = 48 * 60 * 60 * 1000;
+const RECOVERY_REMINDER_DURATION = 60;
+
+function RecoveryBackupReminder({ active }: { active: boolean }) {
+  const [visible, setVisible] = useState(false);
+  const [remainingSeconds, setRemainingSeconds] = useState(RECOVERY_REMINDER_DURATION);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+
+  useEffect(() => {
+    if (!active) return;
+    let alive = true;
+    void listRecoverySnapshots().then((snapshots) => {
+      if (!alive) return;
+      const newest = snapshots.reduce<RecoverySnapshot | undefined>((latest, snapshot) => !latest || snapshot.createdAt > latest.createdAt ? snapshot : latest, undefined);
+      const newestTime = newest ? new Date(newest.createdAt).getTime() : 0;
+      if (!Number.isFinite(newestTime) || Date.now() - newestTime >= RECOVERY_REMINDER_DELAY) {
+        setRemainingSeconds(RECOVERY_REMINDER_DURATION);
+        setVisible(true);
+      }
+    }).catch(() => undefined);
+    return () => { alive = false; };
+  }, [active]);
+
+  useEffect(() => {
+    if (!visible || saving || saved) return;
+    const timer = window.setInterval(() => {
+      setRemainingSeconds((current) => {
+        if (current <= 1) {
+          window.clearInterval(timer);
+          setVisible(false);
+          return 0;
+        }
+        return current - 1;
+      });
+    }, 1_000);
+    return () => window.clearInterval(timer);
+  }, [visible, saving, saved]);
+
+  async function save() {
+    if (saving) return;
+    setSaving(true);
+    try {
+      await createRecoverySnapshot();
+      setSaved(true);
+      window.setTimeout(() => setVisible(false), 2_000);
+    } catch {
+      setSaving(false);
+    }
+  }
+
+  if (!visible) return null;
+  return (
+    <aside className="recovery-reminder" role="status" aria-live="polite">
+      <div className="recovery-reminder-copy">
+        <Check size={17} aria-hidden="true" />
+        <div><strong>{saved ? "Backup saved" : "Save a recovery backup?"}</strong><span>{saved ? "Your local recovery copy is up to date." : "It has been 48 hours since your last one."}</span></div>
+      </div>
+      {!saved && <div className="recovery-reminder-actions"><button type="button" onClick={() => void save()} disabled={saving}>{saving ? "Saving…" : "Save backup"}</button><button type="button" className="icon-button" aria-label="Dismiss backup reminder" title="Dismiss" onClick={() => setVisible(false)}><X size={16} /></button></div>}
+      {!saved && <div className="recovery-reminder-timer" aria-label={`Reminder expires in ${remainingSeconds} seconds`}><span style={{ transform: `scaleX(${remainingSeconds / RECOVERY_REMINDER_DURATION})` }} /></div>}
+    </aside>
   );
 }
 
