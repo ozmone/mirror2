@@ -25,7 +25,6 @@ import {
   createMemory,
   findCharacters,
   getCharacterStats,
-  messagesForIncrementalCompaction,
   normaliseInventoryName,
   searchCharacterBackgroundDetails,
   searchMemories
@@ -342,7 +341,7 @@ export function ChatScreen({
     const activeTools = [
       ...(project && sourceFilesMode === "lookup" ? [...sourceTools] : []),
       ...(deltaAvailable ? [...deltaImminentTools] : []),
-      ...(project && charactersMode !== "none" ? [...characterTools] : []),
+      ...(project && charactersMode === "lookup" ? [...characterTools] : []),
       ...(project?.inventoryEnabled && autoManageInventory ? [...inventoryTools] : []),
       ...(project && project.memoryMode !== "manual" ? [...memoryTools] : []),
       ...(memoryManagementEnabled() ? [...memoryManagementTools] : []),
@@ -376,15 +375,19 @@ export function ChatScreen({
     setChatSourcesOpen(true);
   }
 
-  async function updateLastConfirmedStoryState(chatId: string, branchId: string, replyId: string, replyText: string, requests: MainChatAuditRequest[]) {
+  async function updateLastConfirmedStoryState(chatId: string, branchId: string, replyId: string, userText: string, replyText: string, requests: MainChatAuditRequest[]) {
     if (!project || !draftModelId || !settings.apiKey?.trim()) return;
+    // Story status is opt-in: it makes one additional continuity request after
+    // a reply, so ordinary chats retain no hidden state document.
+    const activeChat = await db.chats.get(chatId);
+    if (!activeChat?.world?.storyStatusEnabled) return;
     const prior = await chatSourceContext(chatId, branchId);
     try {
       const response = await openRouterRequest({
         model: draftModelId, temperature: 0, top_p: 0,
         messages: [
-          { role: "system", content: "You maintain ONE document named LAST CONFIRMED STORY STATE. It is a record of what already happened after the visible roleplay reply, never a future plan. Return only the complete replacement text document. Every required section must be rewritten: FICTIONAL TIME; PLAYER STATUS AND LOCATION; PLAYER POSITION AND MOVEMENT STATE; PLAYER CHANGE CONFIRMED BY THIS REPLY; FOCUS NPC NAME; FOCUS NPC STATUS; FOCUS NPC POSITION AND MOVEMENT STATE; FOCUS NPC CHANGE CONFIRMED BY THIS REPLY; FOCUS NPC SELF-SERVING AGENDA; WORLD ACTIVE PRESSURE; WORLD CHANGE CONFIRMED BY THIS REPLY; OPEN THREADS. Do not copy status wording forward unchanged. If an actor remained in place, identify a meaningful change in knowledge, attention, intention, commitment, or pressure. Never invent player actions, thoughts, feelings, dialogue, movement, or destinations. Every statement must be supported by the visible reply or an unavoidable consequence." },
-          { role: "user", content: `Previous LAST CONFIRMED STORY STATE:\n${prior.text}\n\nVISIBLE ROLEPLAY REPLY JUST SENT:\n${replyText}` }
+          { role: "system", content: "Maintain ONE concise document named LAST CONFIRMED STORY STATE. It is a live record of confirmed present story state after this completed turn, not a future plan, instruction, or objective. Return only its complete replacement text, at most 300 words. Use these short sections: TIME; CURRENT SCENE (location, present characters, physical/emotional state only when confirmed); PLAYER'S LAST CONFIRMED ACTION; FOCUS NPC; ACTIVE PRESSURE; OPEN THREADS. Preserve exact names, locations, possessions only when plot-relevant, relationship changes, injuries, discoveries, and commitments. If nothing changed, keep the confirmed fact; do not manufacture a meaningful change. Never invent player actions, thoughts, feelings, dialogue, movement, destinations, or an ongoing goal. A state entry must never make the next reply repeat or continue an action: the newest user message can always redirect the scene." },
+          { role: "user", content: `Previous LAST CONFIRMED STORY STATE:\n${prior.text}\n\nUSER MESSAGE IN THIS COMPLETED TURN:\n${userText}\n\nVISIBLE ROLEPLAY REPLY JUST SENT:\n${replyText}` }
         ]
       }, undefined, requests, "story state");
       const json = await response.json() as OpenRouterResponse;
@@ -599,18 +602,8 @@ export function ChatScreen({
     }
   }
 
-  async function updateCompactionMemory(activeChat: Chat, orderedHistory: Message[], historyLimit: number, rebuild = false, requests?: MainChatAuditRequest[]) {
-    if (!compactionEnabled || historyLimit < 1 || !settings.apiKey?.trim() || !draftModelId) return activeChat.compactionMemory;
-    const hasExistingCompaction = Boolean(activeChat.compactionMemory || activeChat.compactedThroughSequence !== undefined);
-    const historyLimitChanged = hasExistingCompaction && activeChat.compactionHistoryLimit !== undefined && activeChat.compactionHistoryLimit !== historyLimit;
-    rebuild = rebuild || Boolean(activeChat.compactionNeedsRebuild) || historyLimitChanged;
-    const compactedThrough = rebuild ? -1 : activeChat.compactedThroughSequence ?? -1;
-    const expired = messagesForIncrementalCompaction(orderedHistory, historyLimit, compactedThrough);
-    if (!expired.length) {
-      if (rebuild) await db.chats.update(activeChat.id, { compactionMemory: "", compactedThroughSequence: undefined, compactionNeedsRebuild: false, compactionHistoryLimit: historyLimit, updatedAt: now() });
-      else if (hasExistingCompaction && activeChat.compactionHistoryLimit === undefined) await db.chats.update(activeChat.id, { compactionHistoryLimit: historyLimit, updatedAt: now() });
-      return rebuild ? "" : activeChat.compactionMemory;
-    }
+  async function updateCompactionMemory(activeChat: Chat, userText: string, assistantText: string, requests?: MainChatAuditRequest[]) {
+    if (!compactionEnabled || !settings.apiKey?.trim() || !draftModelId || !assistantText.trim()) return activeChat.compactionMemory;
     try {
       const response = await openRouterRequest({
         model: draftModelId,
@@ -618,19 +611,18 @@ export function ChatScreen({
           {
             role: "system",
             content: [
-              "Maintain a compact continuity outline for chat messages that have fallen outside the active message-history limit.",
-              "Return only the updated outline as terse bullet points, not prose and not JSON.",
-              "Preserve major plot events, decisions, relationships, injuries and their causes, deaths, discoveries, unresolved conflicts, exact names, locations, and lasting narrative state changes.",
-              "Do not preserve inventory or gear acquisitions, losses, quantities, currency amounts, item provenance, or inventory-log details. Those are maintained by separate live systems.",
-              "Discard small talk, routine actions, repeated facts, decorative prose, and minor moment-to-moment details. Never add facts that are not present.",
-              rebuild ? "Rebuild the outline only from the supplied expired messages." : "Merge the newly expired messages into the existing outline without duplicating facts."
+              "Maintain compact roleplay continuity. Return only a replacement memory document with exactly these headings: HISTORY COMPACTION: and NOW:.",
+              "NOW is a living, present-focused state created from the latest completed user/AI turn and the prior memory. Keep NOW under 600 words, preferably terse bullets. Record only currently relevant scene facts: exact current location, present actors, immediate situation, confirmed actions, current objective or pressure, unresolved choices, injuries, relationship movement, and story-critical items/hooks. Do not copy dialogue or prose. Do not turn a stated intention into a completed action. The newest user message may change direction at any time; NOW is context, never an instruction to repeat or force an objective.",
+              "Each update asks: what important facts did this latest turn add to NOW; and has an older NOW fact been resolved or deliberately put on the backburner? Move only those settled/deferred facts to HISTORY COMPACTION, rewritten briefly in past tense.",
+              "HISTORY COMPACTION is a terse durable log. Retain plot-critical discoveries, completed decisions/outcomes, named locations, key-item acquisition/loss, lasting injury/death, critical relationship upgrade/downgrade, and hooks that remain relevant. Discard routine movements, small talk, decorative prose, duplicate facts, and transient emotion. Never invent or guess facts. Keep the whole document compact; do not echo the source messages."
             ].join("\n")
           },
           {
             role: "user",
             content: [
-              !rebuild && activeChat.compactionMemory ? `Existing outline:\n${activeChat.compactionMemory}` : "Existing outline:\n(none)",
-              `Newly expired messages:\n${expired.map((message) => `${message.role}: ${message.body}`).join("\n\n")}`
+              activeChat.compactionMemory ? `Existing memory:\n${activeChat.compactionMemory}` : "Existing memory:\n(none)",
+              `Latest completed user message:\n${userText}`,
+              `Latest completed AI reply:\n${assistantText}`
             ].join("\n\n")
           }
         ],
@@ -640,8 +632,7 @@ export function ChatScreen({
       const json = await response.json() as OpenRouterResponse;
       const summary = json.choices?.[0]?.message?.content?.trim();
       if (!summary) return activeChat.compactionMemory;
-      const compactedThroughSequence = Math.max(...expired.map((message) => message.sequence));
-      await db.chats.update(activeChat.id, { compactionMemory: summary, compactedThroughSequence, compactionNeedsRebuild: false, compactionHistoryLimit: historyLimit, updatedAt: now() });
+      await db.chats.update(activeChat.id, { compactionMemory: summary, compactionNeedsRebuild: false, updatedAt: now() });
       return summary;
     } catch {
       return activeChat.compactionMemory;
@@ -1329,9 +1320,9 @@ export function ChatScreen({
       const historyLimit = effectiveHistoryNoLimit ? undefined : optionalNumber(maxHistory);
       await updateTimeline(chatId, requests, contextHistory, historyLimit);
       const timelineContext = timelineContinuityEnabled ? formatTimelineContinuity(await timelineEntries(project.id)) : "";
-      const compactionMemory = activeChat && historyLimit
-        ? await updateCompactionMemory(activeChat, contextHistory, historyLimit, false, requests)
-        : activeChat?.compactionMemory ?? "";
+      // Compaction is refreshed after a completed turn so it always sees the
+      // latest user action together with the reply it produced.
+      const compactionMemory = activeChat?.compactionMemory ?? "";
       const selectedHistory = historyLimit ? contextHistory.slice(-historyLimit) : contextHistory;
       const memoryDetails = await memoryContext(text, selectedHistory);
       // Condensation is handled after a reply. Keeping it out of the send path avoids
@@ -1389,7 +1380,9 @@ export function ChatScreen({
           onProgress: onMessageUpdated
         });
         const completedReplyText = await applyAssistantWorldState(chatId, reply.id, completed.text);
-        await updateLastConfirmedStoryState(chatId, branchId, reply.id, completedReplyText, requests);
+        await updateLastConfirmedStoryState(chatId, branchId, reply.id, text, completedReplyText, requests);
+        const chatAfterReply = await db.chats.get(chatId);
+        if (chatAfterReply && historyLimit) await updateCompactionMemory(chatAfterReply, text, completedReplyText, requests);
         setAttachedImages([]);
         setAttachedFiles([]);
         if (createdChatId) await onChatCreated(createdChatId);
@@ -1503,9 +1496,7 @@ export function ChatScreen({
     const historyLimit = effectiveHistoryNoLimit ? undefined : optionalNumber(maxHistory);
     await updateTimeline(chatId, requests, orderedHistory, historyLimit);
     const timelineContext = timelineContinuityEnabled ? formatTimelineContinuity(await timelineEntries(project.id, db, { chatId, sequence: promptMessage.sequence })) : "";
-    const compactionMemory = activeChat && historyLimit
-      ? await updateCompactionMemory(activeChat, orderedHistory, historyLimit, true, requests)
-      : activeChat?.compactionMemory ?? "";
+    const compactionMemory = activeChat?.compactionMemory ?? "";
     const limitedHistory = historyLimit ? orderedHistory.slice(-historyLimit) : orderedHistory;
     const selectedHistory = limitedHistory.some((row) => row.id === promptMessage.id) ? limitedHistory : [...limitedHistory, promptMessage].sort((a, b) => a.sequence - b.sequence);
     const memoryDetails = await memoryContext(promptMessage.body, selectedHistory);
@@ -1607,7 +1598,9 @@ export function ChatScreen({
         onProgress: onMessageUpdated
       });
       const completedReplyText = await applyAssistantWorldState(chatId, reply.id, completed.text);
-      await updateLastConfirmedStoryState(chatId, branchId, reply.id, completedReplyText, requests);
+      await updateLastConfirmedStoryState(chatId, branchId, reply.id, promptMessage.body, completedReplyText, requests);
+      const chatAfterReply = await db.chats.get(chatId);
+      if (chatAfterReply && historyLimit) await updateCompactionMemory(chatAfterReply, promptMessage.body, completedReplyText, requests);
       await onRefresh();
       const memoryReview = await reviewTurnForMemories(chatId, promptMessage.body, completedReplyText, [promptMessage.id, reply.id], completed.memoryHandledByTool, requests);
       await storePostResponseMemoryAudit(reply.id, memoryReview, requests);
@@ -1879,6 +1872,7 @@ export function ChatScreen({
                 <section className="world-settings stack">
                   <div className="section-title"><h3>World</h3></div>
                   <label>Time mode<select value={world.timeMode} onChange={(event) => setWorld({ ...world, timeMode: event.target.value as WorldState["timeMode"] })}><option value="realtime">Realtime</option><option value="ai">AI Engine</option><option value="disabled">Disabled</option></select></label>
+                  <label className="compact-check"><input type="checkbox" checked={Boolean(world.storyStatusEnabled)} onChange={(event) => setWorld({ ...world, storyStatusEnabled: event.target.checked })} /> Story / character status <small>Update a concise current-scene record after every reply.</small></label>
                   <label className="compact-check"><input type="checkbox" checked={world.calendarEnabled} onChange={(event) => setWorld({ ...world, calendarEnabled: event.target.checked })} /> Calendar</label>
                   {world.calendarEnabled && <div className="world-calendar"><div className="world-calendar-date"><label>Year<input type="number" value={world.calendar.year} onChange={(event) => setWorld({ ...world, calendar: { ...world.calendar, year: Number(event.target.value) || 0 } })} /></label><label>Month<input type="number" value={world.calendar.month} onChange={(event) => setWorld({ ...world, calendar: { ...world.calendar, month: Number(event.target.value) || 1 } })} /></label><label>Day<input type="number" value={world.calendar.day} onChange={(event) => setWorld({ ...world, calendar: { ...world.calendar, day: Number(event.target.value) || 1 } })} /></label></div><div className="world-calendar-year-style"><label>Year prefix<input value={world.calendar.yearPrefix} onChange={(event) => setWorld({ ...world, calendar: { ...world.calendar, yearPrefix: event.target.value } })} /></label><label>Year suffix<input value={world.calendar.yearSuffix} onChange={(event) => setWorld({ ...world, calendar: { ...world.calendar, yearSuffix: event.target.value } })} /></label></div><small className="world-calendar-preview">Preview: {formatWorldCalendar(world)}</small></div>}
                   <label className="compact-check"><input type="checkbox" checked={world.locationTracking} onChange={(event) => setWorld({ ...world, locationTracking: event.target.checked })} /> Location Tracking</label>

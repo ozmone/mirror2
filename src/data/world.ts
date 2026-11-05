@@ -2,6 +2,7 @@ import type { WorldReplyMetadata, WorldState, WorldTracker } from "../types";
 
 export const defaultWorldState = (): WorldState => ({
   timeMode: "disabled",
+  storyStatusEnabled: false,
   fictionalSeconds: 0,
   realtimeUpdatedAt: Date.now(),
   calendarEnabled: false,

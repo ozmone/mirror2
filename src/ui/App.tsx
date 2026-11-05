@@ -2335,8 +2335,8 @@ function CompactionPage({ chat, onRefresh }: { chat: Chat; onRefresh: () => Prom
   return (
     <Page>
       <section className="item-card stack">
-        <p className="notice">Keep this as a compact outline of major plot facts and continuity. Prefer lines like "Jaeger destroyed the company building" over minor moment-to-moment details.</p>
-        <textarea className="large-entry" value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="- Major plot event&#10;- Important thread consequence&#10;- Current unresolved conflict" />
+        <p className="notice">This is refreshed after each completed turn. Use <strong>HISTORY COMPACTION:</strong> for brief, settled past-tense facts, and <strong>NOW:</strong> for the current scene, pressure, and unresolved choices (keep NOW under 600 words). It guides continuity but never forces the next action.</p>
+        <textarea className="large-entry" value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="HISTORY COMPACTION:&#10;- Halle accepted the Sierra-2 operation.&#10;&#10;NOW:&#10;- At the briefing room; Halle has taken the gun.&#10;- Infiltration remains unresolved." />
         <div className="split-actions persistent-actions"><button onClick={save}><Save size={18} /> Save compaction memory</button>{saved && <span className="save-status">Saved</span>}</div>
       </section>
     </Page>

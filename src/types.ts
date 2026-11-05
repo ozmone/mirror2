@@ -166,6 +166,8 @@ export interface WorldTracker {
 
 export interface WorldState {
   timeMode: WorldTimeMode;
+  /** Keeps a concise, branch-specific present-story state after each reply. */
+  storyStatusEnabled?: boolean;
   fictionalSeconds: number;
   realtimeUpdatedAt?: number;
   calendarEnabled: boolean;
