@@ -6,6 +6,7 @@ import {
   Attachment,
   Branch,
   Character,
+  CharacterBackgroundDetail,
   CharacterActionMacro,
   CharacterActionSlot,
   CharacterBonus,
@@ -46,6 +47,7 @@ export class MirrorDatabase extends Dexie {
   characters!: Table<Character, string>;
   characterBonuses!: Table<CharacterBonus, string>;
   characterGearSlots!: Table<CharacterGearSlot, string>;
+  characterBackgroundDetails!: Table<CharacterBackgroundDetail, string>;
   memories!: Table<Memory, string>;
   pendingMemories!: Table<PendingMemory, string>;
   modelLibrary!: Table<ModelLibraryEntry, string>;
@@ -471,6 +473,12 @@ export class MirrorDatabase extends Dexie {
     });
     this.version(18).stores({
       chatSources: "id, [chatId+branchId], [chatId+updatedAt], projectId, chatId, branchId, internal, kind"
+    });
+    this.version(19).stores({
+      characterBackgroundDetails: "id, characterId, projectId, *normalisedTags, updatedAt"
+    });
+    this.version(20).stores({
+      attachments: "id, [ownerType+ownerId], [ownerType+ownerId+createdAt]"
     });
   }
 }

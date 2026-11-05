@@ -24,8 +24,10 @@ import {
   createChat,
   createMemory,
   findCharacters,
+  getCharacterStats,
   messagesForIncrementalCompaction,
   normaliseInventoryName,
+  searchCharacterBackgroundDetails,
   searchMemories
 } from "../../data/repositories";
 import { runSourceTool } from "../../data/sources";
@@ -340,7 +342,7 @@ export function ChatScreen({
     const activeTools = [
       ...(project && sourceFilesMode === "lookup" ? [...sourceTools] : []),
       ...(deltaAvailable ? [...deltaImminentTools] : []),
-      ...(project && charactersMode === "lookup" ? [...characterTools] : []),
+      ...(project && charactersMode !== "none" ? [...characterTools] : []),
       ...(project?.inventoryEnabled && autoManageInventory ? [...inventoryTools] : []),
       ...(project && project.memoryMode !== "manual" ? [...memoryTools] : []),
       ...(memoryManagementEnabled() ? [...memoryManagementTools] : []),
@@ -395,12 +397,17 @@ export function ChatScreen({
 
   async function characterLibraryContext() {
     if (!project || charactersMode === "none") return "";
-    if (charactersMode === "lookup") return "Project character lookup: use find_characters with a character name to retrieve their full identity, biography, and calculated stats together in one lookup. Reuse those details for this turn; no separate section lookups are needed.";
+    const libraryInstructions = project.characterLibraryInstructions?.trim()
+      ? `Character library instructions:\n${project.characterLibraryInstructions.trim()}`
+      : "";
+    if (charactersMode === "lookup") return [
+      "Project character lookup: use find_characters with a character name to retrieve identity, biography, and trait names. Ability scores require get_character_stats using a returned character ID; it also returns traits. Trait names are narrative facts, while their numerical effects are already reflected in the returned totals—never infer or explain a stat bonus from a trait name. Background Details are excluded unless search_character_background_details is explicitly called with a returned character ID. Reuse retrieved details for this turn.",
+      libraryInstructions
+    ].filter(Boolean).join("\n\n");
     const characters = (await db.characters.where("projectId").equals(project.id).toArray())
       .sort((a, b) => (a.orderIndex ?? Number.MAX_SAFE_INTEGER) - (b.orderIndex ?? Number.MAX_SAFE_INTEGER) || a.normalisedName.localeCompare(b.normalisedName));
     if (!characters.length) return "Project character library:\n(none)";
-    const rows = await Promise.all(characters.map(async (character) => {
-      const stats = await characterTemplateStats(project, character);
+    const rows = characters.map((character) => {
       return [
         `## ${character.name}`,
         "Identity:",
@@ -408,12 +415,10 @@ export function ChatScreen({
         `- Gender: ${character.gender || ""}`,
         `- Personality: ${character.personality || ""}`,
         `- Misc: ${character.misc || ""}`,
-        `Bio:\n${character.bio || ""}`,
-        `Stats: STR ${stats.STR}, DEX ${stats.DEX}, CON ${stats.CON}, INT ${stats.INT}, WIS ${stats.WIS}, CHA ${stats.CHA}`,
-        stats.templateTag ? `Template tag: ${stats.templateTag}` : ""
+        `Bio:\n${character.bio || ""}`
       ].filter(Boolean).join("\n");
-    }));
-    return `Project character library:\n${rows.join("\n\n")}`;
+    });
+    return [`Project character library:\n${rows.join("\n\n")}`, "Ability scores and Background Details are excluded from this library context. Use their dedicated character-ID tools only when needed.", libraryInstructions].filter(Boolean).join("\n\n");
   }
 
   async function inventoryContext(chatId: string) {
@@ -666,7 +671,7 @@ export function ChatScreen({
     return Boolean(
       imageContextMessageId
       || chat?.world?.timeMode === "ai"
-      || (project && charactersMode === "lookup")
+      || (project && charactersMode !== "none")
       || (project && sourceFilesMode === "lookup")
       || deltaEngagementEnabled()
       || (project?.inventoryEnabled && autoManageInventory)
@@ -760,7 +765,7 @@ export function ChatScreen({
 
   async function runCharacterTool(toolCall: OpenRouterToolCall) {
     if (!project) return null;
-    if (charactersMode !== "lookup") return { error: "Character lookup is disabled." };
+    if (charactersMode === "none") return { error: "Character lookup is disabled." };
     let args: Record<string, unknown> = {};
     try {
       args = JSON.parse(toolCall.function.arguments || "{}") as Record<string, unknown>;
@@ -770,6 +775,10 @@ export function ChatScreen({
     switch (toolCall.function.name) {
       case "find_characters":
         return findCharacters(project.id, typeof args.nameQuery === "string" ? args.nameQuery : "");
+      case "get_character_stats":
+        return getCharacterStats(project.id, typeof args.characterId === "string" ? args.characterId : "");
+      case "search_character_background_details":
+        return searchCharacterBackgroundDetails(project.id, typeof args.characterId === "string" ? args.characterId : "", typeof args.query === "string" ? args.query : "");
       default:
         return { error: `Unknown tool ${toolCall.function.name}.` };
     }

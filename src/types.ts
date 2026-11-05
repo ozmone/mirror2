@@ -104,6 +104,8 @@ export interface Project extends Timestamped {
   orderIndex: number;
   pinned: boolean;
   instructions: string;
+  /** Project-scoped guidance used only when the character library is in context. */
+  characterLibraryInstructions?: string;
   worldSetting: string;
   bubbleMode?: BubbleMode;
   entryWidth?: number;
@@ -600,6 +602,14 @@ export interface Character extends Timestamped {
   buildMode?: "template" | "custom";
   customJobName?: string;
   gearBodyType?: GearBodyType;
+}
+
+export interface CharacterBackgroundDetail extends Timestamped {
+  projectId: string;
+  characterId: string;
+  text: string;
+  tags: string[];
+  normalisedTags: string[];
 }
 
 export interface CharacterBonus extends Timestamped {

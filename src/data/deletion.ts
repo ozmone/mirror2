@@ -13,9 +13,10 @@ export async function deleteMessages(messageIds: string[], database = db) {
 
 export async function deleteCharacters(characterIds: string[], database = db) {
   if (!characterIds.length) return;
-  await database.transaction("rw", [database.characters, database.characterBonuses, database.characterGearSlots, database.characterActionSlots, database.characterActionMacros, database.attachments], async () => {
+  await database.transaction("rw", [database.characters, database.characterBonuses, database.characterGearSlots, database.characterBackgroundDetails, database.characterActionSlots, database.characterActionMacros, database.attachments], async () => {
     await database.characterBonuses.where("characterId").anyOf(characterIds).delete();
     await database.characterGearSlots.where("characterId").anyOf(characterIds).delete();
+    await database.characterBackgroundDetails.where("characterId").anyOf(characterIds).delete();
     const slotIds = await database.characterActionSlots.where("characterId").anyOf(characterIds).primaryKeys();
     if (slotIds.length) await database.characterActionMacros.where("slotId").anyOf(slotIds).delete();
     await database.characterActionSlots.where("characterId").anyOf(characterIds).delete();
@@ -27,7 +28,7 @@ export async function deleteCharacters(characterIds: string[], database = db) {
 export async function deleteProject(projectId: string, database = db) {
   const tables = [database.projects, database.chats, database.branches, database.messages, database.stars,
     database.attachments, database.archives, database.archiveEntries, database.characters, database.characterBonuses,
-    database.characterGearSlots, database.characterActionSlots, database.characterActionMacros, database.memories,
+    database.characterGearSlots, database.characterBackgroundDetails, database.characterActionSlots, database.characterActionMacros, database.memories,
     database.pendingMemories, database.sourceFiles, database.chatSources, database.inventoryItems, database.inventoryLogs,
     database.deltaSessions, database.deltaMessages, database.deltaEntities, database.deltaAllyCache,
     database.deltaActionMacros, database.deltaEffects, database.deltaIcons, database.timelineEntries];

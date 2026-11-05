@@ -1,9 +1,9 @@
-import Dexie from "dexie";
 import { OpenRouterBalance } from "./OpenRouterBalance";
 import {
   Archive,
   BookOpen,
   Check,
+  CircleHelp,
   ChevronLeft,
   ChevronRight,
   Database,
@@ -34,6 +34,7 @@ import {
   X,
   Zap
 } from "lucide-react";
+import Dexie from "dexie";
 import type React from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createFullBackup, createRecoverySnapshot, listRecoverySnapshots, mergeFullBackup, parseAndValidateBackup, replaceWithFullBackup, restoreRecoverySnapshot, type RecoverySlot, type RecoverySnapshot } from "../data/backup";
@@ -50,9 +51,6 @@ import {
   effectiveDeltaPrefixes,
   formatDeltaTemplateTag,
   generatedDeltaStats,
-  getCharacterBio,
-  getCharacterIdentity,
-  getCharacterStats,
   getOrCreateDeltaSession,
   normaliseInventoryName,
   refreshActiveDeltaCharacterStats,
@@ -61,7 +59,7 @@ import {
 } from "../data/repositories";
 import { buildSourceChunks } from "../data/sources";
 import { formatTracker, formatWorldTime, syncRealtimeWorld } from "../data/world";
-import { Ability, AbilityModifiers, AbilityScores, AppSettings, Character, CharacterActionMacro, CharacterActionSlot, CharacterBonus, CharacterGearSlot, Chat, DeltaAllyCacheEntry, DeltaBaseTemplate, DeltaEffectDefinition, DeltaEffectPolarity, DeltaEntity, DeltaIconAsset, DeltaJobTemplate, DeltaMessage, DeltaPrefixTemplate, DeltaSavingThrowTiming, DeltaSession, GearBodyType, GearSlotName, InventoryItem, InventoryKind, InventoryLog, Memory, Message, ModelLibraryEntry, PendingMemory, Project, RouteName, SidebarSpacing, SidebarWidth, SourceFile, WorldState } from "../types";
+import { Ability, AbilityModifiers, AbilityScores, AppSettings, Character, CharacterActionMacro, CharacterActionSlot, CharacterBackgroundDetail, CharacterBonus, CharacterGearSlot, Chat, DeltaAllyCacheEntry, DeltaBaseTemplate, DeltaEffectDefinition, DeltaEffectPolarity, DeltaEntity, DeltaIconAsset, DeltaJobTemplate, DeltaMessage, DeltaPrefixTemplate, DeltaSavingThrowTiming, DeltaSession, GearBodyType, GearSlotName, InventoryItem, InventoryKind, InventoryLog, Memory, Message, ModelLibraryEntry, PendingMemory, Project, RouteName, SidebarSpacing, SidebarWidth, SourceFile, WorldState } from "../types";
 import { formatDate, normaliseTag, now, splitTags, uid } from "../utils";
 import { TimelinePage } from "./timeline/TimelinePage";
 import { ChatScreen } from "./chat/ChatScreen";
@@ -73,7 +71,7 @@ import { ProjectIcon, projectIcons } from "./icons";
 import { HpSquares } from "./shared/HpSquares";
 import { MarkdownText } from "./shared/MarkdownText";
 import { EmptyState, ImageStrip, ImageViewer, MothMark } from "./shared/appElements";
-import { useAttachmentImages } from "./shared/useAttachmentImages";
+import { useAttachmentImagePage, useAttachmentImages } from "./shared/useAttachmentImages";
 
 const accents = [
   { name: "sage", value: "#8fbea8" },
@@ -779,7 +777,6 @@ export function App() {
               chatId={selectedChat?.id}
               onSaved={() => setGearRefreshVersion((current) => current + 1)}
               onBack={() => setGearEditingCharacterId(undefined)}
-              onDeleted={() => setGearEditingCharacterId(undefined)}
             />
           </section>
         </div>
@@ -884,7 +881,7 @@ export function App() {
         {route === "stars" && <StarsPage project={selectedProject} />}
         {route === "archives" && <ArchivesPage project={selectedProject} />}
         {route === "characters" && <CharactersPage project={selectedProject} onOpenProfile={(id) => { setProfileCharacterId(id); setRoute("characterProfile"); }} />}
-        {route === "characterProfile" && selectedProject && profileCharacterId && <CharacterProfilePage project={selectedProject} characterId={profileCharacterId} chatId={selectedChat?.id} onBack={() => setRoute("characters")} onDeleted={() => { setProfileCharacterId(undefined); setRoute("characters"); }} />}
+        {route === "characterProfile" && selectedProject && profileCharacterId && <CharacterProfilePage project={selectedProject} characterId={profileCharacterId} chatId={selectedChat?.id} onBack={() => setRoute("characters")} />}
         {route === "timeline" && <TimelinePage key={selectedProjectId} project={selectedProject} settings={settings} selectedModelId={selectedModelId} onOpenChat={async (id) => { await selectChat(id); setRoute("chat"); }} />}
         {route === "memories" && <MemoriesPage project={selectedProject} />}
         {route === "compaction" && selectedChat && <CompactionPage chat={selectedChat} onRefresh={refresh} />}
@@ -1463,9 +1460,9 @@ function ProjectCard({ project, active, onSelect, onEdit, onRefresh, dragging, d
   );
 }
 
-function ProjectEditPage({ project, initialTab = "general", onRefresh, onDone }: { project: Project; initialTab?: "general" | "delta"; onRefresh: () => Promise<void>; onDone: () => void }) {
+function ProjectEditPage({ project, initialTab = "general", onRefresh, onDone }: { project: Project; initialTab?: "general" | "characters" | "delta"; onRefresh: () => Promise<void>; onDone: () => void }) {
   const [draft, setDraft] = useState(project);
-  const [tab, setTab] = useState<"general" | "delta">(initialTab);
+  const [tab, setTab] = useState<"general" | "characters" | "delta">(initialTab);
   const [deltaTab, setDeltaTab] = useState<"system" | "values" | "prefix" | "base" | "job" | "effects">("system");
   const [deltaStats, setDeltaStats] = useState<AbilityScores>(cleanAbilityScores(project.deltaDefaultNpcStats));
   const [deltaPrefixes, setDeltaPrefixes] = useState<DeltaPrefixTemplate[]>(effectiveDeltaPrefixes(project.deltaPrefixes));
@@ -1509,6 +1506,7 @@ function ProjectEditPage({ project, initialTab = "general", onRefresh, onDone }:
     <Page>
       <div className="settings-tabs">
         <button className={tab === "general" ? "picked" : ""} onClick={() => setTab("general")}><Folder size={18} /> General</button>
+        <button className={tab === "characters" ? "picked" : ""} onClick={() => setTab("characters")}><UserRound size={18} /> Characters</button>
         <button className={tab === "delta" ? "picked" : ""} onClick={() => setTab("delta")}><Swords size={18} /> Delta</button>
       </div>
       {tab === "general" && (
@@ -1546,6 +1544,22 @@ function ProjectEditPage({ project, initialTab = "general", onRefresh, onDone }:
         <SourceFilesSection project={project} />
         <div className="split-actions persistent-actions"><button onClick={save}><Save size={18} /> Save</button><button className="done-button" onClick={onDone}>Done</button>{saved && <span className="save-status">Saved</span>}</div>
       </section>
+      )}
+      {tab === "characters" && (
+        <section className="item-card stack">
+          <div className="section-title"><h2>Character Library</h2></div>
+          <p className="notice">These instructions apply only when this project's character library is included or searched. They are sent before the AI decides whether to look up a character.</p>
+          <label>
+            Character library instructions
+            <textarea
+              className="large-entry"
+              value={draft.characterLibraryInstructions ?? ""}
+              onChange={(event) => setDraft({ ...draft, characterLibraryInstructions: event.target.value })}
+              placeholder={'Treat names inside "(brackets)" as real identities usually kept confidential from public knowledge.'}
+            />
+          </label>
+          <div className="split-actions persistent-actions"><button onClick={save}><Save size={18} /> Save</button><button className="done-button" onClick={onDone}>Done</button>{saved && <span className="save-status">Saved</span>}</div>
+        </section>
       )}
       {tab === "delta" && (
         <>
@@ -2439,6 +2453,7 @@ export function CharactersPage({ project, onOpenProfile }: { project?: Project; 
   const [loadingSources, setLoadingSources] = useState(false);
   const [importing, setImporting] = useState(false);
   const [importResult, setImportResult] = useState<{ projectId: string; message: string; error?: boolean }>();
+  const [castFormatHelpOpen, setCastFormatHelpOpen] = useState(false);
   const [draggedCharacterId, setDraggedCharacterId] = useState<string>();
   const [managing, setManaging] = useState(false);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
@@ -2517,11 +2532,11 @@ export function CharactersPage({ project, onOpenProfile }: { project?: Project; 
   }
   return (
     <Page>
-      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-        <button onClick={add} disabled={importing}><Plus size={18} /> Add character</button>
-        <button onClick={() => void openSourcePicker()} disabled={importing || loadingSources}>{importing ? "Importing characters…" : loadingSources ? "Loading source files…" : "Import characters from source files"}</button>
+      <div className="character-library-actions" aria-label="Character library actions">
+        <button onClick={add} disabled={importing}><Plus size={17} /> Add Character</button>
+        <button onClick={() => void openSourcePicker()} disabled={importing || loadingSources}>{loadingSources ? "Loading…" : "Import"}</button>
+        <button aria-label="Manage characters" onClick={() => setManaging(true)} disabled={!characters.length || managing}>Manage</button>
       </div>
-      {characters.length > 0 && !managing && <button onClick={() => setManaging(true)}>Manage characters</button>}
       {managing && <div className="character-manage-toolbar" role="group" aria-label="Manage characters">
         <strong role="status">{selectedIds.length} selected</strong>
         <button disabled={deleting} onClick={() => setSelectedIds(selectedIds.length === characters.length ? [] : characters.map((character) => character.id))}>{selectedIds.length === characters.length ? "Deselect all" : "Select all"}</button>
@@ -2529,11 +2544,14 @@ export function CharactersPage({ project, onOpenProfile }: { project?: Project; 
         <button disabled={deleting} onClick={() => { setManaging(false); setSelectedIds([]); setDeleteError(""); }}>Done</button>
       </div>}
       {deleteError && <p className="error" role="alert">{deleteError}</p>}
-      {sourcePicker?.projectId === projectId && <fieldset disabled={importing}>
-        <legend>Choose source files to import</legend>
+      {sourcePicker?.projectId === projectId && <div className="modal-backdrop" onClick={() => { if (!importing) { setSourcePicker(undefined); setSelectedSourceIds([]); } }}>
+        <section className="modal character-import-modal" role="dialog" aria-modal="true" aria-labelledby="character-import-title" onClick={(event) => event.stopPropagation()}>
+        <div className="section-title"><h2 id="character-import-title">Import Characters</h2><button className="icon-button" type="button" onClick={() => setCastFormatHelpOpen(true)} aria-label="Show CAST markdown import format" title="CAST markdown import format"><CircleHelp size={18} /></button></div>
+        <fieldset disabled={importing}>
+        <legend>Choose source files</legend>
         {sourcePicker.files.length ? <>
           <p className="notice">Select the files to process. Each import creates new character entries, including names already in your library.</p>
-          <div style={{ display: "grid", gap: 8, maxHeight: 280, overflowY: "auto" }}>
+          <div className="character-import-file-list">
             {sourcePicker.files.map((file) => <label key={file.id} style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <input type="checkbox" style={{ width: "auto" }} checked={selectedSourceIds.includes(file.id)} onChange={(event) => setSelectedSourceIds((ids) => event.target.checked ? [...ids, file.id] : ids.filter((id) => id !== file.id))} />
               {file.name}
@@ -2544,7 +2562,21 @@ export function CharactersPage({ project, onOpenProfile }: { project?: Project; 
           <button onClick={() => { setSourcePicker(undefined); setSelectedSourceIds([]); }}>Cancel</button>
           <button disabled={!selectedSourceIds.length || importing} onClick={() => void importCharacters()}>{importing ? "Importing…" : `Import selected files (${selectedSourceIds.length})`}</button>
         </div>
-      </fieldset>}
+      </fieldset>
+        </section>
+      </div>}
+      {castFormatHelpOpen && <div className="modal-backdrop cast-import-help-backdrop" onClick={() => setCastFormatHelpOpen(false)}>
+        <section className="modal cast-import-help" role="dialog" aria-modal="true" aria-labelledby="cast-import-help-title" onClick={(event) => event.stopPropagation()}>
+          <div className="section-title">
+            <div><h2 id="cast-import-help-title">CAST Markdown format</h2><small>Name the source file <code>CAST_&lt;group&gt;.md</code>, for example <code>CAST_Main.md</code>.</small></div>
+            <button className="icon-button" type="button" onClick={() => setCastFormatHelpOpen(false)} aria-label="Close CAST markdown format"><X size={18} /></button>
+          </div>
+          <p>Use one heading per character and keep their details below it. This is the recommended format; the importer can also read ordinary prose, lists, tables, and sparse notes.</p>
+          <pre className="cast-import-example">{`## Mara Venn\n\nAge: 29\nGender: Woman\nPersonality: Calm under pressure; fiercely loyal.\nAppearance: Black hair, grey eyes, and a weathered flight jacket.\nRole: Smuggler and former reconnaissance pilot.\n\nMara keeps a battered star chart from her missing brother. She distrusts the Coalition after they abandoned her squad during the siege of Eros.`}</pre>
+          <p className="notice">The importer preserves the text it finds. Fields such as age or gender are optional; a name and a short description are enough.</p>
+          <div className="split-actions"><button type="button" onClick={() => setCastFormatHelpOpen(false)}>Close</button></div>
+        </section>
+      </div>}
       {importResult?.projectId === projectId && <p className={importResult.error ? "error" : "notice"} role={importResult.error ? "alert" : "status"}>{importResult.message}</p>}
       <div className="character-gallery">
         {characters.map((character) => (
@@ -2626,18 +2658,27 @@ function CharacterTile({ character, dragging, managing, selected, disabled, onHo
   );
 }
 
-function CharacterProfilePage({ project, characterId, chatId, onSaved, onBack, onDeleted }: { project: Project; characterId: string; chatId?: string; onSaved?: () => void; onBack: () => void; onDeleted: () => void }) {
+function CharacterProfilePage({ project, characterId, chatId, onSaved, onBack }: { project: Project; characterId: string; chatId?: string; onSaved?: () => void; onBack: () => void }) {
   const [character, setCharacter] = useState<Character>();
+  const [galleryOpen, setGalleryOpen] = useState(false);
   async function load() {
     const row = await db.characters.get(characterId);
     if (row?.projectId === project.id) setCharacter(row);
   }
   useEffect(() => { load(); }, [characterId, project.id]);
   if (!character) return <EmptyState title="Character not found" body="This character could not be opened in the selected project." />;
-  return <Page><CharacterEditor project={project} character={character} chatId={chatId} onSaved={onSaved} onRefresh={load} onBack={onBack} onDeleted={onDeleted} /></Page>;
+  if (galleryOpen) return <CharacterGallery character={character} onBack={() => setGalleryOpen(false)} />;
+  return (
+    <Page>
+      <nav className="character-profile-nav" aria-label="Character profile navigation">
+        <button className="character-back-button" type="button" onClick={onBack}><ChevronLeft size={18} /> Back to characters</button>
+      </nav>
+      <CharacterEditor project={project} character={character} chatId={chatId} onSaved={onSaved} onRefresh={load} onOpenGallery={() => setGalleryOpen(true)} />
+    </Page>
+  );
 }
 
-function CharacterEditor({ project, character, chatId, onSaved, onRefresh, onBack, onDeleted }: { project: Project; character: Character; chatId?: string; onSaved?: () => void; onRefresh: () => Promise<void>; onBack: () => void; onDeleted: () => void }) {
+function CharacterEditor({ project, character, chatId, onSaved, onRefresh, onOpenGallery }: { project: Project; character: Character; chatId?: string; onSaved?: () => void; onRefresh: () => Promise<void>; onOpenGallery: () => void }) {
   const [draft, setDraft] = useState(character);
   const [editing, setEditing] = useState(false);
   const { images: attachments, refresh: loadAttachments } = useAttachmentImages("character", character.id);
@@ -2683,7 +2724,15 @@ function CharacterEditor({ project, character, chatId, onSaved, onRefresh, onBac
       normalisedName: normaliseTag(draft.name),
       updatedAt: now()
     };
-    await db.characters.put(savedCharacter);
+    const timestamp = now();
+    const savedTraits = bonuses
+      .filter((bonus) => bonus.name.trim())
+      .map((bonus) => ({ ...bonus, characterId: character.id, name: bonus.name.trim(), updatedAt: timestamp }));
+    await db.transaction("rw", db.characters, db.characterBonuses, async () => {
+      await db.characters.put(savedCharacter);
+      await db.characterBonuses.where("characterId").equals(character.id).delete();
+      await db.characterBonuses.bulkPut(savedTraits);
+    });
     await refreshActiveDeltaCharacterStats(project, savedCharacter);
     setEditing(false);
     showSaved();
@@ -2693,57 +2742,36 @@ function CharacterEditor({ project, character, chatId, onSaved, onRefresh, onBac
 
   async function addImages(files: FileList | null) {
     if (!files?.length) return;
-    const imageFile = Array.from(files).find((file) => file.type.startsWith("image/"));
-    if (!imageFile) return;
+    const imageFiles = Array.from(files).filter((file) => file.type.startsWith("image/"));
+    if (!imageFiles.length) return;
     const timestamp = now();
     await db.transaction("rw", db.attachments, async () => {
-      await db.attachments.where("[ownerType+ownerId]").equals(["character", character.id]).delete();
-      await db.attachments.add({ id: uid(), ownerType: "character", ownerId: character.id, mimeType: imageFile.type, size: imageFile.size, blob: imageFile, createdAt: timestamp, updatedAt: timestamp });
+      await db.attachments.bulkAdd(imageFiles.map((file, index) => ({ id: uid(), ownerType: "character" as const, ownerId: character.id, name: file.name, mimeType: file.type, size: file.size, blob: file, createdAt: timestamp + index, updatedAt: timestamp + index })));
     });
     await loadAttachments();
   }
-  async function removeImage(id: string) {
-    await db.attachments.delete(id);
-    setViewerIndex(undefined);
+  async function removeImage(id: string) { await db.attachments.delete(id); await loadAttachments(); }
+  async function makeMainImage(id: string) {
+    const currentMain = attachments[0];
+    if (!currentMain || currentMain.id === id) return;
+    const [mainRow, nextRow] = await Promise.all([db.attachments.get(currentMain.id), db.attachments.get(id)]);
+    if (!mainRow || !nextRow) return;
+    await db.transaction("rw", db.attachments, async () => {
+      await db.attachments.update(mainRow.id, { createdAt: nextRow.createdAt, updatedAt: now() });
+      await db.attachments.update(nextRow.id, { createdAt: mainRow.createdAt, updatedAt: now() });
+    });
     await loadAttachments();
   }
-  async function previewTool(division: "identity" | "bio" | "stats") {
-    const result =
-      division === "identity"
-        ? await getCharacterIdentity(character.projectId, character.id)
-        : division === "bio"
-          ? await getCharacterBio(character.projectId, character.id)
-          : await getCharacterStats(character.projectId, character.id);
-    alert(JSON.stringify(result, null, 2));
-  }
-  async function removeCharacter() {
-    if (!confirm(`Delete ${character.name}? This removes the character profile, attached character images, and stat bonuses.`)) return;
-    await deleteCharacters([character.id]);
-    onDeleted();
-  }
   return (
-    <section className="item-card character-card">
-      <div className="character-head">
+    <section className={`item-card character-card${editing ? "" : " dossier-profile"}`}>
+      {editing && <div className="character-head">
         <div>
           <h2>Name: {character.name}</h2>
           <p>Identity: {character.age || "Age"}, {character.gender || "Gender"}, {character.personality || "Personality"}, {character.misc || "Misc"}</p>
         </div>
         <button onClick={() => setEditing(!editing)}><Edit3 size={18} /> {editing ? "Close" : "Edit"}</button>
-      </div>
-      {!editing && (
-        <div className="character-display">
-          <div className="character-summary-row">
-            {attachments[0] && <img className="profile-side-image" src={attachments[0].url} alt="" />}
-            {character.statsEnabled && <StatsDisplay project={project} character={character} bonuses={bonuses} gearStatBonuses={gearStatBonuses} />}
-          </div>
-          <p className="bio-full"><strong>Bio:</strong> {character.bio || "No bio saved yet."}</p>
-          <div className="split-actions">
-            <button onClick={() => previewTool("identity")}><Eye size={18} /> Identity</button>
-            <button onClick={() => previewTool("bio")}><Eye size={18} /> Bio</button>
-            <button onClick={() => previewTool("stats")}><Eye size={18} /> Stats</button>
-          </div>
-        </div>
-      )}
+      </div>}
+      {!editing && <CharacterProfileView project={project} character={character} attachments={attachments} bonuses={bonuses} gearStatBonuses={gearStatBonuses} inventoryWeightKg={carryInventoryWeightKg} gearWeightKg={carryGearWeightKg} onEdit={() => setEditing(true)} onOpenImage={() => setViewerIndex(0)} onOpenGallery={onOpenGallery} />}
       {editing && (
         <div className="stack edit-panel">
           <label>Name:<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} /></label>
@@ -2755,25 +2783,183 @@ function CharacterEditor({ project, character, chatId, onSaved, onRefresh, onBac
           <label>Identity: Personality<textarea value={draft.personality} onChange={(event) => setDraft({ ...draft, personality: event.target.value })} /></label>
           <label>Identity: Misc<textarea value={draft.misc} onChange={(event) => setDraft({ ...draft, misc: event.target.value })} /></label>
           <label>Bio:<textarea className="large-entry" value={draft.bio} onChange={(event) => setDraft({ ...draft, bio: event.target.value })} /></label>
-          <label className="file-pick"><ImageIcon size={18} /> Replace character image<input type="file" accept="image/*" onChange={(event) => { void addImages(event.target.files); event.currentTarget.value = ""; }} /></label>
-          {attachments.length > 0 ? <div className="character-image-manage">{attachments.map((attachment, index) => <div className="character-image-manage-item" key={attachment.id}><button type="button" onClick={() => setViewerIndex(index)} aria-label="Open image"><img src={attachment.url} alt="Character" /></button><button type="button" className="attachment-remove" onClick={() => void removeImage(attachment.id)} aria-label="Remove character image"><X size={13} /></button></div>)}</div> : <p className="muted-pad">No character image attached.</p>}
+          <label className="file-pick"><ImageIcon size={18} /> Add character images<input type="file" accept="image/*" multiple onChange={(event) => { void addImages(event.target.files); event.currentTarget.value = ""; }} /></label>
+          {attachments.length > 0 ? <div className="character-image-manage" aria-label="Character images"><div className="character-image-main"><small>Main image</small><div className="character-image-manage-item"><button type="button" onClick={() => setViewerIndex(0)} aria-label="Open main image"><img src={attachments[0].url} alt="Character main" /></button></div></div>{attachments.length > 1 && <><span className="character-image-divider" aria-hidden="true" /> <div className="character-image-additional">{attachments.slice(1).map((attachment, index) => <div className="character-image-manage-item" key={attachment.id}><button type="button" onClick={() => setViewerIndex(index + 1)} aria-label={`Open gallery image ${index + 1}`}><img src={attachment.url} alt="Character gallery" /></button></div>)}</div></>}</div> : <p className="muted-pad">No character image attached.</p>}
           <label className="compact-check"><input type="checkbox" checked={draft.statsEnabled} onChange={(event) => setDraft({ ...draft, statsEnabled: event.target.checked })} /> Enable ability scores</label>
           {draft.statsEnabled && <PointBuyEditor project={project} draft={draft} bonuses={bonuses} gearStatBonuses={gearStatBonuses} onDraft={setDraft} />}
+          {draft.statsEnabled && <CharacterTraitEditor bonuses={bonuses} onChange={setBonuses} />}
           {draft.statsEnabled && <CharacterCarryPreview project={project} character={draft} bonuses={bonuses} gearStatBonuses={gearStatBonuses} inventoryWeightKg={carryInventoryWeightKg} gearWeightKg={carryGearWeightKg} unweighedItemCount={unweighedItemCount} />}
           <CharacterActionLibraryEditor character={character} />
           {!valid && <p className="error">{buildMode === "template" ? "Choose a JOB for template builds." : "Custom builds need a job name and must stay within 27 points, with base scores from 8 to 15."}</p>}
-          <div className="split-actions persistent-actions"><button disabled={!valid} onClick={save}><Save size={18} /> Save</button><button onClick={() => setEditing(false)}>Cancel</button>{saved && <span className="save-status">Saved</span>}</div>
+          <div className="split-actions persistent-actions"><button disabled={!valid} onClick={save}><Save size={18} /> Save</button><button onClick={() => { setDraft(character); void loadBonuses(); setEditing(false); }}>Cancel</button>{saved && <span className="save-status">Saved</span>}</div>
         </div>
       )}
-      {viewerIndex !== undefined && <ImageViewer attachments={attachments} index={viewerIndex} onChange={setViewerIndex} onClose={() => setViewerIndex(undefined)} />}
-      <div className="character-back-row">
-        <button onClick={onBack}><ChevronLeft size={18} /> Back to characters</button>
-      </div>
-      <div className="character-delete-row">
-        <button className="danger" onClick={removeCharacter}><Trash2 size={18} /> Delete character</button>
-      </div>
+      <CharacterBackgroundDetails projectId={project.id} characterId={character.id} editable={editing} />
+      {viewerIndex !== undefined && <CharacterImageViewer characterName={character.name} attachments={attachments} index={viewerIndex} onChange={setViewerIndex} onClose={() => setViewerIndex(undefined)} onDelete={removeImage} onMakeMain={makeMainImage} />}
     </section>
   );
+}
+
+function statScoreTier(score: number) {
+  if (score >= 21) return "purple";
+  if (score >= 20) return "gold";
+  if (score === 19) return "silver";
+  if (score === 18) return "bronze";
+  const modifier = scoreModifier(score);
+  if (modifier >= 3) return "modifier-3";
+  if (modifier >= 2) return "modifier-2";
+  if (modifier >= 1) return "modifier-1";
+  return "neutral";
+}
+
+function dossierClassLabel(character: Character) {
+  const className = characterBuildMode(character) === "custom" ? character.customJobName?.trim() : character.job?.trim();
+  const lineage = formatDeltaTemplateTag(character.prefix, character.base);
+  return [className, lineage].filter(Boolean).join(" · ");
+}
+
+function CharacterProfileView({ project, character, attachments, bonuses, gearStatBonuses, inventoryWeightKg, gearWeightKg, onEdit, onOpenImage, onOpenGallery }: { project: Project; character: Character; attachments: CharacterImage[]; bonuses: CharacterBonus[]; gearStatBonuses: AbilityModifiers; inventoryWeightKg: number; gearWeightKg: number; onEdit: () => void; onOpenImage: () => void; onOpenGallery: () => void }) {
+  const template = characterTemplateBonus(project, character);
+  const templateBuild = characterBuildMode(character) === "template";
+  const defaultStats = project.deltaDefaultNpcStats ?? defaultDeltaNpcStats();
+  const totals = abilities.reduce((result, ability) => {
+    const key = ability.toLowerCase() as "str" | "dex" | "con" | "int" | "wis" | "cha";
+    const traitBonus = bonuses.filter((bonus) => bonus.stat === ability).reduce((sum, bonus) => sum + bonus.value, 0);
+    result[ability] = (templateBuild ? defaultStats[ability] : character[key]) + template.bonus[ability] + traitBonus + (gearStatBonuses[ability] ?? 0);
+    return result;
+  }, {} as AbilityScores);
+  const totalHp = Math.max(1, 10 + scoreModifier(totals.CON) + template.generated.hpBonus);
+  const strength = totals.STR;
+  const carry = deltaCarryProfile(project, character.base, strength, inventoryWeightKg + gearWeightKg);
+  const buildTag = dossierClassLabel(character);
+  const positiveTraits = bonuses.filter((bonus) => bonus.value > 0 && bonus.name.trim()).map((bonus) => bonus.name.trim());
+  const negativeTraits = bonuses.filter((bonus) => bonus.value < 0 && bonus.name.trim()).map((bonus) => bonus.name.trim());
+  return <div className="character-dossier">
+    <header className="character-dossier-hero">
+      {attachments[0] ? <div className="dossier-image"><button type="button" onClick={onOpenImage} aria-label="Open main character image"><img src={attachments[0].url} alt="" /></button><button type="button" onClick={onOpenGallery}>Image Gallery ({attachments.length})</button></div> : <div className="dossier-image dossier-image-empty" aria-hidden="true" />}
+      <div className="dossier-identity"><h2>{character.name}</h2>{buildTag && <span className="dossier-class">{buildTag}</span>}<dl><dt>Age</dt><dd>{character.age || "—"}</dd><dt>Gender</dt><dd>{character.gender || "—"}</dd><dt>Misc</dt><dd>{character.misc || "—"}</dd><dt>Personality</dt><dd>{character.personality || "—"}</dd></dl></div>
+      <button className="dossier-edit" onClick={onEdit}><Edit3 size={17} /> Edit</button>
+      <p className="dossier-bio"><strong>Bio:</strong> {character.bio || "No bio saved yet."}</p>
+    </header>
+    {character.statsEnabled && <section className="dossier-section"><h3>Ability Scores</h3><div className="dossier-ability-layout"><div className="dossier-stat-list">{abilities.map((ability) => { const total = totals[ability]; return <div className="dossier-stat" key={ability}><span className={`score-${statScoreTier(total)}`}>{ability}</span><div className="dossier-stat-track"><i className={`score-${statScoreTier(total)}`} style={{ width: `${Math.max(0, Math.min(100, total * 5))}%` }} /></div><strong className={`score-${statScoreTier(total)}`}>{total}</strong><small className={traitStatColor(bonuses, ability)}>{modifierLabel(total)}</small></div>; })}</div><aside className="dossier-vitals"><div className="dossier-hp"><span>HP: {totalHp}</span><div>{Array.from({ length: totalHp }, (_, index) => <i key={index} />)}</div></div><p>Carry: {formatInventoryKg(carry.carryCapacityKg)} kg</p><p>Combat: {formatInventoryKg(carry.combatLoadKg)} kg</p></aside></div>{(positiveTraits.length > 0 || negativeTraits.length > 0) && <div className="dossier-inline-traits">{positiveTraits.map((trait) => <span className="dossier-trait-chip positive" key={`positive-${trait}`}>{trait}</span>)}{negativeTraits.map((trait) => <span className="dossier-trait-chip negative" key={`negative-${trait}`}>{trait}</span>)}</div>}</section>}
+  </div>;
+}
+
+type CharacterImage = { id: string; url: string; mimeType: string };
+
+function CharacterImageViewer({ characterName, attachments, index, isMain = index === 0, onChange, onClose, onDelete, onMakeMain }: { characterName: string; attachments: CharacterImage[]; index: number; isMain?: boolean; onChange: (index: number) => void; onClose: () => void; onDelete: (id: string) => Promise<void>; onMakeMain: (id: string) => Promise<void> }) {
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const active = attachments[index];
+  if (!active) return null;
+  function download() {
+    const extension = active.mimeType.split("/")[1] || "image";
+    const link = document.createElement("a");
+    link.href = active.url;
+    link.download = `${characterName.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "") || "character"}-${index + 1}.${extension}`;
+    link.click();
+  }
+  async function deleteImage() {
+    await onDelete(active.id);
+    setConfirmingDelete(false);
+    onClose();
+  }
+  async function makeMain() {
+    await onMakeMain(active.id);
+    onChange(0);
+  }
+  return <div className="image-viewer character-image-viewer" role="dialog" aria-modal="true" aria-label={`${characterName} image`} onClick={onClose}>
+    <div className="character-image-viewer-content" onClick={(event) => event.stopPropagation()}>
+      <button className="character-image-viewer-close" type="button" onClick={onClose} aria-label="Close image viewer" title="Close"><X size={20} /></button>
+      <img className="image-full" src={active.url} alt={`${characterName} image ${index + 1}`} />
+      {attachments.length > 1 && <div className="viewer-thumbs">{attachments.map((attachment, nextIndex) => <button className={nextIndex === index ? "picked" : ""} key={attachment.id} onClick={() => onChange(nextIndex)} aria-label={`View image ${nextIndex + 1}`}><img src={attachment.url} alt="" /></button>)}</div>}
+      <div className="character-image-action-bar">
+        <button type="button" onClick={download}><Download size={17} /> Download</button>
+        <button type="button" disabled={isMain} onClick={() => void makeMain()}><Star size={17} /> Make main image</button>
+        <button type="button" className="danger" onClick={() => setConfirmingDelete(true)}><Trash2 size={17} /> Delete image</button>
+      </div>
+    </div>
+    {confirmingDelete && <div className="modal-backdrop image-delete-confirmation" onClick={() => setConfirmingDelete(false)}>
+      <section className="modal" role="alertdialog" aria-modal="true" aria-labelledby="delete-image-title" onClick={(event) => event.stopPropagation()}>
+        <h2 id="delete-image-title">Delete image?</h2>
+        <p>This image will be permanently removed from {characterName}&apos;s gallery.</p>
+        <div className="split-actions"><button type="button" onClick={() => setConfirmingDelete(false)}>Cancel</button><button type="button" className="danger" onClick={() => void deleteImage()}>Delete image</button></div>
+      </section>
+    </div>}
+  </div>;
+}
+
+function CharacterGallery({ character, onBack }: { character: Character; onBack: () => void }) {
+  const [page, setPage] = useState(0);
+  const pageSize = 10;
+  const { images, count, refresh } = useAttachmentImagePage("character", character.id, page, pageSize);
+  const [viewerIndex, setViewerIndex] = useState<number>();
+  const pageCount = Math.max(1, Math.ceil(count / pageSize));
+  useEffect(() => { if (page >= pageCount) setPage(pageCount - 1); }, [page, pageCount]);
+  async function removeImage(id: string) { await db.attachments.delete(id); await refresh(); }
+  async function makeMainImage(id: string) {
+    const [mainRow, nextRow] = await Promise.all([
+      db.attachments.where("[ownerType+ownerId+createdAt]").between(["character", character.id, Dexie.minKey], ["character", character.id, Dexie.maxKey]).first(),
+      db.attachments.get(id)
+    ]);
+    if (!mainRow || !nextRow) return;
+    await db.transaction("rw", db.attachments, async () => {
+      await db.attachments.update(mainRow.id, { createdAt: nextRow.createdAt, updatedAt: now() });
+      await db.attachments.update(nextRow.id, { createdAt: mainRow.createdAt, updatedAt: now() });
+    });
+    setPage(0);
+    await refresh();
+  }
+  return <Page>
+    <nav className="character-profile-nav" aria-label="Character gallery navigation"><button className="character-back-button" type="button" onClick={onBack}><ChevronLeft size={18} /> Back to {character.name}</button></nav>
+    <section className="item-card character-gallery-page">
+      <div className="section-title"><div><h2>{character.name}&apos;s Image Gallery</h2><small>{count} image{count === 1 ? "" : "s"}</small></div></div>
+      {count === 0 ? <p className="muted-pad">No images yet. Add images while editing this character.</p> : <>
+        <div className="character-gallery-grid">{images.map((image, offset) => { const imageIndex = page * pageSize + offset; return <button key={image.id} type="button" onClick={() => setViewerIndex(offset)} aria-label={`Open image ${imageIndex + 1}${imageIndex === 0 ? ", main image" : ""}`}><img src={image.url} alt="" />{imageIndex === 0 && <span>Main image</span>}</button>; })}</div>
+        {pageCount > 1 && <nav className="character-gallery-pagination" aria-label="Gallery pages">{Array.from({ length: pageCount }, (_, index) => <button type="button" key={index} className={page === index ? "picked" : ""} onClick={() => setPage(index)} aria-label={`Page ${index + 1}`} aria-current={page === index ? "page" : undefined}>{index + 1}</button>)}</nav>}
+      </>}
+    </section>
+    {viewerIndex !== undefined && <CharacterImageViewer characterName={character.name} attachments={images} index={viewerIndex} isMain={page === 0 && viewerIndex === 0} onChange={setViewerIndex} onClose={() => setViewerIndex(undefined)} onDelete={removeImage} onMakeMain={makeMainImage} />}
+  </Page>;
+}
+
+function CharacterBackgroundDetails({ projectId, characterId, editable }: { projectId: string; characterId: string; editable: boolean }) {
+  const [details, setDetails] = useState<CharacterBackgroundDetail[]>([]);
+  const [text, setText] = useState("");
+  const [tagText, setTagText] = useState("");
+  async function load() {
+    const rows = await db.characterBackgroundDetails.where("characterId").equals(characterId).toArray();
+    setDetails(rows.sort((a, b) => b.createdAt - a.createdAt));
+  }
+  useEffect(() => { void load(); }, [characterId]);
+  async function add() {
+    const value = text.trim();
+    if (!value) return;
+    const timestamp = now();
+    const tags = Array.from(new Map(tagText.split(",").map((tag) => tag.trim()).filter(Boolean).map((tag) => [normaliseTag(tag), tag])).values());
+    await db.characterBackgroundDetails.add({ id: uid(), projectId, characterId, text: value, tags, normalisedTags: tags.map(normaliseTag), createdAt: timestamp, updatedAt: timestamp });
+    setText("");
+    setTagText("");
+    await load();
+  }
+  async function remove(id: string) {
+    await db.characterBackgroundDetails.delete(id);
+    await load();
+  }
+  return <section className="character-background-details" aria-labelledby="background-details-title">
+    <h3 id="background-details-title">Background Details</h3>
+    {editable && <div className="background-detail-add">
+      <input value={text} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); void add(); } }} placeholder="Add a character-specific detail" aria-label="New Background Detail" />
+      <input value={tagText} onChange={(event) => setTagText(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); void add(); } }} placeholder="Tags: secret, family, location" aria-label="Background Detail tags" />
+      <button type="button" onClick={() => void add()} disabled={!text.trim()} aria-label="Add Background Detail" title="Add Background Detail"><Plus size={17} /></button>
+    </div>}
+    {details.length > 0 && <div className="background-detail-list">
+      {details.map((detail) => <article className="background-detail" key={detail.id}>
+        <p>{detail.text}</p>
+        {detail.tags.length > 0 && <small>Tags: {detail.tags.join(", ")}</small>}
+        {editable && <button type="button" className="background-detail-delete" onClick={() => void remove(detail.id)} aria-label="Delete Background Detail"><X size={14} /></button>}
+      </article>)}
+    </div>}
+  </section>;
 }
 
 function CharacterActionLibraryEditor({ character }: { character: Character }) {
@@ -2898,7 +3084,6 @@ function CharacterActionLibraryEditor({ character }: { character: Character }) {
           </label>
         )}
       </div>
-      {macros.length === 0 && <p className="notice">Create nested action menus for this character. Delta will use the selected character's action slots.</p>}
       <DeltaActionTree macros={macros} parentId={undefined} editMode onChoose={() => undefined} onAdd={addMacro} onEdit={editMacro} onDelete={deleteMacro} />
       {macroDraft && (
         <div className="modal-backdrop" onClick={() => setMacroDraft(undefined)}>
@@ -2958,6 +3143,34 @@ function scoreModifier(score: number) {
   return Math.floor((score - 10) / 2);
 }
 
+function traitStatColor(bonuses: CharacterBonus[], ability: Ability) {
+  const relevant = bonuses.filter((bonus) => bonus.stat === ability && bonus.value !== 0);
+  return relevant.some((bonus) => bonus.value > 0) ? "trait-stat-positive" : relevant.some((bonus) => bonus.value < 0) ? "trait-stat-negative" : "";
+}
+
+function CharacterTraitEditor({ bonuses, onChange }: { bonuses: CharacterBonus[]; onChange: (bonuses: CharacterBonus[]) => void }) {
+  function update(id: string, patch: Partial<CharacterBonus>) {
+    onChange(bonuses.map((bonus) => bonus.id === id ? { ...bonus, ...patch } : bonus));
+  }
+  function add() {
+    const timestamp = now();
+    onChange([...bonuses, { id: uid(), characterId: "", name: "", stat: "STR", value: 0, createdAt: timestamp, updatedAt: timestamp }]);
+  }
+  return <section className="character-traits-editor" aria-label="Character traits">
+    <div className="mini-row"><strong>Traits</strong><button type="button" onClick={add}><Plus size={16} /> Add trait</button></div>
+    {bonuses.map((bonus) => <div className="trait-bonus-row" key={bonus.id}>
+      <input aria-label="Trait name" value={bonus.name} onChange={(event) => update(bonus.id, { name: event.target.value })} placeholder="Trait name" />
+      <select aria-label="Bonus stat" value={bonus.stat} onChange={(event) => update(bonus.id, { stat: event.target.value as Ability })}>
+        {abilities.map((ability) => <option key={ability} value={ability}>{ability}</option>)}
+      </select>
+      <button type="button" aria-label={`Decrease ${bonus.name || "trait"} bonus`} onClick={() => update(bonus.id, { value: bonus.value - 1 })}>−</button>
+      <strong className={bonus.value > 0 ? "trait-stat-positive" : bonus.value < 0 ? "trait-stat-negative" : ""}>{bonus.value > 0 ? `+${bonus.value}` : bonus.value}</strong>
+      <button type="button" aria-label={`Increase ${bonus.name || "trait"} bonus`} onClick={() => update(bonus.id, { value: bonus.value + 1 })}>+</button>
+      <button type="button" className="trait-remove" aria-label={`Remove ${bonus.name || "trait"}`} onClick={() => onChange(bonuses.filter((item) => item.id !== bonus.id))}><Trash2 size={16} /></button>
+    </div>)}
+  </section>;
+}
+
 function modifierLabel(score: number) {
   return `(${signedBonus(scoreModifier(score))})`;
 }
@@ -2994,7 +3207,7 @@ function StatsDisplay({ project, character, bonuses, gearStatBonuses }: { projec
     const key = ability.toLowerCase() as "str" | "dex" | "con" | "int" | "wis" | "cha";
     const legacyBonus = bonuses.filter((item) => item.stat === ability).reduce((sum, item) => sum + item.value, 0);
     const total = (templateBuild ? defaultStats[ability] : character[key]) + template.bonus[ability] + legacyBonus + (gearStatBonuses[ability] ?? 0);
-    return <span key={ability}>{ability} {total} <small>{modifierLabel(total)}</small></span>;
+    return <span key={ability} className={traitStatColor(bonuses, ability)}>{ability} {total} <small>{modifierLabel(total)}</small></span>;
   })}<span className="character-hp-display">HP {totalHp} <HpSquares current={totalHp} max={totalHp} character /></span>{buildTag && <small className="delta-template-tag">{buildTag}</small>}</div>;
 }
 
@@ -3041,7 +3254,7 @@ function PointBuyEditor({ project, draft, bonuses, gearStatBonuses, onDraft }: {
     const legacyBonus = bonuses.filter((item) => item.stat === ability).reduce((sum, item) => sum + item.value, 0);
     const bonus = template.bonus[ability] + legacyBonus + (gearStatBonuses[ability] ?? 0);
     const total = base + bonus;
-    return { ability, key, base, bonus, total };
+    return { ability, key, base, bonus, total, traitColor: traitStatColor(bonuses, ability) };
   });
   const statScale = Math.max(20, ...statRows.map((row) => Math.max(row.base, row.total)));
   return (
@@ -3096,7 +3309,7 @@ function PointBuyEditor({ project, draft, bonuses, gearStatBonuses, onDraft }: {
         <HpSquares current={totalHp} max={totalHp} character />
         <div className="hp-summary-foot"><span>{baseHp} {signedBonus(tagHpBonus)} = {totalHp}</span></div>
       </div>
-      {statRows.map(({ ability, key, base, bonus, total }) => {
+      {statRows.map(({ ability, key, base, bonus, total, traitColor }) => {
         const baseWidth = (Math.max(0, bonus < 0 ? total : base) / statScale) * 100;
         const bonusWidth = (Math.abs(bonus) / statScale) * 100;
         return (
@@ -3108,11 +3321,10 @@ function PointBuyEditor({ project, draft, bonuses, gearStatBonuses, onDraft }: {
               <small>{abilityHints[ability]}</small>
             </div>
             <button disabled={templateBuild || base >= 15} onClick={() => onDraft({ ...draft, [key]: base + 1 })}>+</button>
-            <strong>{total} <small>{modifierLabel(total)}</small></strong>
+            <strong className={traitColor}>{total} <small>{modifierLabel(total)}</small></strong>
           </div>
         );
       })}
-      {bonuses.length > 0 && <p className="notice">Legacy custom bonuses are still included in totals, but new stat bonuses come from PREFIX / BASE / JOB tags.</p>}
     </div>
   );
 }

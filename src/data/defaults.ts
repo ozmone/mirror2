@@ -99,6 +99,7 @@ export const sampleProject = (): Project => {
     orderIndex: 0,
     pinned: true,
     instructions: "",
+      characterLibraryInstructions: "",
     worldSetting: "",
     memoryMode: "approval",
     memoryInstruction: defaultMemoryInstruction,

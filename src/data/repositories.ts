@@ -609,8 +609,25 @@ export async function findCharacters(projectId: string, nameQuery: string, limit
     id: character.id, name: character.name,
     ...(await getCharacterIdentity(projectId, character.id)),
     ...(await getCharacterBio(projectId, character.id)),
-    ...(await getCharacterStats(projectId, character.id))
+    traits: await getCharacterTraits(projectId, character.id)
   })));
+}
+
+export async function searchCharacterBackgroundDetails(projectId: string, characterId: string, query: string, limit = 8) {
+  const character = await db.characters.get(characterId);
+  if (!character || character.projectId !== projectId) return null;
+  const terms = normaliseTag(query).split("-").filter(Boolean);
+  const details = await db.characterBackgroundDetails.where("characterId").equals(characterId).toArray();
+  const matches = details
+    .filter((detail) => {
+      if (!terms.length) return true;
+      const searchable = detail.normalisedTags.join(" ");
+      return terms.every((term) => searchable.includes(term));
+    })
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+    .slice(0, limit)
+    .map((detail) => ({ text: detail.text, tags: detail.tags }));
+  return { characterId, character: character.name, details: matches };
 }
 
 export async function getCharacterIdentity(projectId: string, characterId: string) {
@@ -636,6 +653,17 @@ export async function getCharacterBio(projectId: string, characterId: string) {
   };
 }
 
+/** Trait names are narrative context; their attached stat modifiers stay mechanical. */
+export async function getCharacterTraits(projectId: string, characterId: string) {
+  const character = await db.characters.get(characterId);
+  if (!character || character.projectId !== projectId) return null;
+  const bonuses = await db.characterBonuses.where("characterId").equals(characterId).toArray();
+  return {
+    positive: bonuses.filter((bonus) => bonus.value > 0 && bonus.name.trim()).map((bonus) => bonus.name.trim()),
+    negative: bonuses.filter((bonus) => bonus.value < 0 && bonus.name.trim()).map((bonus) => bonus.name.trim())
+  };
+}
+
 export async function getCharacterStats(projectId: string, characterId: string) {
   const character = await db.characters.get(characterId);
   if (!character || character.projectId !== projectId) return null;
@@ -644,6 +672,7 @@ export async function getCharacterStats(projectId: string, characterId: string) 
   const stats = await characterTemplateStats(project, character);
   return {
     character: character.name,
+    traits: await getCharacterTraits(projectId, characterId),
     stats: {
       STR: stats.STR,
       DEX: stats.DEX,

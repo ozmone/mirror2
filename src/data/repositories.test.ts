@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { db } from "./db";
 import { defaultDeltaBases, defaultSettings, sampleProject } from "./defaults";
-import { addDeltaMessage, applyDeltaDamage, applyInventoryChange, createChat, createMemory, deltaCarryProfile, formatDeltaTemplateTag, generatedDeltaStats, findCharacters, getCharacterBio, getCharacterIdentity, getCharacterStats, messagesForIncrementalCompaction, normaliseInventoryName, searchMemories, validatePointBuy } from "./repositories";
+import { addDeltaMessage, applyDeltaDamage, applyInventoryChange, createChat, createMemory, deltaCarryProfile, formatDeltaTemplateTag, generatedDeltaStats, findCharacters, getCharacterBio, getCharacterIdentity, getCharacterStats, messagesForIncrementalCompaction, normaliseInventoryName, searchCharacterBackgroundDetails, searchMemories, validatePointBuy } from "./repositories";
 import { Character, DeltaRollReceipt, Message } from "../types";
 
 describe("local data rules", () => {
@@ -86,6 +86,7 @@ describe("local data rules", () => {
     });
     expect(await getCharacterStats(project.id, character.id)).toEqual({
       character: "Jaeger",
+      traits: { positive: ["training"], negative: [] },
       stats: {
         STR: 8,
         DEX: 17,
@@ -112,9 +113,44 @@ describe("local data rules", () => {
     expect(result[0]).toMatchObject({
       id: character.id, name: "Alice", character: "Alice",
       identity: { age: "30", gender: "woman", personality: "patient", misc: "Blue coat" },
-      bio: "A travelling medic.", stats: { DEX: 14, INT: 14 }
+      bio: "A travelling medic.",
+      traits: { positive: ["training"], negative: [] }
     });
+    expect(result[0]).not.toHaveProperty("stats");
     expect(await findCharacters(project.id, "missing")).toEqual([]);
+  });
+
+  it("finds a bracketed alternate name stored in a character name", async () => {
+    const project = sampleProject();
+    await db.projects.add(project);
+    await db.characters.add({
+      id: "jaeger", projectId: project.id, name: "Jaeger (Elias Vahrn)", normalisedName: "jaeger-elias-vahrn",
+      age: "29", gender: "man", personality: "dry", misc: "", bio: "", statsEnabled: false,
+      str: 8, dex: 8, con: 8, int: 8, wis: 8, cha: 8, createdAt: 1, updatedAt: 1
+    });
+
+    const result = await findCharacters(project.id, "Elias Vahrn");
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({ id: "jaeger", name: "Jaeger (Elias Vahrn)", identity: { age: "29" } });
+  });
+
+  it("searches Background Details only within the requested character", async () => {
+    const project = sampleProject();
+    await db.projects.add(project);
+    await db.characters.bulkAdd([
+      { id: "jaeger", projectId: project.id, name: "Jaeger", normalisedName: "jaeger", age: "", gender: "", personality: "", misc: "", bio: "", statsEnabled: false, str: 8, dex: 8, con: 8, int: 8, wis: 8, cha: 8, createdAt: 1, updatedAt: 1 },
+      { id: "torque", projectId: project.id, name: "Torque", normalisedName: "torque", age: "", gender: "", personality: "", misc: "", bio: "", statsEnabled: false, str: 8, dex: 8, con: 8, int: 8, wis: 8, cha: 8, createdAt: 1, updatedAt: 1 }
+    ]);
+    await db.characterBackgroundDetails.bulkAdd([
+      { id: "jaeger-car", projectId: project.id, characterId: "jaeger", text: "Jaeger's vehicle is a black sedan.", tags: ["vehicle", "car"], normalisedTags: ["vehicle", "car"], createdAt: 1, updatedAt: 1 },
+      { id: "torque-truck", projectId: project.id, characterId: "torque", text: "Torque drives a sedan.", tags: ["vehicle", "car", "truck"], normalisedTags: ["vehicle", "car", "truck"], createdAt: 1, updatedAt: 1 }
+    ]);
+
+    await expect(searchCharacterBackgroundDetails(project.id, "torque", "car")).resolves.toEqual({
+      characterId: "torque", character: "Torque", details: [{ text: "Torque drives a sedan.", tags: ["vehicle", "car", "truck"] }]
+    });
+    await expect(searchCharacterBackgroundDetails(project.id, "torque", "sedan")).resolves.toMatchObject({ details: [] });
   });
 
   it("validates 27 point-buy limits", () => {
@@ -209,6 +245,7 @@ describe("local data rules", () => {
 
     expect(await getCharacterStats(project.id, character.id)).toEqual({
       character: "Legolas",
+      traits: { positive: [], negative: [] },
       stats: {
         STR: 9,
         DEX: 14,
@@ -259,6 +296,7 @@ describe("local data rules", () => {
 
     expect(await getCharacterStats(project.id, character.id)).toEqual({
       character: "Custom Ranger",
+      traits: { positive: [], negative: [] },
       stats: {
         STR: 9,
         DEX: 16,

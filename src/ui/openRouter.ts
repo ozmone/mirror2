@@ -40,7 +40,7 @@ export const characterTools = [
     type: "function",
     function: {
       name: "find_characters",
-      description: "Look up complete characters by name within the active project. Returns each matching character's ID, name, full identity, biography, and calculated stats together. No separate section lookups are needed. Reuse returned details for this turn.",
+      description: "Look up character profiles by name within the active project. Returns each matching character's ID, name, identity, biography, and positive/negative trait names. It does not return ability scores or Background Details; use the dedicated tools only after this lookup returns the character ID.",
       parameters: {
         type: "object",
         properties: {
@@ -48,6 +48,22 @@ export const characterTools = [
         },
         required: ["nameQuery"]
       }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_character_stats",
+      description: "Retrieve calculated ability scores and positive/negative trait names for one character ID returned by find_characters. Trait modifiers are already included in the calculated scores; do not infer or explain numeric modifiers from trait names. Use only when the current reply needs that character's stats.",
+      parameters: { type: "object", properties: { characterId: { type: "string", description: "Saved character ID returned by find_characters." } }, required: ["characterId"] }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "search_character_background_details",
+      description: "Search tag-matched Background Details for exactly one character ID returned by find_characters. This never searches other characters or the detail text itself. Use only when the current reply needs a deeper character-specific fact not present in the profile.",
+      parameters: { type: "object", properties: { characterId: { type: "string", description: "Saved character ID returned by find_characters." }, query: { type: "string", description: "The fact to look for within this character's Background Details." } }, required: ["characterId", "query"] }
     }
   }
 ] as const;
