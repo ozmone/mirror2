@@ -32,11 +32,11 @@ import {
 import { runSourceTool } from "../../data/sources";
 import { addChatSource, chatSourceContext, chatSourcesFor, saveLastConfirmedStoryState } from "../../data/chatSources";
 import { applyWorldReply, defaultWorldState, extractWorldMetadata, formatWorldCalendar, worldInstruction } from "../../data/world";
-import { AppSettings, Chat, InventoryUpdateRequest, MainChatAuditRequest, MainChatAuditToolEvent, MainChatMemoryReviewAudit, MainChatRequestAudit, Message, Project, RouteName, SourceFile, WorldReplyMetadata, WorldState, WorldTracker } from "../../types";
+import { Ability, AbilityScores, AppSettings, Chat, InventoryUpdateRequest, MainChatAuditRequest, MainChatAuditToolEvent, MainChatMemoryReviewAudit, MainChatRequestAudit, Message, Project, RoleplayRollReceipt, RouteName, SourceFile, WorldReplyMetadata, WorldState, WorldTracker } from "../../types";
 import { estimateTokens, now, uid } from "../../utils";
 import { isDeltaModeRequest } from "../delta/config";
 import { abstractDeltaRosterName, fitComposerTextarea, formatInventoryKg, keepComposerVisible, useSavedNotice } from "../delta/workspaceSupport";
-import { characterTools, deltaImminentTools, finalizeTurnTool, imageContextTools, inventoryTools, memoryManagementTools, memoryTools, sourceTools, timelineTools, type OpenRouterMessage, type OpenRouterResponse, type OpenRouterToolCall, type OpenRouterUsage } from "../openRouter";
+import { characterTools, deltaImminentTools, finalizeTurnTool, imageContextTools, inventoryTools, memoryManagementTools, memoryTools, roleplayRollTools, sourceTools, timelineTools, type OpenRouterMessage, type OpenRouterResponse, type OpenRouterToolCall, type OpenRouterUsage } from "../openRouter";
 import { auditSafeValue, recordModelRequest, sourceAuditVersions } from "../responseAudit";
 import { EmptyState } from "../shared/appElements";
 import { VirtualMessageList } from "./MessageList";
@@ -44,6 +44,7 @@ import { completeReply } from "./completeReply";
 import { charactersModeFor, sourceFilesModeFor } from "./contextModes";
 import { chatFileContext, chatHistoryContent, contextCondensationLimit, contextCondensationMinimumCharacters, contextCondensationRatio, deltaBriefRosterFromContext, deltaBriefRosterLines, deltaContinuityWithoutRosterLines, DeltaImminentProposal, extractMemoryConcepts, imageForOpenRouter, normaliseDeltaBriefRoster, optionalNumber, parseContextCondensations, parseDeltaAvoidPacket, parseDeltaBriefPacket, parseMemoryReview, storedMessageImages } from "./context";
 import { sendOpenRouterRequest } from "./transport";
+import { thinkingCapabilitiesFor, thinkingModeLabel, type ThinkingMode } from "./thinking";
 
 function modelPrice(value?: number) {
   return value !== undefined && Number.isFinite(value) && value >= 0
@@ -99,13 +100,17 @@ export function ChatScreen({
   onMessageUpdated: (id: string, patch: Partial<Message>) => void;
   onRoute: (route: RouteName) => void;
   selectedModelId: string;
-  models: { modelId: string; cosmeticName: string; inputPricePerMillionUsd?: number; outputPricePerMillionUsd?: number }[];
+  models: { modelId: string; cosmeticName: string; inputPricePerMillionUsd?: number; outputPricePerMillionUsd?: number; thinkingModes?: ThinkingMode[]; defaultThinkingMode?: ThinkingMode }[];
   deltaLocked: boolean;
   onOpenDelta: (chat: Chat, startContext: string) => Promise<void>;
   onSettingsSaved: (modelId: string) => Promise<void>;
   onModelSelected: (modelId: string) => void;
 }) {
   const [body, setBody] = useState("");
+  const [maskedSessionInfoOpen, setMaskedSessionInfoOpen] = useState(false);
+  const [maskedSettingsOpen, setMaskedSettingsOpen] = useState(false);
+  const [maskedInstructions, setMaskedInstructions] = useState(chat?.maskedInstructions ?? "");
+  const [creatingMaskedSession, setCreatingMaskedSession] = useState(false);
   const [contextOpen, setContextOpen] = useState(false);
   const [chatSettingsOpen, setChatSettingsOpen] = useState(false);
   const [chatSourcesOpen, setChatSourcesOpen] = useState(false);
@@ -115,6 +120,9 @@ export function ChatScreen({
   const [chatSettingsTab, setChatSettingsTab] = useState<"general" | "world">("general");
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [modelMenuPosition, setModelMenuPosition] = useState<{ left: number; bottom: number; width: number }>();
+  const [thinkingMenuOpen, setThinkingMenuOpen] = useState(false);
+  const [thinkingMenuPosition, setThinkingMenuPosition] = useState<{ left: number; bottom: number; width: number }>();
+  const [thinkingModeByModel, setThinkingModeByModel] = useState(settings.thinkingModeByModel ?? {});
   const [modelSaving, setModelSaving] = useState(false);
   const [modelSaveError, setModelSaveError] = useState("");
   const [draftModelId, setDraftModelId] = useState(selectedModelId);
@@ -147,6 +155,9 @@ export function ChatScreen({
   const [inventoryEnabled, setInventoryEnabled] = useState(project?.inventoryEnabled ?? false);
   const [gearEnabled, setGearEnabled] = useState(project?.gearEnabled ?? false);
   const [world, setWorld] = useState<WorldState>(chat?.world ?? defaultWorldState());
+  const [d20Enabled, setD20Enabled] = useState(Boolean(chat?.d20Enabled));
+  const [d20Instructions, setD20Instructions] = useState(chat?.d20Instructions ?? "Use request_roleplay_roll for decisive or notable actions. Retrieve the roller's exact character stats first. If no stats exist, create a 31-point ability array suited to that character and save it to character_stats.md. Never narrate an outcome before the verified client receipt.");
+  const [d20InstructionsOpen, setD20InstructionsOpen] = useState(false);
   const [attachedImages, setAttachedImages] = useState<File[]>([]);
   const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
   const [attachmentError, setAttachmentError] = useState("");
@@ -185,6 +196,9 @@ export function ChatScreen({
     setStreamingEnabled(settings.streamingEnabled ?? true);
     setAutoManageInventory(settings.autoManageInventory ?? false);
     setConfirmInventoryUpdates(settings.confirmInventoryUpdates ?? true);
+    setThinkingModeByModel(settings.thinkingModeByModel ?? {});
+    setD20Enabled(Boolean(chat?.d20Enabled));
+    setD20Instructions(chat?.d20Instructions ?? "Use request_roleplay_roll for decisive or notable actions. Retrieve the roller's exact character stats first. If no stats exist, create a 31-point ability array suited to that character and save it to character_stats.md. Never narrate an outcome before the verified client receipt.");
   }, [settings, selectedModelId, chat?.id, chat?.infiniteHistoryLocked, chat?.compactionEnabled, chat?.timelineContinuityEnabled, chat?.timelineUpdateMode]);
   useEffect(() => {
     setInventoryEnabled(project?.inventoryEnabled ?? false);
@@ -192,6 +206,7 @@ export function ChatScreen({
     setInfiniteWarningOpen(false);
   }, [project?.id, project?.inventoryEnabled, project?.gearEnabled]);
   useEffect(() => setWorld(chat?.world ?? defaultWorldState()), [chat?.id, chat?.world]);
+  useEffect(() => setMaskedInstructions(chat?.maskedInstructions ?? ""), [chat?.id, chat?.maskedInstructions]);
   useEffect(() => setInfiniteWarningOpen(false), [chat?.id]);
   useEffect(() => {
     const composer = composerRef.current;
@@ -229,6 +244,7 @@ export function ChatScreen({
     };
   }, [chatSettingsOpen]);
   const infiniteHistoryLocked = Boolean(chat?.infiniteHistoryLocked);
+  const maskedSession = Boolean(chat?.maskedSession);
   const effectiveHistoryNoLimit = infiniteHistoryLocked || historyNoLimit;
   async function persistChatSettings(lockInfiniteHistory = false) {
     const timestamp = now();
@@ -251,8 +267,8 @@ export function ChatScreen({
       confirmInventoryUpdates,
       updatedAt: timestamp
     });
-    if (project) await db.projects.update(project.id, { inventoryEnabled, gearEnabled, updatedAt: timestamp });
-    if (chat) await db.chats.update(chat.id, { compactionEnabled, timelineContinuityEnabled, timelineUpdateMode, world: world.timeMode === "realtime" ? { ...world, realtimeUpdatedAt: timestamp } : world, ...(lockInfiniteHistory ? { infiniteHistoryLocked: true } : {}), updatedAt: timestamp });
+    if (project && !maskedSession) await db.projects.update(project.id, { inventoryEnabled, gearEnabled, updatedAt: timestamp });
+    if (chat) await db.chats.update(chat.id, { compactionEnabled, timelineContinuityEnabled, timelineUpdateMode, d20Enabled, d20Instructions: d20Instructions.trim() || undefined, world: world.timeMode === "realtime" ? { ...world, realtimeUpdatedAt: timestamp } : world, ...(lockInfiniteHistory ? { infiniteHistoryLocked: true } : {}), updatedAt: timestamp });
     setInfiniteWarningOpen(false);
     showSaved();
     await onSettingsSaved(draftModelId);
@@ -302,6 +318,7 @@ export function ChatScreen({
       if (!updated) throw new Error("Chat settings were unavailable.");
       setDraftModelId(modelId);
       setModelMenuOpen(false);
+      setThinkingMenuOpen(false);
       showSaved();
       onModelSelected(modelId);
     } catch (error) {
@@ -325,6 +342,26 @@ export function ChatScreen({
     setModelMenuOpen(true);
   }
 
+  const selectedModel = models.find((model) => model.modelId === draftModelId);
+  const thinkingCapabilities = thinkingCapabilitiesFor(selectedModel);
+  const selectedThinkingMode = thinkingCapabilities.availableModes.includes(thinkingModeByModel[draftModelId] as ThinkingMode)
+    ? thinkingModeByModel[draftModelId] as ThinkingMode
+    : thinkingCapabilities.defaultMode;
+
+  function toggleThinkingMenu(event: React.MouseEvent<HTMLButtonElement>) {
+    if (thinkingMenuOpen) { setThinkingMenuOpen(false); return; }
+    const trigger = event.currentTarget.getBoundingClientRect();
+    setThinkingMenuPosition({ left: trigger.left, bottom: window.innerHeight - trigger.top + 8, width: trigger.width });
+    setThinkingMenuOpen(true);
+  }
+
+  async function chooseThinkingMode(mode: ThinkingMode) {
+    const next = { ...thinkingModeByModel, [draftModelId]: mode };
+    setThinkingModeByModel(next);
+    setThinkingMenuOpen(false);
+    await db.settings.update("settings", { thinkingModeByModel: next, updatedAt: now() });
+  }
+
   function openRouterPayload(messagesToSend: OpenRouterMessage[], stream: boolean, imageContextMessageId?: string, forceImageContextTool = false, forceTurnFinalizer = false) {
     const payload: Record<string, unknown> = {
       model: draftModelId,
@@ -337,15 +374,18 @@ export function ChatScreen({
     if (temperatureValue !== undefined) payload.temperature = temperatureValue;
     if (topPValue !== undefined) payload.top_p = topPValue;
     if (maxTokensValue !== undefined) payload.max_tokens = maxTokensValue;
+    const thinkingRequest = thinkingCapabilities.requestForMode[selectedThinkingMode];
+    if (thinkingRequest) Object.assign(payload, thinkingRequest);
     const deltaAvailable = deltaEngagementEnabled();
     const activeTools = [
       ...(project && sourceFilesMode === "lookup" ? [...sourceTools] : []),
       ...(deltaAvailable ? [...deltaImminentTools] : []),
+      ...(roleplayDiceEnabled() ? [...roleplayRollTools] : []),
       ...(project && charactersMode === "lookup" ? [...characterTools] : []),
       ...(project?.inventoryEnabled && autoManageInventory ? [...inventoryTools] : []),
-      ...(project && project.memoryMode !== "manual" ? [...memoryTools] : []),
+      ...(project && !maskedSession && project.memoryMode !== "manual" ? [...memoryTools] : []),
       ...(memoryManagementEnabled() ? [...memoryManagementTools] : []),
-      ...(timelineContinuityEnabled ? [...timelineTools] : []),
+      ...(!maskedSession && timelineContinuityEnabled ? [...timelineTools] : []),
       ...(imageContextMessageId ? [...imageContextTools] : []),
       ...(forceTurnFinalizer ? [finalizeTurnTool] : [])
     ];
@@ -466,7 +506,7 @@ export function ChatScreen({
     ]);
     const query = concepts.join(" ");
     const memories = query ? await searchMemories(project.id, concepts, query, 8) : [];
-    if (memories.length) {
+    if (memories.length && !maskedSession) {
       const timestamp = now();
       await Promise.all(memories.map(async (memory) => {
         const row = await db.memories.get(memory.id);
@@ -507,6 +547,7 @@ export function ChatScreen({
   async function reviewTurnForMemories(chatId: string, userText: string, assistantText: string, sourceMessageIds: string[], memoryHandledByTool = false, requests?: MainChatAuditRequest[]): Promise<MainChatMemoryReviewAudit> {
     const skipped = (reason: string): MainChatMemoryReviewAudit => ({ status: "skipped", reason, condensationMessageIds: [], candidates: [] });
     if (!project) return skipped("No active project.");
+    if (maskedSession) return skipped("This masked session never writes project memories.");
     if (!settings.apiKey?.trim() || !draftModelId) return skipped("No API key or model was available for post-response memory review.");
     if (!assistantText.trim()) return skipped("The assistant response was empty.");
     const sourceMessages = (await db.messages.bulkGet(sourceMessageIds)).filter((message): message is Message => Boolean(message));
@@ -591,7 +632,7 @@ export function ChatScreen({
   }
 
   async function updateTimeline(chatId: string, requests: MainChatAuditRequest[], history: Message[], historyLimit?: number) {
-    if (!timelineContinuityEnabled || timelineUpdateMode === "manual") return;
+    if (maskedSession || !timelineContinuityEnabled || timelineUpdateMode === "manual") return;
     const beforeSequence = timelineHistoryBoundary(history, historyLimit);
     if (beforeSequence === undefined) return;
     const signal = activeSendRef.current?.controller.signal ?? new AbortController().signal;
@@ -649,8 +690,16 @@ export function ChatScreen({
     return Boolean(project?.deltaEnabled && project.inventoryEnabled && project.gearEnabled);
   }
 
+  function roleplayDiceEnabled() {
+    return Boolean(chat?.d20Enabled);
+  }
+
+  function roleplayPacingInstruction() {
+    return "Roleplay pacing: choose the smallest complete beat. Default to 200–500 words; use up to 800 only when the scene genuinely needs several consequential developments. A quiet follow, reaction, handoff, or moment where the player should lead may be 200–300 words. Do not pad scenes, decide the player's thoughts/actions, or match prior reply length.";
+  }
+
   function memoryManagementEnabled() {
-    return Boolean(project && (project.memoryMode !== "manual" || timelineContinuityEnabled
+    return Boolean(!maskedSession && project && (project.memoryMode !== "manual" || timelineContinuityEnabled
       || (memoryManagementAvailability.current.projectId === project.id && memoryManagementAvailability.current.available)));
   }
 
@@ -665,6 +714,7 @@ export function ChatScreen({
       || (project && charactersMode !== "none")
       || (project && sourceFilesMode === "lookup")
       || deltaEngagementEnabled()
+      || roleplayDiceEnabled()
       || (project?.inventoryEnabled && autoManageInventory)
       || (project && project.memoryMode !== "manual")
       || memoryManagementEnabled()
@@ -773,6 +823,61 @@ export function ChatScreen({
       default:
         return { error: `Unknown tool ${toolCall.function.name}.` };
     }
+  }
+
+  function secureDie(sides: number) {
+    const range = Math.max(2, Math.floor(sides));
+    const values = new Uint32Array(1);
+    crypto.getRandomValues(values);
+    return (values[0] % range) + 1;
+  }
+
+  function generatedRoleplayStats(preferred: Ability): AbilityScores {
+    // Exactly 31 points: 15 (9) / 14 (7) / 13 (5) / 12 (4) / 12 (4) / 10 (2).
+    // The first score is always the requested governing ability; the rest are
+    // shuffled locally so new NPCs are capable without being identical.
+    const rest = (["STR", "DEX", "CON", "INT", "WIS", "CHA"] as Ability[]).filter((ability) => ability !== preferred);
+    for (let index = rest.length - 1; index > 0; index -= 1) {
+      const swap = secureDie(index + 1) - 1;
+      [rest[index], rest[swap]] = [rest[swap], rest[index]];
+    }
+    const values = [15, 14, 13, 12, 12, 10];
+    return [preferred, ...rest].reduce((scores, ability, index) => ({ ...scores, [ability]: values[index] }), {} as AbilityScores);
+  }
+
+  async function runRoleplayRollTool(toolCall: OpenRouterToolCall) {
+    if (!project) return { error: "No active project." };
+    let args: Record<string, unknown> = {};
+    try { args = JSON.parse(toolCall.function.arguments || "{}") as Record<string, unknown>; } catch { return { error: "Invalid roll arguments." }; }
+    const rollerName = typeof args.rollerName === "string" ? args.rollerName.trim() : "";
+    const label = typeof args.label === "string" ? args.label.trim() : "";
+    const ability = typeof args.ability === "string" && ["STR", "DEX", "CON", "INT", "WIS", "CHA"].includes(args.ability) ? args.ability as Ability : undefined;
+    if (!rollerName || !label || !ability) return { error: "rollerName, label, and a valid ability are required." };
+    const key = rollerName.toLocaleLowerCase().replace(/\s+/g, " ");
+    const saved = await db.characters.where("projectId").equals(project.id).filter((character) => character.normalisedName === key).first();
+    let generatedStats: AbilityScores | undefined;
+    let scores: AbilityScores;
+    if (saved?.statsEnabled) {
+      const calculated = await getCharacterStats(project.id, saved.id);
+      scores = calculated?.stats ?? { STR: saved.str, DEX: saved.dex, CON: saved.con, INT: saved.int, WIS: saved.wis, CHA: saved.cha };
+    } else {
+      const cachedEntry = Object.entries(project.roleplayStatCache ?? {}).find(([name]) => name.toLocaleLowerCase().replace(/\s+/g, " ") === key);
+      const cached = cachedEntry?.[1];
+      if (cached) scores = cached;
+      else {
+        scores = generatedRoleplayStats(ability);
+        generatedStats = scores;
+        if (!maskedSession) await db.projects.update(project.id, { roleplayStatCache: { ...(project.roleplayStatCache ?? {}), [rollerName]: scores }, updatedAt: now() });
+      }
+    }
+    const modifier = Math.floor((scores[ability] - 10) / 2);
+    const raw = secureDie(20);
+    const target = Number(args.target);
+    const receipt: RoleplayRollReceipt = {
+      id: uid(), source: "client-web-crypto", rollerName, label, ability, die: 20, raw, modifier,
+      total: raw + modifier, scores, ...(Number.isFinite(target) ? { target } : {}), ...(generatedStats ? { generatedStats } : {}), status: "pending", createdAt: now()
+    };
+    return { roleplayRoll: receipt };
   }
 
   async function applyInventoryUpdate(projectId: string, chatId: string, update: InventoryUpdateRequest) {
@@ -937,6 +1042,7 @@ export function ChatScreen({
 
   async function runToolCall(toolCall: OpenRouterToolCall, chatId: string, inventoryUpdates: InventoryUpdateRequest[], sourceMessageIds: string[], deltaImminentProposals: DeltaImminentProposal[], memorySession: MemoryManagementSession, imageContextMessageId?: string, captureSources?: (files: SourceFile[]) => Promise<void>) {
     if (toolCall.function.name === "add_timeline_entry") {
+      if (maskedSession) return { error: "Masked sessions cannot change the shared project timeline." };
       if (!project || !timelineContinuityEnabled) return { error: "Timeline continuity is disabled." };
       const args = JSON.parse(toolCall.function.arguments) as { title?: unknown; body?: unknown } | null;
       if (!args || typeof args.title !== "string" || typeof args.body !== "string" || !args.title.replace(/[:\s]+$/, "") || !args.body.trim() || args.title.length > 160 || args.body.length > 4000) return { error: "Provide a title (1–160 characters) and content (1–4000 characters)." };
@@ -947,6 +1053,7 @@ export function ChatScreen({
       return { added: !pendingApproval, pendingApproval, entryId: entry.id };
     }
     if (memoryManagementTools.some((tool) => tool.function.name === toolCall.function.name)) {
+      if (maskedSession) return { error: "Masked sessions cannot change shared project memories." };
       if (!project || !memoryManagementEnabled()) return { error: "Memory management is unavailable." };
       return runMemoryManagementTool(project.id, toolCall.function.name, toolCall.function.arguments, memorySession);
     }
@@ -964,7 +1071,9 @@ export function ChatScreen({
     if (toolCall.function.name === "update_inventory_item") {
       return runInventoryTool(toolCall, chatId, inventoryUpdates);
     }
+    if (toolCall.function.name === "request_roleplay_roll") return runRoleplayRollTool(toolCall);
     if (toolCall.function.name === "save_memory") {
+      if (maskedSession) return { error: "Masked sessions cannot save project memories." };
       return runMemoryTool(toolCall, chatId, sourceMessageIds);
     }
     return runCharacterTool(toolCall);
@@ -1020,6 +1129,9 @@ export function ChatScreen({
         if (toolCall.function.name === "save_memory" && result && typeof result === "object" && ("saved" in result || "proposedForApproval" in result || "duplicate" in result)) memoryHandledByTool = true;
         if (memoryManagementTools.some((tool) => tool.function.name === toolCall.function.name)) { memoryHandledByTool = true; memoryManagementTurn = true; }
         if (toolCall.function.name === "add_timeline_entry") { memoryHandledByTool = true; memoryManagementTurn = true; }
+        if (toolCall.function.name === "request_roleplay_roll" && result && typeof result === "object" && "roleplayRoll" in result) {
+          return { messages: nextMessages, assistantMessage, usage, memoryHandledByTool, memoryManagementTurn, roleplayRoll: result.roleplayRoll as RoleplayRollReceipt };
+        }
         if (toolCall.function.name === "finalize_turn" && result && typeof result === "object" && "finalizedTurn" in result) return { messages: nextMessages, assistantMessage, usage, memoryHandledByTool, memoryManagementTurn, deltaImminentProposal: deltaImminentProposals[deltaImminentProposals.length - 1], finalizedTurn: result.finalizedTurn };
         nextMessages.push({
           role: "tool",
@@ -1048,6 +1160,7 @@ export function ChatScreen({
       outputTokens: resolved.usage?.completion_tokens,
       memoryHandledByTool: resolved.memoryHandledByTool,
       memoryManagementTurn: resolved.memoryManagementTurn,
+      roleplayRoll: resolved.roleplayRoll,
       deltaImminentProposal: resolved.deltaImminentProposal,
       finalizedTurn: resolved.finalizedTurn
     };
@@ -1146,7 +1259,7 @@ export function ChatScreen({
       let createdDeltaChatId: string | undefined;
       let deltaUserMessageId: string | undefined;
       if (!deltaChat) {
-        const deltaChatId = await createChat(project.id, text, { compactionEnabled, timelineContinuityEnabled, timelineUpdateMode });
+        const deltaChatId = await createChat(project.id, text, { compactionEnabled, timelineContinuityEnabled, timelineUpdateMode, d20Enabled, d20Instructions: d20Instructions.trim() || undefined });
         createdDeltaChatId = deltaChatId;
         deltaChat = await db.chats.get(deltaChatId);
         if (!deltaChat) return;
@@ -1241,7 +1354,7 @@ export function ChatScreen({
     let createdChatId: string | undefined;
     let requestFailed = false;
     if (!chatId || !branchId) {
-      chatId = await createChat(project.id, text, { compactionEnabled, timelineContinuityEnabled, timelineUpdateMode });
+      chatId = await createChat(project.id, text, { compactionEnabled, timelineContinuityEnabled, timelineUpdateMode, d20Enabled, d20Instructions: d20Instructions.trim() || undefined });
       createdChatId = chatId;
       const created = await db.chats.get(chatId);
       branchId = created?.activeBranchId;
@@ -1253,7 +1366,7 @@ export function ChatScreen({
       userMessageId = (await addMessage(chatId, branchId, "user", text)).id;
     }
     if (chatId && branchId) {
-      await db.chats.update(chatId, { compactionEnabled, timelineContinuityEnabled, timelineUpdateMode });
+      await db.chats.update(chatId, { compactionEnabled, timelineContinuityEnabled, timelineUpdateMode, d20Enabled, d20Instructions: d20Instructions.trim() || undefined });
       if (userMessageId && (attachedImages.length || attachedFiles.length)) {
         const timestamp = now();
         await db.attachments.bulkAdd([...attachedImages, ...attachedFiles].map((file) => ({
@@ -1288,6 +1401,7 @@ export function ChatScreen({
           `Characters: ${charactersMode}`,
           `Source files: ${sourceFilesMode}`,
           `Compaction memory: ${compactionEnabled ? "on" : "off"}`,
+          `Masked session: ${maskedSession ? "on (shared writes blocked)" : "off"}`,
           `Timeline continuity: ${timelineContinuityEnabled ? "on" : "off"}`,
           `Project memories: ${project.memoryMode !== "manual" ? project.memoryMode : "manual/off"}`,
           `Auto inventory: ${inventoryToolEnabled("inventory") ? "on" : "off"}`,
@@ -1330,7 +1444,10 @@ export function ChatScreen({
       const preparedHistory = selectedHistory;
       const deltaAvailable = deltaEngagementEnabled();
       const systemParts = [
+        maskedSession && activeChat?.maskedInstructions?.trim() ? `Masked instructions (follow these before all other project context):\n${activeChat.maskedInstructions.trim()}` : "",
         `Project: ${project.name}`,
+        roleplayPacingInstruction(),
+        roleplayDiceEnabled() ? `D20 rules:\n${d20Instructions}` : "",
         activeChat?.world ? worldInstruction(activeChat.world) : "",
         deltaAvailable ? "Delta Mode boundary: the main chat must not run structured fights, hostile standoffs, tactical engagements, mission commitments, or combat-like confrontations as ordinary roleplay once they become imminent. When the current reply would initiate or clearly commit to that kind of engagement, call prepare_delta_engagement with a short in-world third-person scene beat instead of continuing the scene as normal chat. Use this only when the engagement is imminent, not for ordinary tension." : "",
         includeInstructions && project.instructions ? `Project instructions:\n${project.instructions}` : "",
@@ -1338,12 +1455,12 @@ export function ChatScreen({
         characterDetails,
         compactionEnabled && historyLimit && compactionMemory ? `Compaction memory:\n${compactionMemory}` : "",
         timelineContext,
-        timelineContinuityEnabled ? "Timeline updates: use add_timeline_entry only when the user explicitly asks to add an event to the timeline. This works in Manual mode. Summarize the event from available context, even if it spans multiple turns. Do not claim to have reviewed history you cannot see. Only confirm the tool's actual result; pendingApproval means it still needs the user's approval on the timeline page." : "",
+        !maskedSession && timelineContinuityEnabled ? "Timeline updates: use add_timeline_entry only when the user explicitly asks to add an event to the timeline. This works in Manual mode. Summarize the event from available context, even if it spans multiple turns. Do not claim to have reviewed history you cannot see. Only confirm the tool's actual result; pendingApproval means it still needs the user's approval on the timeline page." : "",
         await sourceLibraryContext(),
         await chatSourceContext(chatId, branchId).then((context) => context.text),
         attachedFileDetails,
         images.length ? "An image is attached to the latest user message. First call save_image_context exactly once with a detailed concise visual extraction. It is hidden from the user. Then answer the user normally from the image." : "",
-        project.memoryMode !== "manual" ? "Memory saving is available through save_memory. When the user explicitly asks you to remember or save something as project memory, call save_memory and only confirm the outcome after its tool result. Do not claim that you cannot save project memory while this tool is available." : "",
+        !maskedSession && project.memoryMode !== "manual" ? "Memory saving is available through save_memory. When the user explicitly asks you to remember or save something as project memory, call save_memory and only confirm the outcome after its tool result. Do not claim that you cannot save project memory while this tool is available." : "",
         memoryDetails.text,
         memoryManagementEnabled() ? memoryManagementInstruction : "",
         inventoryDetails
@@ -1469,8 +1586,8 @@ export function ChatScreen({
     }
     await prepareMemoryManagement();
     if (!(await requireToolCapableModel())) return;
-    if (message.role !== "user") {
-      alert("Only user messages can be resent.");
+    if (message.role !== "user" && message.role !== "system") {
+      alert("Only user or system continuation messages can be resent.");
       return;
     }
     const requests: MainChatAuditRequest[] = [];
@@ -1484,7 +1601,7 @@ export function ChatScreen({
       .map((row) => row.id);
     if (staleStateIds.length) await db.chatSources.bulkDelete(staleStateIds);
     const timestamp = now();
-    await db.chats.update(chatId, { compactionEnabled, timelineContinuityEnabled, timelineUpdateMode });
+    await db.chats.update(chatId, { compactionEnabled, timelineContinuityEnabled, timelineUpdateMode, d20Enabled, d20Instructions: d20Instructions.trim() || undefined });
     const activeChat = await db.chats.get(chatId);
     const characterDetails = await characterLibraryContext();
     const inventoryDetails = await inventoryContext(chatId);
@@ -1504,7 +1621,10 @@ export function ChatScreen({
     const resendImages = promptMessage.attachmentContext ? [] : await storedMessageImages(promptMessage.id);
     const deltaAvailable = deltaEngagementEnabled();
     const systemParts = [
+      maskedSession && activeChat?.maskedInstructions?.trim() ? `Masked instructions (follow these before all other project context):\n${activeChat.maskedInstructions.trim()}` : "",
       `Project: ${project.name}`,
+      roleplayPacingInstruction(),
+      roleplayDiceEnabled() ? `D20 rules:\n${d20Instructions}` : "",
       activeChat?.world ? worldInstruction(activeChat.world) : "",
       deltaAvailable ? "Delta Mode boundary: the main chat must not run structured fights, hostile standoffs, tactical engagements, mission commitments, or combat-like confrontations as ordinary roleplay once they become imminent. When the current reply would initiate or clearly commit to that kind of engagement, call prepare_delta_engagement with a short in-world third-person scene beat instead of continuing the scene as normal chat. Use this only when the engagement is imminent, not for ordinary tension." : "",
       includeInstructions && project.instructions ? `Project instructions:\n${project.instructions}` : "",
@@ -1512,7 +1632,7 @@ export function ChatScreen({
       characterDetails,
       compactionEnabled && historyLimit && compactionMemory ? `Compaction memory:\n${compactionMemory}` : "",
       timelineContext,
-      timelineContinuityEnabled ? "Timeline updates: use add_timeline_entry only when the user explicitly asks to add an event to the timeline. This works in Manual mode. Summarize the event from available context, even if it spans multiple turns. Do not claim to have reviewed history you cannot see. Only confirm the tool's actual result; pendingApproval means it still needs the user's approval on the timeline page." : "",
+        !maskedSession && timelineContinuityEnabled ? "Timeline updates: use add_timeline_entry only when the user explicitly asks to add an event to the timeline. This works in Manual mode. Summarize the event from available context, even if it spans multiple turns. Do not claim to have reviewed history you cannot see. Only confirm the tool's actual result; pendingApproval means it still needs the user's approval on the timeline page." : "",
       await sourceLibraryContext(),
       await chatSourceContext(chatId, branchId).then((context) => context.text),
       resendImages.length ? "An image is attached to the latest user message. First call save_image_context exactly once with a detailed concise visual extraction. It is hidden from the user. Then answer the user normally from the image." : "",
@@ -1543,6 +1663,7 @@ export function ChatScreen({
         `Characters: ${charactersMode}`,
         `Source files: ${sourceFilesMode}`,
         `Compaction memory: ${compactionEnabled ? "on" : "off"}`,
+        `Masked session: ${maskedSession ? "on (shared writes blocked)" : "off"}`,
         `Timeline continuity: ${timelineContinuityEnabled ? "on" : "off"}`,
         `Project memories: ${project.memoryMode !== "manual" ? project.memoryMode : "manual/off"}`,
         `Auto inventory: ${inventoryToolEnabled("inventory") ? "on" : "off"}`,
@@ -1647,6 +1768,27 @@ export function ChatScreen({
       updatedAt: now()
     });
     await onRefresh();
+  }
+
+  async function resolveRoleplayRoll(message: Message, action: "ai" | "player" | "contest", input = "") {
+    const receipt = message.roleplayRoll;
+    if (!receipt || !project) return;
+    if (action === "contest") {
+      await db.messages.delete(message.id);
+      const note = await addMessage(message.chatId, message.branchId, "user", `(${receipt.rollerName} contested dice roll: ${receipt.raw} + ${receipt.modifier} (${receipt.ability}) = ${receipt.total}. Reason: ${input.trim()})`);
+      await db.messages.update(note.id, { diceInput: true, updatedAt: now() });
+      await onRefresh();
+      await resendFromMessage(note);
+      return;
+    }
+    await db.messages.update(message.id, { roleplayRoll: { ...receipt, status: "accepted" }, updatedAt: now() });
+    const handoff = action === "ai"
+      ? "[SYSTEM: The verified dice result above is accepted. Continue the AI turn from that result only. Do not reroll or print a dice result. Keep the reply under 300 words and leave room for the player.]"
+      : `((OOC: The verified dice result is accepted. Player input: ${input.trim()}))`;
+    const prompt = await addMessage(message.chatId, message.branchId, action === "ai" ? "system" : "user", handoff);
+    if (action === "player") await db.messages.update(prompt.id, { diceInput: true, updatedAt: now() });
+    await onRefresh();
+    await resendFromMessage(prompt);
   }
 
   async function avoidDeltaBrief(message: Message, attempt: string) {
@@ -1763,12 +1905,14 @@ export function ChatScreen({
   const editMessageRef = useRef(editMessage);
   const resendFromMessageRef = useRef(resendFromMessage);
   const inventoryUpdateActionRef = useRef(handleInventoryUpdateAction);
+  const roleplayRollActionRef = useRef(resolveRoleplayRoll);
   const beginDeltaBriefRef = useRef(beginDeltaBrief);
   const avoidDeltaBriefRef = useRef(avoidDeltaBrief);
   const onRefreshRef = useRef(onRefresh);
   editMessageRef.current = editMessage;
   resendFromMessageRef.current = resendFromMessage;
   inventoryUpdateActionRef.current = handleInventoryUpdateAction;
+  roleplayRollActionRef.current = resolveRoleplayRoll;
   beginDeltaBriefRef.current = beginDeltaBrief;
   avoidDeltaBriefRef.current = avoidDeltaBrief;
   onRefreshRef.current = onRefresh;
@@ -1778,6 +1922,7 @@ export function ChatScreen({
   const editMessageStable = useCallback((message: Message, nextBody: string) => editMessageRef.current(message, nextBody), []);
   const resendFromMessageStable = useCallback((message: Message) => resendFromMessageRef.current(message), []);
   const inventoryUpdateActionStable = useCallback((message: Message, action: "confirm" | "edit" | "reject", editedUpdates?: InventoryUpdateRequest[]) => inventoryUpdateActionRef.current(message, action, editedUpdates), []);
+  const roleplayRollActionStable = useCallback((message: Message, action: "ai" | "player" | "contest", input?: string) => roleplayRollActionRef.current(message, action, input), []);
   const beginDeltaBriefStable = useCallback((message: Message) => beginDeltaBriefRef.current(message), []);
   const avoidDeltaBriefStable = useCallback((message: Message, attempt: string) => avoidDeltaBriefRef.current(message, attempt), []);
   const onRefreshStable = useCallback(() => onRefreshRef.current(), []);
@@ -1806,9 +1951,44 @@ export function ChatScreen({
     setModelMenuOpen(false);
   }
 
+  async function createMaskedSession() {
+    if (!project || creatingMaskedSession) return;
+    setCreatingMaskedSession(true);
+    try {
+      const chatId = await createChat(project.id, "", {
+        compactionEnabled,
+        timelineContinuityEnabled,
+        timelineUpdateMode,
+        d20Enabled,
+        d20Instructions: d20Instructions.trim() || undefined,
+        maskedSession: true
+      });
+      setMaskedSessionInfoOpen(false);
+      await onChatCreated(chatId);
+    } finally {
+      setCreatingMaskedSession(false);
+    }
+  }
+
+  async function endMaskedSession() {
+    if (!chat?.maskedSession) return;
+    await db.chats.update(chat.id, { maskedSession: false, updatedAt: now() });
+    setContextOpen(false);
+    setMaskedSettingsOpen(false);
+    await onRefresh();
+  }
+
+  async function saveMaskedSettings() {
+    if (!chat?.maskedSession) return;
+    await db.chats.update(chat.id, { maskedInstructions: maskedInstructions.trim() || undefined, updatedAt: now() });
+    setMaskedSettingsOpen(false);
+    await onRefresh();
+  }
+
   return (
     <div className="chat-screen">
-      {!chat && messages.length === 0 && <EmptyState title="Ready when you are" body="Start a new project chat from the composer." />}
+      {!chat && messages.length === 0 && <EmptyState title="Ready when you are" body={<>Start a new project chat from the composer, or <button type="button" className="text-link" onClick={() => setMaskedSessionInfoOpen(true)}>create a masked session</button>.</>} />}
+      {maskedSession && <div className="masked-session-banner" role="status"><strong>Masked session</strong><span>Project context is available, but this chat cannot change shared memories or timeline records.</span></div>}
       <VirtualMessageList
         projectId={project.id}
         messages={messages}
@@ -1818,6 +1998,7 @@ export function ChatScreen({
         onEdit={editMessageStable}
         onResend={resendFromMessageStable}
         onInventoryUpdateAction={inventoryUpdateActionStable}
+        onRoleplayRollAction={roleplayRollActionStable}
         onBeginDeltaBrief={beginDeltaBriefStable}
         onAvoidDeltaBrief={avoidDeltaBriefStable}
         deltaLocked={deltaLocked}
@@ -1840,6 +2021,18 @@ export function ChatScreen({
               </div>,
               document.body
             )}
+            <button className="model-row thinking-row" type="button" aria-expanded={thinkingMenuOpen} aria-haspopup="menu" onClick={toggleThinkingMenu}>
+              <span>Thinking</span>
+              <strong>{thinkingModeLabel(selectedThinkingMode)}</strong>
+            </button>
+            {thinkingMenuOpen && thinkingMenuPosition && createPortal(
+              <div className="model-menu thinking-menu" role="menu" aria-label="Choose thinking mode" style={thinkingMenuPosition}>
+                {thinkingCapabilities.availableModes.map((mode) => <button key={mode} className={mode === selectedThinkingMode ? "picked" : ""} type="button" role="menuitemradio" aria-checked={mode === selectedThinkingMode} onClick={() => void chooseThinkingMode(mode)}>
+                  <span>{thinkingModeLabel(mode)}</span><small aria-hidden="true">{mode === selectedThinkingMode ? "✓" : ""}</small>
+                </button>)}
+              </div>,
+              document.body
+            )}
             {modelSaveError && <small className="error">{modelSaveError}</small>}
             <button className="drawer-action-row" type="button" onClick={openChatSettings}>
               <Settings size={18} /> Chat settings
@@ -1847,6 +2040,9 @@ export function ChatScreen({
             <button className="drawer-action-row" type="button" onClick={() => void openChatSources()} disabled={!chat}>
               <BookOpen size={18} /> Chat sources
             </button>
+            {maskedSession && <button className="drawer-action-row" type="button" onClick={() => { setContextOpen(false); setMaskedSettingsOpen(true); }}>
+              Masked settings
+            </button>}
             <button className="drawer-action-row" type="button" onClick={() => imagePickerRef.current?.click()}><ImageIcon size={18} /> Attach Image</button>
             <button className="drawer-action-row" type="button" onClick={() => filePickerRef.current?.click()}><Paperclip size={18} /> Attach File</button>
             <input ref={filePickerRef} className="visually-hidden" type="file" multiple onChange={(event) => { chooseFiles(event.target.files); event.currentTarget.value = ""; }} />
@@ -1867,6 +2063,7 @@ export function ChatScreen({
                 <ContextModeSetting label="Instructions" value={includeInstructions ? "all" : "none"} onChange={(value) => setIncludeInstructions(value === "all")} />
                 <ContextModeSetting label="Source files" value={sourceFilesMode} onChange={setSourceFilesMode} lookup />
                 <ContextModeSetting label="Characters" value={charactersMode} onChange={setCharactersMode} lookup />
+                <div className="inline-setting-pair"><label className="compact-check"><input type="checkbox" checked={d20Enabled} onChange={(event) => setD20Enabled(event.target.checked)} /> Use DnD-style D20 rolls.</label><button className="text-button" type="button" onClick={() => setD20InstructionsOpen(true)}>roll settings</button></div>
                 </>}
                 {chatSettingsTab === "world" && <>
                 <section className="world-settings stack">
@@ -1882,9 +2079,9 @@ export function ChatScreen({
                 </section>
                 </>}
                 {chatSettingsTab === "general" && <>
-                <label className="compact-check"><input type="checkbox" checked={inventoryEnabled} onChange={(event) => setInventoryEnabled(event.target.checked)} /> Enable inventory</label>
+                <label className="compact-check"><input type="checkbox" checked={inventoryEnabled} disabled={maskedSession} onChange={(event) => setInventoryEnabled(event.target.checked)} /> Enable inventory</label>
                 {inventoryEnabled && <div className="inline-setting-pair"><label className="compact-check"><input type="checkbox" checked={autoManageInventory} onChange={(event) => setAutoManageInventory(event.target.checked)} /> Auto manage Inventory</label><label className="compact-check"><input type="checkbox" checked={confirmInventoryUpdates} onChange={(event) => setConfirmInventoryUpdates(event.target.checked)} /> Use confirmation</label></div>}
-                <label className="compact-check"><input type="checkbox" checked={gearEnabled} onChange={(event) => setGearEnabled(event.target.checked)} /> Enable gear</label>
+                <label className="compact-check"><input type="checkbox" checked={gearEnabled} disabled={maskedSession} onChange={(event) => setGearEnabled(event.target.checked)} /> Enable gear</label>
                 <label className="compact-check"><input type="checkbox" checked={compactionEnabled} onChange={(event) => setCompactionEnabled(event.target.checked)} /> Memory compaction</label>
                 <label className="compact-check"><input type="checkbox" checked={timelineContinuityEnabled} onChange={(event) => setTimelineContinuityEnabled(event.target.checked)} /> Timeline continuity</label>
                 {timelineContinuityEnabled && <label>Timeline updates<select aria-label="Timeline updates" value={timelineUpdateMode} onChange={(event) => setTimelineUpdateMode(event.target.value as NonNullable<Chat["timelineUpdateMode"]>)}>
@@ -1921,6 +2118,7 @@ export function ChatScreen({
           </div>,
           document.body
         )}
+        {d20InstructionsOpen && createPortal(<div className="modal-backdrop" onClick={() => setD20InstructionsOpen(false)}><section className="modal chat-settings-modal" onClick={(event) => event.stopPropagation()}><div className="section-title"><h2>D20 roll instructions</h2><button className="icon-button" onClick={() => setD20InstructionsOpen(false)} aria-label="Close"><X size={18} /></button></div><p className="notice">These instructions apply only to this chat. The roll itself is always generated and audited locally.</p><textarea className="large-entry" rows={10} value={d20Instructions} onChange={(event) => setD20Instructions(event.target.value)} /><div className="split-actions"><button onClick={() => { if (chat) void db.chats.update(chat.id, { d20Enabled, d20Instructions: d20Instructions.trim() || undefined, updatedAt: now() }); setD20InstructionsOpen(false); }}><Save size={18} /> Save</button></div></section></div>, document.body)}
         {chatSourcesOpen && createPortal(
           <div className="modal-backdrop chat-settings-backdrop" onClick={() => setChatSourcesOpen(false)}>
             <section className="modal chat-settings-modal" role="dialog" aria-modal="true" aria-labelledby="chat-sources-title" onClick={(event) => event.stopPropagation()}>
@@ -1944,6 +2142,29 @@ export function ChatScreen({
               <p>This chat has features that use tools. The saved details for <strong>{draftModelId}</strong> say it does not support them.</p>
               <p className="muted">If that is out of date, fetch OpenRouter models again in API settings, then refresh this model in your library.</p>
               <div className="split-actions"><button type="button" onClick={() => setToolRequirementOpen(false)}>Okay</button></div>
+            </section>
+          </div>,
+          document.body
+        )}
+        {maskedSessionInfoOpen && createPortal(
+          <div className="modal-backdrop masked-session-backdrop" onClick={() => setMaskedSessionInfoOpen(false)}>
+            <section className="modal masked-session-modal" role="dialog" aria-modal="true" aria-labelledby="masked-session-title" onClick={(event) => event.stopPropagation()}>
+              <div className="section-title"><h2 id="masked-session-title">Create a masked session?</h2><button type="button" className="icon-button" onClick={() => setMaskedSessionInfoOpen(false)} aria-label="Close"><X size={18} /></button></div>
+              <p>A masked session is a private working thread inside this project. It keeps the project’s existing context, memories, sources, and enabled tools available to you, but it never writes new memories or timeline entries back to the shared project.</p>
+              <p>Use it to test ideas, explore alternate directions, or ask a throwaway question without changing what future project chats know.</p>
+              <p>You can turn masking off later, but you cannot turn it back on for this chat. Masked sessions can only be created as new threads.</p>
+              <div className="split-actions"><button type="button" className="save-button" disabled={creatingMaskedSession} onClick={() => void createMaskedSession()}>{creatingMaskedSession ? "Creating…" : "Create masked session"}</button><button type="button" onClick={() => setMaskedSessionInfoOpen(false)}>Cancel</button></div>
+            </section>
+          </div>,
+          document.body
+        )}
+        {maskedSettingsOpen && createPortal(
+          <div className="modal-backdrop masked-session-backdrop" onClick={() => setMaskedSettingsOpen(false)}>
+            <section className="modal masked-session-modal" role="dialog" aria-modal="true" aria-labelledby="masked-settings-title" onClick={(event) => event.stopPropagation()}>
+              <div className="section-title"><h2 id="masked-settings-title">Masked settings</h2><button type="button" className="icon-button" onClick={() => setMaskedSettingsOpen(false)} aria-label="Close masked settings"><X size={18} /></button></div>
+              <label className="masked-instructions-field">Masked instructions<textarea rows={10} value={maskedInstructions} placeholder="Private instructions for this masked thread…" onChange={(event) => setMaskedInstructions(event.target.value)} /><small>These instructions apply only to this masked thread. They are sent before project instructions, world setting, memories, sources, and other project context.</small></label>
+              <div className="split-actions"><button type="button" className="save-button" onClick={() => void saveMaskedSettings()}><Save size={16} /> Save</button></div>
+              <section className="masked-session-danger"><strong>Turn off masked session</strong><p>After you turn masking off, this chat can write to shared project systems again. You cannot turn masking back on for this chat.</p><button type="button" className="danger" onClick={() => void endMaskedSession()}>Turn off masked session</button></section>
             </section>
           </div>,
           document.body
@@ -1974,7 +2195,8 @@ export function ChatScreen({
             </section>
           </div>
         , document.body)}
-        <button className="composer-plus" onClick={() => { setContextOpen(!contextOpen); setModelMenuOpen(false); }} disabled={deltaLocked} aria-label="Chat settings and attachments">
+        {body.trim() && <div className="thinking-status">You are using thinking: {thinkingModeLabel(selectedThinkingMode)}.</div>}
+        <button className="composer-plus" onClick={() => { setContextOpen(!contextOpen); setModelMenuOpen(false); setThinkingMenuOpen(false); }} disabled={deltaLocked} aria-label="Chat settings and attachments">
           <Plus size={20} />
         </button>
         <textarea ref={composerRef} className="composer-input" value={body} onChange={(event) => setBody(event.target.value)} onFocus={() => keepComposerVisible(composerRef.current)} onClick={() => keepComposerVisible(composerRef.current)} disabled={deltaLocked} placeholder={deltaLocked ? "Resolve engagement to unlock chat." : "Message this project"} rows={1} />

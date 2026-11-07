@@ -46,6 +46,7 @@ function MessageRow({
   onEdit,
   onResend,
   onInventoryUpdateAction,
+  onRoleplayRollAction,
   onBeginDeltaBrief,
   onAvoidDeltaBrief,
   deltaLocked,
@@ -59,6 +60,7 @@ function MessageRow({
   onEdit: (message: Message, nextBody: string) => Promise<Message>;
   onResend: (message: Message) => Promise<void>;
   onInventoryUpdateAction: (message: Message, action: "confirm" | "edit" | "reject", editedUpdates?: InventoryUpdateRequest[]) => Promise<void>;
+  onRoleplayRollAction: (message: Message, action: "ai" | "player" | "contest", input?: string) => Promise<void>;
   onBeginDeltaBrief: (message: Message) => Promise<void>;
   onAvoidDeltaBrief: (message: Message, attempt: string) => Promise<void>;
   deltaLocked: boolean;
@@ -76,6 +78,8 @@ function MessageRow({
   const [avoidOpen, setAvoidOpen] = useState(false);
   const [avoidText, setAvoidText] = useState("");
   const [avoidSaving, setAvoidSaving] = useState(false);
+  const [rollInputAction, setRollInputAction] = useState<"player" | "contest">();
+  const [rollInput, setRollInput] = useState("");
   const [deltaCharacters, setDeltaCharacters] = useState<Character[]>([]);
   const editImagePickerRef = useRef<HTMLInputElement>(null);
   const editFilePickerRef = useRef<HTMLInputElement>(null);
@@ -189,6 +193,11 @@ function MessageRow({
       setAvoidSaving(false);
     }
   }
+  async function submitRollInput() {
+    if (!rollInputAction || !rollInput.trim()) return;
+    await onRoleplayRollAction(message, rollInputAction, rollInput);
+    setRollInput(""); setRollInputAction(undefined);
+  }
   async function updateDeltaPlayerCharacter(playerCharacterId: string) {
     const brief = message.deltaBrief;
     if (!brief) return;
@@ -242,6 +251,17 @@ function MessageRow({
       >
         {message.role === "user" && <MessageImageAttachments messageId={message.id} />}
         <div className="message-body">{message.status === "pending" && message.body.trim() === "..." ? <LoadingSignal /> : <MarkdownText text={message.body} inventoryMarkers />}</div>
+        {message.roleplayRoll && <div className="roleplay-roll-card" onClick={(event) => event.stopPropagation()}>
+          <button type="button" className="roleplay-roll-result" onClick={() => setInfoOpen(true)} title="Open response audit">
+            <span>🎲 d{message.roleplayRoll.die}</span> {message.roleplayRoll.rollerName}: {message.roleplayRoll.raw} {message.roleplayRoll.modifier >= 0 ? "+" : "-"} {Math.abs(message.roleplayRoll.modifier)} ({message.roleplayRoll.ability}) = <strong>{message.roleplayRoll.total}</strong>{message.roleplayRoll.target !== undefined ? ` vs DC ${message.roleplayRoll.target}` : ""}
+          </button>
+          <small>{message.roleplayRoll.label} · Retrieved Character: {message.roleplayRoll.rollerName}, {message.roleplayRoll.scores.STR} {message.roleplayRoll.scores.DEX} {message.roleplayRoll.scores.CON} {message.roleplayRoll.scores.INT} {message.roleplayRoll.scores.WIS} {message.roleplayRoll.scores.CHA} · client-web-crypto{message.roleplayRoll.generatedStats ? " · generated stats cached" : ""}</small>
+          {message.roleplayRoll.status === "pending" && <div className="roleplay-roll-actions">
+            <button type="button" onClick={() => void onRoleplayRollAction(message, "ai")}>AI Turn</button>
+            <button type="button" onClick={() => setRollInputAction("player")}>My Turn</button>
+            <button type="button" onClick={() => setRollInputAction("contest")}>Contest Dice</button>
+          </div>}
+        </div>}
         {message.deltaBrief?.status === "pending" && (
           <div className="delta-brief-panel" onClick={(event) => event.stopPropagation()}>
             <div className="delta-brief-preflight">
@@ -355,6 +375,7 @@ function MessageRow({
           </section>
         </div>, document.body)
       )}
+      {rollInputAction && createPortal(<div className="modal-backdrop" onClick={() => setRollInputAction(undefined)}><section className="star-modal message-info-modal" onClick={(event) => event.stopPropagation()}><div className="section-title"><h2>{rollInputAction === "contest" ? "Your contest" : "Your turn"}</h2><button className="icon-button" onClick={() => setRollInputAction(undefined)} aria-label="Cancel"><X size={18} /></button></div><textarea className="large-entry" autoFocus rows={5} value={rollInput} onChange={(event) => setRollInput(event.target.value)} placeholder={rollInputAction === "contest" ? "Explain what was wrong with this roll..." : "Add your character's thoughts, response, or roleplay..."} /><div className="split-actions"><button onClick={() => void submitRollInput()} disabled={!rollInput.trim()}>Send</button><button onClick={() => setRollInputAction(undefined)}>Cancel</button></div></section></div>, document.body)}
     </>
   );
 }
@@ -389,6 +410,7 @@ type VirtualMessageListData = {
   onEdit: (message: Message, nextBody: string) => Promise<Message>;
   onResend: (message: Message) => Promise<void>;
   onInventoryUpdateAction: (message: Message, action: "confirm" | "edit" | "reject", editedUpdates?: InventoryUpdateRequest[]) => Promise<void>;
+  onRoleplayRollAction?: (message: Message, action: "ai" | "player" | "contest", input?: string) => Promise<void>;
   onBeginDeltaBrief: (message: Message) => Promise<void>;
   onAvoidDeltaBrief: (message: Message, attempt: string) => Promise<void>;
   deltaLocked: boolean;
@@ -420,6 +442,7 @@ function VirtualMessageListRow({ index, style, data }: ListChildComponentProps<V
           onEdit={data.onEdit}
           onResend={data.onResend}
           onInventoryUpdateAction={data.onInventoryUpdateAction}
+          onRoleplayRollAction={data.onRoleplayRollAction ?? (async () => undefined)}
           onBeginDeltaBrief={data.onBeginDeltaBrief}
           onAvoidDeltaBrief={data.onAvoidDeltaBrief}
           deltaLocked={data.deltaLocked}
@@ -446,6 +469,7 @@ function MeasuredMessageList({
   onEdit,
   onResend,
   onInventoryUpdateAction,
+  onRoleplayRollAction,
   onBeginDeltaBrief,
   onAvoidDeltaBrief,
   deltaLocked,
@@ -505,9 +529,9 @@ function MeasuredMessageList({
     });
   }, [messages.length]);
   const itemData = useMemo<VirtualMessageListData>(() => ({
-    projectId, messages, expandedMessageId, onExpand, onEdit, onResend, onInventoryUpdateAction,
+    projectId, messages, expandedMessageId, onExpand, onEdit, onResend, onInventoryUpdateAction, onRoleplayRollAction,
     onBeginDeltaBrief, onAvoidDeltaBrief, deltaLocked, onOpenChatSettings, onRefresh, onSize
-  }), [projectId, messages, expandedMessageId, onExpand, onEdit, onResend, onInventoryUpdateAction, onBeginDeltaBrief, onAvoidDeltaBrief, deltaLocked, onOpenChatSettings, onRefresh, onSize]);
+  }), [projectId, messages, expandedMessageId, onExpand, onEdit, onResend, onInventoryUpdateAction, onRoleplayRollAction, onBeginDeltaBrief, onAvoidDeltaBrief, deltaLocked, onOpenChatSettings, onRefresh, onSize]);
 
   return (
     <div ref={hostRef} className="virtual-message-list-host">

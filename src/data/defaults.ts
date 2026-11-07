@@ -59,6 +59,7 @@ export const defaultSettings = (): AppSettings => {
     id: "settings",
     createdAt: now,
     updatedAt: now,
+    profileName: "User",
     theme: "onyx",
     displayMode: "mobile",
     accent: "sage",

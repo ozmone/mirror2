@@ -35,13 +35,15 @@ export type RouteName =
   | "archives"
   | "archiveEntries"
   | "characters"
+  | "characterStats"
   | "characterProfile"
   | "memories"
   | "timeline"
   | "compaction"
   | "api"
   | "data"
-  | "settings";
+  | "settings"
+  | "changelog";
 
 export interface Timestamped {
   id: string;
@@ -50,6 +52,10 @@ export interface Timestamped {
 }
 
 export interface AppSettings extends Timestamped {
+  /** Cosmetic profile details are stored locally and never included in chat requests. */
+  profileName?: string;
+  profileAvatarDataUrl?: string;
+  profileAvatarCrop?: { x: number; y: number; zoom: number };
   theme: ThemeName;
   displayMode?: DisplayMode;
   accent: AccentName;
@@ -66,6 +72,8 @@ export interface AppSettings extends Timestamped {
   apiKey?: string;
   privacyPreset: "maximum" | "balanced" | "availability";
   defaultModelId?: string;
+  /** User's last valid explicit thinking choice for each model. */
+  thinkingModeByModel?: Partial<Record<string, "instant" | "low" | "medium" | "high">>;
   temperature?: number;
   topP?: number;
   maxTokens?: number;
@@ -123,11 +131,17 @@ export interface Project extends Timestamped {
   deltaSystemPrompt?: string;
   deltaRevealText?: boolean;
   deltaRevealSpeed?: number;
+  /** Ability scores created for unsaved roleplay characters, keyed by normalized name. */
+  roleplayStatCache?: Record<string, AbilityScores>;
 }
 
 export interface Chat extends Timestamped {
   projectId: string;
   title: string;
+  /** Reads project context but prevents this thread from changing shared project records. */
+  maskedSession?: boolean;
+  /** Private, thread-scoped instructions prepended to every masked-session request. */
+  maskedInstructions?: string;
   pinned?: boolean;
   titleState: "manual" | "pending" | "generated" | "fallback";
   modelId?: string;
@@ -147,6 +161,8 @@ export interface Chat extends Timestamped {
   deltaRevealText?: boolean;
   deltaRevealSpeed?: number;
   world?: WorldState;
+  d20Enabled?: boolean;
+  d20Instructions?: string;
 }
 
 export type WorldTimeMode = "realtime" | "ai" | "disabled";
@@ -227,6 +243,26 @@ export interface Message extends Timestamped {
     avoidPrompt?: string;
     startedAt?: number;
   };
+  /** A client-generated main-chat roll. The model cannot author its result. */
+  roleplayRoll?: RoleplayRollReceipt;
+  diceInput?: boolean;
+}
+
+export interface RoleplayRollReceipt {
+  id: string;
+  source: "client-web-crypto";
+  rollerName: string;
+  label: string;
+  ability: Ability;
+  die: number;
+  raw: number;
+  modifier: number;
+  total: number;
+  scores: AbilityScores;
+  target?: number;
+  generatedStats?: AbilityScores;
+  status: "pending" | "accepted" | "contested";
+  createdAt: number;
 }
 
 export interface MainChatAuditMemoryHit {
@@ -492,6 +528,8 @@ export interface Star extends Timestamped {
   role: Message["role"];
   bodyCopy: string;
   note?: string;
+  /** Personal 1–5 rating; omitted means unrated. */
+  rating?: number;
 }
 
 export interface Archive extends Timestamped {
@@ -753,6 +791,9 @@ export interface ModelLibraryEntry extends Timestamped {
   orderIndex: number;
   contextLength?: number;
   supportsTools?: boolean;
+  /** Exact reasoning choices verified for this model, if available. */
+  thinkingModes?: Array<"instant" | "low" | "medium" | "high">;
+  defaultThinkingMode?: "instant" | "low" | "medium" | "high";
   pricing?: string;
   inputPricePerMillionUsd?: number;
   outputPricePerMillionUsd?: number;

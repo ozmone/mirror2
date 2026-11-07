@@ -1,5 +1,5 @@
 import { db } from "../../data/db";
-import type { MainChatAuditRequest, Message, WorldReplyMetadata } from "../../types";
+import type { MainChatAuditRequest, Message, RoleplayRollReceipt, WorldReplyMetadata } from "../../types";
 import { estimateTokens, now } from "../../utils";
 import type { OpenRouterResponse, OpenRouterUsage } from "../openRouter";
 
@@ -11,6 +11,7 @@ type ToolReply = {
   memoryManagementTurn?: boolean;
   finalizedTurn?: { prose: string; metadata: WorldReplyMetadata };
   deltaImminentProposal?: Omit<NonNullable<Message["deltaBrief"]>, "status">;
+  roleplayRoll?: RoleplayRollReceipt;
 };
 
 type ReplyOptions = {
@@ -76,6 +77,7 @@ export async function completeReply(options: ReplyOptions, database = db) {
     extra = {
       memoryManagementTurn: completed.memoryManagementTurn,
       deltaBrief: proposal ? { ...proposal, status: "pending", avoidLabel: proposal.avoidLabel || "Escape", avoidPrompt: proposal.avoidPrompt || "What do you do to avoid the engagement?" } : undefined,
+      roleplayRoll: completed.roleplayRoll,
       worldState: completed.finalizedTurn?.metadata
     };
     // Preserve the existing estimate for engagement briefs.
@@ -101,7 +103,7 @@ export async function completeReply(options: ReplyOptions, database = db) {
     }
     if (audit) audit.status = "complete";
   }
-  const body = text || "(No response text returned.)";
+  const body = extra.roleplayRoll ? "" : text || "(No response text returned.)";
   await database.messages.update(messageId, {
     body, inputTokens, outputTokens: outputTokens ?? estimateTokens(text), estimatedTokens: outputTokens === undefined,
     status: "complete", requestInfo: { ...requestInfo, toolCalls: requestInfo.toolCalls.length ? requestInfo.toolCalls : ["None"] },

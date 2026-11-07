@@ -300,7 +300,7 @@ export async function createProject(name: string) {
   return project;
 }
 
-export async function createChat(projectId: string, firstMessage: string, continuity?: Pick<Chat, "timelineContinuityEnabled" | "compactionEnabled" | "timelineUpdateMode">) {
+export async function createChat(projectId: string, firstMessage = "", continuity?: Pick<Chat, "timelineContinuityEnabled" | "compactionEnabled" | "timelineUpdateMode" | "d20Enabled" | "d20Instructions" | "maskedSession">) {
   const timestamp = now();
   const settings = await db.settings.get("settings");
   const chatId = uid();
@@ -311,6 +311,7 @@ export async function createChat(projectId: string, firstMessage: string, contin
       id: chatId,
       projectId,
       title: fallbackChatTitle(firstMessage),
+      maskedSession: continuity?.maskedSession,
       pinned: false,
       titleState: "fallback",
       activeBranchId: branchId,
@@ -321,9 +322,11 @@ export async function createChat(projectId: string, firstMessage: string, contin
       compactionEnabled: continuity?.compactionEnabled ?? settings?.compactionEnabled ?? false,
       timelineContinuityEnabled: continuity?.timelineContinuityEnabled ?? settings?.timelineContinuityEnabled ?? false,
       timelineUpdateMode: continuity?.timelineUpdateMode ?? settings?.timelineUpdateMode ?? "automatic",
+      d20Enabled: continuity?.d20Enabled ?? false,
+      d20Instructions: continuity?.d20Instructions,
       world: defaultWorldState()
     });
-    await addMessage(chatId, branchId, "user", firstMessage, undefined, 0);
+    if (firstMessage.trim()) await addMessage(chatId, branchId, "user", firstMessage, undefined, 0);
   });
   return chatId;
 }

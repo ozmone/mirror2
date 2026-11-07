@@ -26,6 +26,6 @@ export function ImageViewer({ attachments, index, onChange, onClose }: { attachm
   );
 }
 
-export function EmptyState({ title, body }: { title: string; body: string }) {
+export function EmptyState({ title, body }: { title: string; body: React.ReactNode }) {
   return <section className="empty"><MothMark /><h1>{title}</h1><p>{body}</p></section>;
 }

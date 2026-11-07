@@ -480,6 +480,12 @@ export class MirrorDatabase extends Dexie {
     this.version(20).stores({
       attachments: "id, [ownerType+ownerId], [ownerType+ownerId+createdAt]"
     });
+    this.version(21).stores({
+      stars: "id, [projectId+updatedAt], [projectId+rating], messageId, chatId, rating"
+    });
+    // Masked-session status is stored on chats and needs no index or data migration.
+    this.version(22).stores({});
+    this.version(23).stores({});
   }
 }
 

@@ -68,6 +68,20 @@ export const characterTools = [
   }
 ] as const;
 
+export const roleplayRollTools = [{
+  type: "function",
+  function: {
+    name: "request_roleplay_roll",
+    description: "Pause ordinary roleplay for one authoritative, client-generated d20 check. Call this before narrating any uncertain action or consequence covered by the project's dice rules. The client, not you, chooses the number and obtains the roller's saved ability score; if no profile or stats exist it creates and remembers fitting stats. Do not narrate the outcome, print a dice line, or continue the turn after calling this tool.",
+    parameters: { type: "object", properties: {
+      rollerName: { type: "string", description: "The character making the check." },
+      label: { type: "string", description: "Short action, e.g. read her mind." },
+      ability: { type: "string", enum: ["STR", "DEX", "CON", "INT", "WIS", "CHA"], description: "The governing ability." },
+      target: { type: "number", description: "Optional known difficulty class." }
+    }, required: ["rollerName", "label", "ability"] }
+  }
+}] as const;
+
 export const inventoryTools = [
   {
     type: "function",

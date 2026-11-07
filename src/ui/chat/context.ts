@@ -141,6 +141,10 @@ export async function imageForOpenRouter(file: File) {
 }
 
 function messageHistoryText(message: Message, useCondensation = true) {
+  if (message.roleplayRoll) {
+    const roll = message.roleplayRoll;
+    return `[Verified client dice receipt: ${roll.rollerName} rolled d${roll.die} for ${roll.label}: raw ${roll.raw} + ${roll.modifier >= 0 ? "+" : "-"}${Math.abs(roll.modifier)} ${roll.ability} = ${roll.total}${roll.target !== undefined ? ` vs DC ${roll.target}` : ""}. Status: ${roll.status}. This number is authoritative; never invent, alter, or repeat a dice roll.]`;
+  }
   const source = useCondensation && message.contextCondensation && message.contextCondensationSourceUpdatedAt === message.updatedAt
     ? message.contextCondensation
     : message.body;

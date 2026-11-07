@@ -55,6 +55,7 @@ import {
   normaliseInventoryName,
   refreshActiveDeltaCharacterStats,
   searchMemories,
+  totalPointCost,
   validatePointBuy
 } from "../data/repositories";
 import { buildSourceChunks } from "../data/sources";
@@ -154,13 +155,15 @@ const routeLabels: Record<RouteName, string> = {
   archives: "Archives",
   archiveEntries: "Archive Entries",
   characters: "Characters",
+  characterStats: "Character Stats",
   characterProfile: "Character Profile",
   memories: "Memories",
   timeline: "Timeline continuity",
   compaction: "Compaction Memory",
   api: "API",
   data: "Data",
-  settings: "Settings"
+  settings: "Settings",
+  changelog: "Changelog"
 };
 
 const sidebarSpacingOptions: SidebarSpacing[] = ["22", "24", "28", "36"];
@@ -188,6 +191,43 @@ function normaliseSidebarWidth(value: unknown): SidebarWidth {
   if (value === "slim") return "300";
   if (value === "wide") return "420";
   return sidebarWidthOptions.includes(value as SidebarWidth) ? value as SidebarWidth : "380";
+}
+
+type AvatarCrop = NonNullable<AppSettings["profileAvatarCrop"]>;
+
+function normaliseAvatarCrop(value?: AppSettings["profileAvatarCrop"]): AvatarCrop {
+  return {
+    x: Math.max(0, Math.min(100, Number.isFinite(value?.x) ? Number(value?.x) : 50)),
+    y: Math.max(0, Math.min(100, Number.isFinite(value?.y) ? Number(value?.y) : 50)),
+    zoom: Math.max(1, Math.min(2.5, Number.isFinite(value?.zoom) ? Number(value?.zoom) : 1))
+  };
+}
+
+function avatarImageStyle(crop?: AppSettings["profileAvatarCrop"]) {
+  const { x, y } = normaliseAvatarCrop(crop);
+  return { objectPosition: `${x}% ${y}%` };
+}
+
+function renderAvatarCrop(dataUrl: string, crop: AvatarCrop): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => {
+      const size = 512;
+      const baseScale = Math.max(size / image.naturalWidth, size / image.naturalHeight);
+      const scale = baseScale * crop.zoom;
+      const width = image.naturalWidth * scale;
+      const height = image.naturalHeight * scale;
+      const canvas = document.createElement("canvas");
+      canvas.width = size;
+      canvas.height = size;
+      const context = canvas.getContext("2d");
+      if (!context) return reject(new Error("Avatar crop canvas is unavailable."));
+      context.drawImage(image, -Math.max(0, width - size) * crop.x / 100, -Math.max(0, height - size) * crop.y / 100, width, height);
+      resolve(canvas.toDataURL("image/png"));
+    };
+    image.onerror = () => reject(new Error("The selected image could not be cropped."));
+    image.src = dataUrl;
+  });
 }
 
 function cleanAbilityScores(value?: AbilityScores): AbilityScores {
@@ -358,6 +398,7 @@ export function App() {
   const [selectedChatActiveDelta, setSelectedChatActiveDelta] = useState<DeltaSession>();
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const [worldStatusOpen, setWorldStatusOpen] = useState(false);
+  const [starRatingFilter, setStarRatingFilter] = useState<0 | 1 | 2 | 3 | 4 | 5>(0);
   const [, setWorldClockTick] = useState(0);
   const navigationReadyRef = useRef(false);
   const applyingHistoryNavigationRef = useRef(false);
@@ -559,7 +600,7 @@ export function App() {
   const projectChats = useMemo(() => chats.filter((chat) => chat.projectId === selectedProjectId), [chats, selectedProjectId]);
   const title = route === "chat"
     ? selectedProject?.name ?? "Choose a project"
-    : selectedProject && ["stars", "archives", "archiveEntries", "characters", "characterProfile", "memories", "timeline", "compaction"].includes(route)
+    : selectedProject && ["stars", "archives", "archiveEntries", "characters", "characterStats", "characterProfile", "memories", "timeline", "compaction"].includes(route)
       ? `${selectedProject.name} / ${routeLabels[route]}`
       : routeLabels[route];
 
@@ -725,7 +766,16 @@ export function App() {
         worldStatusOpen={worldStatusOpen}
         onWorldToggle={() => setWorldStatusOpen((open) => !open)}
         onMenu={() => setDrawerOpen(true)}
-        right={route === "chat" && selectedProject ? (
+        onBack={route === "changelog" ? () => window.history.back() : undefined}
+        right={route === "stars" ? (
+          <label className="star-rating-filter">
+            <span>Search by stars:</span>
+            <select aria-label="Search starred messages by rating" value={starRatingFilter} onChange={(event) => setStarRatingFilter(Number(event.target.value) as 0 | 1 | 2 | 3 | 4 | 5)}>
+              <option value={0}>All</option>
+              {[1, 2, 3, 4, 5].map((rating) => <option key={rating} value={rating}>{rating} {rating === 1 ? "star" : "stars"}</option>)}
+            </select>
+          </label>
+        ) : route === "chat" && selectedProject ? (
           <div className="header-actions">
             {selectedProject.inventoryEnabled && (
               <button className="inventory-trigger" onClick={() => setInventoryOpen(true)} aria-label="Open inventory" title="Inventory">
@@ -821,6 +871,9 @@ export function App() {
       )}
       <Drawer
         apiKey={settings.apiKey}
+        profileName={settings.profileName}
+        profileAvatarDataUrl={settings.profileAvatarDataUrl}
+        profileAvatarCrop={settings.profileAvatarCrop}
         open={drawerOpen}
         projects={projects}
         selectedProjectId={selectedProjectId}
@@ -850,6 +903,11 @@ export function App() {
         onDeleteChat={deleteChat}
         onToggleProjectPin={toggleProjectPin}
         onToggleChatPin={toggleChatPin}
+        onProfileSaved={async (profile) => {
+          const updatedAt = now();
+          await db.settings.update("settings", { ...profile, updatedAt });
+          setSettings((current) => ({ ...current, ...profile, updatedAt }));
+        }}
       />
       <main className="screen">
         {route === "chat" && (
@@ -878,28 +936,30 @@ export function App() {
         )}
         {route === "projects" && <ProjectsPage projects={projects} selectedProjectId={selectedProjectId} onSelect={setSelectedProjectId} onEdit={(id) => { setEditingProjectId(id); setProjectEditInitialTab("general"); setRoute("projectEdit"); }} onRefresh={refresh} />}
         {route === "projectEdit" && editingProject && <ProjectEditPage key={`${editingProject.id}:${projectEditInitialTab}`} project={editingProject} initialTab={projectEditInitialTab} onRefresh={refresh} onDone={() => setRoute("projects")} />}
-        {route === "stars" && <StarsPage project={selectedProject} />}
+        {route === "stars" && <StarsPage project={selectedProject} ratingFilter={starRatingFilter} />}
         {route === "archives" && <ArchivesPage project={selectedProject} />}
-        {route === "characters" && <CharactersPage project={selectedProject} onOpenProfile={(id) => { setProfileCharacterId(id); setRoute("characterProfile"); }} />}
+        {route === "characters" && <CharactersPage project={selectedProject} onOpenProfile={(id) => { setProfileCharacterId(id); setRoute("characterProfile"); }} onOpenStats={() => setRoute("characterStats")} />}
+        {route === "characterStats" && selectedProject && <CharacterStatsPage project={selectedProject} onBack={() => setRoute("characters")} />}
         {route === "characterProfile" && selectedProject && profileCharacterId && <CharacterProfilePage project={selectedProject} characterId={profileCharacterId} chatId={selectedChat?.id} onBack={() => setRoute("characters")} />}
         {route === "timeline" && <TimelinePage key={selectedProjectId} project={selectedProject} settings={settings} selectedModelId={selectedModelId} onOpenChat={async (id) => { await selectChat(id); setRoute("chat"); }} />}
         {route === "memories" && <MemoriesPage project={selectedProject} />}
         {route === "compaction" && selectedChat && <CompactionPage chat={selectedChat} onRefresh={refresh} />}
-        {route === "settings" && <SettingsPage settings={settings} onRefresh={refresh} />}
+        {route === "settings" && <SettingsPage settings={settings} onRefresh={refresh} onOpenChangelog={() => setRoute("changelog")} />}
+        {route === "changelog" && <ChangelogPage />}
       </main>
     </div>
   );
 }
 
-function Header({ title, subtitle, contextNote, onMenu, right, world, worldStatusOpen, onWorldToggle }: { title: string; subtitle?: string; contextNote?: string; onMenu: () => void; right?: React.ReactNode; world?: WorldState; worldStatusOpen?: boolean; onWorldToggle?: () => void }) {
+function Header({ title, subtitle, contextNote, onMenu, onBack, right, world, worldStatusOpen, onWorldToggle }: { title: string; subtitle?: string; contextNote?: string; onMenu: () => void; onBack?: () => void; right?: React.ReactNode; world?: WorldState; worldStatusOpen?: boolean; onWorldToggle?: () => void }) {
   const [locationTooltipOpen, setLocationTooltipOpen] = useState(false);
   const worldTime = world && formatWorldTime(world);
   const hasReadout = Boolean(worldTime || world?.location);
   return (
     <header className="topbar-wrap">
     <div className="topbar">
-      <button className="icon-button" onClick={onMenu} aria-label="Open navigation">
-        <Menu size={22} />
+      <button className="icon-button" onClick={onBack ?? onMenu} aria-label={onBack ? "Back to settings" : "Open navigation"}>
+        {onBack ? <ChevronLeft size={24} /> : <Menu size={22} />}
       </button>
       <div className="brand-mini">
         <div className="title-stack"><strong>{title}</strong>{(subtitle || contextNote) && <div className="title-meta">{subtitle && <span>{subtitle}</span>}{contextNote && <small>{contextNote}</small>}</div>}</div>
@@ -1204,6 +1264,9 @@ function InventoryLogList({ logs, onRefresh }: { logs: InventoryLog[]; onRefresh
 
 function Drawer(props: {
   apiKey?: string;
+  profileName?: string;
+  profileAvatarDataUrl?: string;
+  profileAvatarCrop?: AppSettings["profileAvatarCrop"];
   open: boolean;
   projects: Project[];
   selectedProjectId?: string;
@@ -1217,10 +1280,12 @@ function Drawer(props: {
   onDeleteChat: (id: string) => Promise<void>;
   onToggleProjectPin: (id: string) => Promise<void>;
   onToggleChatPin: (id: string) => Promise<void>;
+  onProfileSaved: (profile: Pick<AppSettings, "profileName" | "profileAvatarDataUrl" | "profileAvatarCrop">) => Promise<void>;
 }) {
   const [showAllProjects, setShowAllProjects] = useState(false);
   const [activeChatId, setActiveChatId] = useState<string>();
   const [activeProjectId, setActiveProjectId] = useState<string>();
+  const [profileOpen, setProfileOpen] = useState(false);
   const pressTimer = useRef<number>();
   const longPressedItem = useRef<string>();
   const orderedProjects = [...props.projects].sort((a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)) || a.orderIndex - b.orderIndex);
@@ -1326,14 +1391,114 @@ function Drawer(props: {
           ))}
         </DrawerSection>
         <div className="drawer-foot">
-          <button className="nav-row" onClick={() => props.onRoute("settings")}>
-            <Settings size={18} /> App Settings
+          <div className="drawer-foot-content">
+            <button className="nav-row" onClick={() => props.onRoute("settings")}>
+              <Settings size={18} /> App Settings
+            </button>
+            <OpenRouterBalance apiKey={props.apiKey} />
+          </div>
+          <button className="profile-avatar-button" type="button" onClick={() => setProfileOpen(true)} aria-label="Edit author details" title="Edit author details">
+            {props.profileAvatarDataUrl ? <img src={props.profileAvatarDataUrl} alt="" style={avatarImageStyle(props.profileAvatarCrop)} /> : <UserRound aria-hidden="true" />}
           </button>
-          <OpenRouterBalance apiKey={props.apiKey} />
         </div>
       </aside>
+      {profileOpen && <AuthorDetailsDialog
+        name={props.profileName ?? "User"}
+        avatarDataUrl={props.profileAvatarDataUrl}
+        avatarCrop={props.profileAvatarCrop}
+        onClose={() => setProfileOpen(false)}
+        onSave={async (profile) => {
+          await props.onProfileSaved(profile);
+          setProfileOpen(false);
+        }}
+      />}
     </>
   );
+}
+
+function AuthorDetailsDialog({ name, avatarDataUrl, avatarCrop, onClose, onSave }: {
+  name: string;
+  avatarDataUrl?: string;
+  avatarCrop?: AppSettings["profileAvatarCrop"];
+  onClose: () => void;
+  onSave: (profile: Pick<AppSettings, "profileName" | "profileAvatarDataUrl" | "profileAvatarCrop">) => Promise<void>;
+}) {
+  const [draftName, setDraftName] = useState(name);
+  const [draftAvatar, setDraftAvatar] = useState(avatarDataUrl);
+  const [draftCrop, setDraftCrop] = useState(() => normaliseAvatarCrop(avatarCrop));
+  const [saving, setSaving] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  function chooseAvatar() {
+    fileInputRef.current?.click();
+  }
+
+  function changeAvatar(file?: File) {
+    if (!file || !file.type.startsWith("image/")) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      setDraftAvatar(typeof reader.result === "string" ? reader.result : undefined);
+      setDraftCrop({ x: 50, y: 50, zoom: 1 });
+    };
+    reader.readAsDataURL(file);
+  }
+
+  async function save() {
+    if (saving) return;
+    setSaving(true);
+    try {
+      const croppedAvatar = draftAvatar ? await renderAvatarCrop(draftAvatar, draftCrop) : undefined;
+      await onSave({ profileName: draftName.trim() || "User", profileAvatarDataUrl: croppedAvatar, profileAvatarCrop: undefined });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return <div className="modal-backdrop author-details-backdrop" onMouseDown={onClose}>
+    <section className="author-details-modal" role="dialog" aria-modal="true" aria-labelledby="author-details-title" onMouseDown={(event) => event.stopPropagation()}>
+      <div className="author-details-heading">
+        <div><p>Profile</p><h2 id="author-details-title">Author Details</h2></div>
+        <button className="icon-button" type="button" onClick={onClose} aria-label="Close author details"><X size={18} /></button>
+      </div>
+      <div className="author-avatar-field">
+        <button className="author-avatar-editor" type="button" onClick={chooseAvatar} aria-label="Upload or change avatar">
+          {draftAvatar ? <ImageIcon aria-hidden="true" /> : <UserRound aria-hidden="true" />}
+          <span>{draftAvatar ? "Change image" : "Upload"}</span>
+        </button>
+        <div><strong>Avatar</strong><small>Square image. Stored only on this device.</small>{draftAvatar && <button className="link-button author-avatar-remove" type="button" onClick={() => setDraftAvatar(undefined)}>Remove image</button>}</div>
+        <input ref={fileInputRef} className="visually-hidden" type="file" accept="image/*" onChange={(event) => { changeAvatar(event.target.files?.[0]); event.currentTarget.value = ""; }} />
+      </div>
+      {draftAvatar && <div className="avatar-crop-controls">
+        <AvatarCropPreview dataUrl={draftAvatar} crop={draftCrop} />
+        <div className="avatar-crop-sliders">
+          <span>Adjust crop</span>
+          <label>Horizontal<input type="range" min="0" max="100" value={draftCrop.x} onChange={(event) => setDraftCrop((crop) => ({ ...crop, x: Number(event.target.value) }))} /></label>
+          <label>Vertical<input type="range" min="0" max="100" value={draftCrop.y} onChange={(event) => setDraftCrop((crop) => ({ ...crop, y: Number(event.target.value) }))} /></label>
+          <label>Zoom<input type="range" min="1" max="2.5" step="0.05" value={draftCrop.zoom} onChange={(event) => setDraftCrop((crop) => ({ ...crop, zoom: Number(event.target.value) }))} /></label>
+          <button className="link-button avatar-crop-reset" type="button" onClick={() => setDraftCrop({ x: 50, y: 50, zoom: 1 })}>Reset crop</button>
+        </div>
+      </div>}
+      <label className="settings-field author-name-field">Name
+        <input value={draftName} maxLength={80} onChange={(event) => setDraftName(event.target.value)} placeholder="User" autoFocus />
+      </label>
+      <p className="author-details-note">These details are client-side flair only and are never sent in chats.</p>
+      <div className="split-actions author-details-actions"><button type="button" onClick={() => void save()} disabled={saving}>{saving ? "Saving…" : "Save details"}</button><button type="button" onClick={onClose}>Cancel</button></div>
+    </section>
+  </div>;
+}
+
+function AvatarCropPreview({ dataUrl, crop }: { dataUrl: string; crop: AvatarCrop }) {
+  const [preview, setPreview] = useState(dataUrl);
+  useEffect(() => {
+    let current = true;
+    void renderAvatarCrop(dataUrl, crop).then((nextPreview) => {
+      if (current) setPreview(nextPreview);
+    }).catch(() => {
+      if (current) setPreview(dataUrl);
+    });
+    return () => { current = false; };
+  }, [dataUrl, crop.x, crop.y, crop.zoom]);
+  return <div className="avatar-crop-preview" aria-label="Avatar crop preview"><img src={preview} alt="Current avatar crop preview" /></div>;
 }
 
 function DrawerSection({ title, action, className, children }: { title: string; action?: React.ReactNode; className?: string; children: React.ReactNode }) {
@@ -2107,7 +2272,7 @@ function DeltaJobImport({ value, onChange }: { value: DeltaJobTemplate[]; onChan
   );
 }
 
-function SettingsPage({ settings, onRefresh }: { settings: AppSettings; onRefresh: () => Promise<void> }) {
+function SettingsPage({ settings, onRefresh, onOpenChangelog }: { settings: AppSettings; onRefresh: () => Promise<void>; onOpenChangelog: () => void }) {
   const [draft, setDraft] = useState(settings);
   const [tab, setTab] = useState<"appearance" | "api" | "data">("appearance");
   const [saved, showSaved] = useSavedNotice();
@@ -2120,6 +2285,9 @@ function SettingsPage({ settings, onRefresh }: { settings: AppSettings; onRefres
   }
   return (
     <Page>
+      <div className="settings-page-heading">
+        <button className="version-link" type="button" onClick={onOpenChangelog} aria-label="Open changelog for Mirror version 2.0.0">v2.0.0 · View changelog</button>
+      </div>
       <div className="settings-tabs">
         <button className={tab === "appearance" ? "picked" : ""} onClick={() => setTab("appearance")}><Settings size={18} /> Look</button>
         <button className={tab === "api" ? "picked" : ""} onClick={() => setTab("api")}><KeyRound size={18} /> API</button>
@@ -2172,6 +2340,63 @@ function SettingsPage({ settings, onRefresh }: { settings: AppSettings; onRefres
   );
 }
 
+type ChangelogEntry = {
+  version: string;
+  date: string;
+  changes: string[];
+};
+
+// This is local release metadata; keep entries terse so the full history stays lightweight.
+const changelogEntries: ChangelogEntry[] = [
+  { version: "2.0.0", date: "2026-11-07", changes: ["Added concise in-app changelog.", "Kept release history local and capped at 12 months."] },
+  { version: "1.9.0", date: "2026-08-21", changes: ["Refined chat and Delta workspace.", "Improved update handling."] },
+  { version: "1.8.0", date: "2026-07-14", changes: ["Added timeline continuity.", "Added memory and request-count controls."] },
+  { version: "1.7.0", date: "2026-06-06", changes: ["Added project backup and recovery tools.", "Improved model-library management."] }
+];
+
+const changelogYears = [...new Set(changelogEntries.map((entry) => entry.date.slice(0, 4)))];
+
+function ChangelogPage() {
+  const [year, setYear] = useState(changelogYears[0] ?? "");
+  const [searchDraft, setSearchDraft] = useState("");
+  const [search, setSearch] = useState("");
+  const entries = changelogEntries.filter((entry) => {
+    if (!entry.date.startsWith(year)) return false;
+    const searchable = `${entry.version} ${entry.changes.join(" ")}`.toLowerCase();
+    return !search || searchable.includes(search);
+  });
+
+  return (
+    <Page>
+      <section className="changelog" aria-label="Changelog">
+        <form className="changelog-controls" onSubmit={(event) => { event.preventDefault(); setSearch(searchDraft.trim().toLowerCase()); }}>
+          <label className="changelog-year-label">Year
+            <select className="changelog-year" value={year} onChange={(event) => setYear(event.target.value)}>
+              {changelogYears.map((option) => <option key={option} value={option}>{option}</option>)}
+            </select>
+          </label>
+          <label className="changelog-search-label">Search changelog
+            <input value={searchDraft} onChange={(event) => setSearchDraft(event.target.value)} placeholder="Search changes" />
+          </label>
+          <button type="submit"><Search size={15} /> Search</button>
+        </form>
+        {entries.map((entry) => (
+          <article className="changelog-entry" key={entry.version}>
+            <header>
+              <span>{`v${entry.version}`}</span>
+              <time dateTime={entry.date}>{entry.date}</time>
+            </header>
+            <ul>
+              {entry.changes.map((change) => <li key={change}>{change}</li>)}
+            </ul>
+          </article>
+        ))}
+        {!entries.length && <p className="changelog-note">No matching changes.</p>}
+      </section>
+    </Page>
+  );
+}
+
 function ApiSettingsContent({ settings, onRefresh }: { settings: AppSettings; onRefresh: () => Promise<void> }) {
   const [key, setKey] = useState(settings.apiKey ?? "");
   const [show, setShow] = useState(false);
@@ -2200,7 +2425,7 @@ function ApiSettingsContent({ settings, onRefresh }: { settings: AppSettings; on
 
 function ModelLibrary({ onRefresh }: { onRefresh: () => Promise<void> }) {
   const [models, setModels] = useState<ModelLibraryEntry[]>([]);
-  const [fetchedModels, setFetchedModels] = useState<{ id: string; name?: string; context_length?: number; supported_parameters?: string[]; pricing?: { prompt?: string; completion?: string } }[]>([]);
+  const [fetchedModels, setFetchedModels] = useState<{ id: string; name?: string; context_length?: number; supported_parameters?: string[]; reasoning_effort?: { levels?: string[]; default?: string | null }; pricing?: { prompt?: string; completion?: string } }[]>([]);
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState("");
   const [editingNameId, setEditingNameId] = useState<string>();
@@ -2232,7 +2457,7 @@ function ModelLibrary({ onRefresh }: { onRefresh: () => Promise<void> }) {
     try {
       const response = await fetch("https://openrouter.ai/api/v1/models");
       if (!response.ok) throw new Error("Could not fetch models.");
-      const json = await response.json() as { data?: { id: string; name?: string; context_length?: number; supported_parameters?: string[]; pricing?: { prompt?: string; completion?: string } }[] };
+      const json = await response.json() as { data?: typeof fetchedModels };
       setFetchedModels(json.data ?? []);
       setStatus(`Fetched ${(json.data ?? []).length} models`);
     } catch {
@@ -2243,6 +2468,17 @@ function ModelLibrary({ onRefresh }: { onRefresh: () => Promise<void> }) {
     const perToken = Number(value);
     return Number.isFinite(perToken) && perToken >= 0 ? perToken * 1_000_000 : undefined;
   }
+  function importedThinkingCapabilities(model: typeof fetchedModels[number]) {
+    const levels = model.reasoning_effort?.levels;
+    const defaultLevel = model.reasoning_effort?.default;
+    if (!levels || !defaultLevel) return undefined;
+    const modes = levels.map((level) => level === "none" ? "instant" : level)
+      .filter((level): level is "instant" | "low" | "medium" | "high" => ["instant", "low", "medium", "high"].includes(level));
+    const defaultMode = defaultLevel === "none" ? "instant" : defaultLevel;
+    return modes.length && modes.includes(defaultMode as typeof modes[number])
+      ? { thinkingModes: modes, defaultThinkingMode: defaultMode as typeof modes[number] }
+      : undefined;
+  }
   async function addOrUpdateModel(model: typeof fetchedModels[number]) {
     if (!model.id.trim()) return;
     const timestamp = now();
@@ -2250,15 +2486,18 @@ function ModelLibrary({ onRefresh }: { onRefresh: () => Promise<void> }) {
     const outputPricePerMillionUsd = perMillion(model.pricing?.completion);
     const existing = models.find((item) => item.modelId === model.id);
     const supportsTools = model.supported_parameters?.includes("tools");
-    if (existing) await db.modelLibrary.update(existing.id, { contextLength: model.context_length, supportsTools, inputPricePerMillionUsd, outputPricePerMillionUsd, updatedAt: timestamp });
-    else await db.modelLibrary.add({ id: uid(), modelId: model.id, cosmeticName: model.name || model.id.split("/").pop() || model.id, contextLength: model.context_length, supportsTools, inputPricePerMillionUsd, outputPricePerMillionUsd, orderIndex: models.length, createdAt: timestamp, updatedAt: timestamp });
+    const thinking = importedThinkingCapabilities(model);
+    if (existing) await db.modelLibrary.update(existing.id, { contextLength: model.context_length, supportsTools, inputPricePerMillionUsd, outputPricePerMillionUsd, ...thinking, updatedAt: timestamp });
+    else await db.modelLibrary.add({ id: uid(), modelId: model.id, cosmeticName: model.name || model.id.split("/").pop() || model.id, contextLength: model.context_length, supportsTools, inputPricePerMillionUsd, outputPricePerMillionUsd, ...thinking, orderIndex: models.length, createdAt: timestamp, updatedAt: timestamp });
     await load();
     await onRefresh();
   }
   async function updatePrice(model: ModelLibraryEntry, field: "inputPricePerMillionUsd" | "outputPricePerMillionUsd", value: string) {
     const parsed = value.trim() === "" ? undefined : Number(value);
     if (parsed !== undefined && (!Number.isFinite(parsed) || parsed < 0)) return;
-    await db.modelLibrary.update(model.id, { [field]: parsed, updatedAt: now() });
+    await db.modelLibrary.update(model.id, field === "inputPricePerMillionUsd"
+      ? { inputPricePerMillionUsd: parsed, updatedAt: now() }
+      : { outputPricePerMillionUsd: parsed, updatedAt: now() });
     await load();
     await onRefresh();
   }
@@ -2446,7 +2685,7 @@ function EditableMemory({ memory, onRefresh }: { memory: Memory; onRefresh: () =
   );
 }
 
-export function CharactersPage({ project, onOpenProfile }: { project?: Project; onOpenProfile: (id: string) => void }) {
+export function CharactersPage({ project, onOpenProfile, onOpenStats }: { project?: Project; onOpenProfile: (id: string) => void; onOpenStats?: () => void }) {
   const [characters, setCharacters] = useState<Character[]>([]);
   const [sourcePicker, setSourcePicker] = useState<{ projectId: string; files: SourceFile[] }>();
   const [selectedSourceIds, setSelectedSourceIds] = useState<string[]>([]);
@@ -2533,6 +2772,7 @@ export function CharactersPage({ project, onOpenProfile }: { project?: Project; 
   return (
     <Page>
       <div className="character-library-actions" aria-label="Character library actions">
+        <button type="button" onClick={onOpenStats}>STATS</button>
         <button onClick={add} disabled={importing}><Plus size={17} /> Add Character</button>
         <button onClick={() => void openSourcePicker()} disabled={importing || loadingSources}>{loadingSources ? "Loading…" : "Import"}</button>
         <button aria-label="Manage characters" onClick={() => setManaging(true)} disabled={!characters.length || managing}>Manage</button>
@@ -2597,6 +2837,61 @@ export function CharactersPage({ project, onOpenProfile }: { project?: Project; 
       </div>
     </Page>
   );
+}
+
+function statsMarkdown(characters: Character[], cache: Record<string, AbilityScores> = {}) {
+  const saved = characters.filter((character) => character.statsEnabled).map((character) => [character.name.trim(), character.str, character.dex, character.con, character.int, character.wis, character.cha] as const);
+  const names = new Set(saved.map(([name]) => name.toLocaleLowerCase()));
+  const cached = Object.entries(cache).filter(([name]) => !names.has(name.toLocaleLowerCase())).map(([name, scores]) => [name.trim(), scores.STR, scores.DEX, scores.CON, scores.INT, scores.WIS, scores.CHA] as const);
+  return [...saved, ...cached].sort((a, b) => a[0].localeCompare(b[0])).map(([name, ...scores]) => `"${name}" ${scores.join(" ")}`).join("\n");
+}
+
+function parseStatsMarkdown(text: string) {
+  const rows: Array<{ name: string; scores: AbilityScores }> = [];
+  const errors: string[] = [];
+  text.split(/\r?\n/).forEach((line, index) => {
+    if (!line.trim() || line.trimStart().startsWith("#")) return;
+    const match = line.match(/^\s*"([^"\r\n]+)"\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$/);
+    if (!match || match[1] !== match[1].trim()) { errors.push(`Line ${index + 1}: use "Exact Character Name" STR DEX CON INT WIS CHA.`); return; }
+    const values = match.slice(2).map(Number);
+    if (values.some((value) => !Number.isInteger(value) || value < 8 || value > 15)) { errors.push(`Line ${index + 1}: each base score must be an integer from 8 to 15.`); return; }
+    const scores = { STR: values[0], DEX: values[1], CON: values[2], INT: values[3], WIS: values[4], CHA: values[5] };
+    if (totalPointCost({ str: scores.STR, dex: scores.DEX, con: scores.CON, int: scores.INT, wis: scores.WIS, cha: scores.CHA }) > 31) { errors.push(`Line ${index + 1}: scores exceed the 31-point budget.`); return; }
+    rows.push({ name: match[1], scores });
+  });
+  return { rows, errors };
+}
+
+function CharacterStatsPage({ project, onBack }: { project: Project; onBack: () => void }) {
+  const [text, setText] = useState("");
+  const [notice, setNotice] = useState("");
+  async function load() {
+    const characters = await db.characters.where("projectId").equals(project.id).toArray();
+    const current = await db.projects.get(project.id);
+    setText(statsMarkdown(characters, current?.roleplayStatCache));
+  }
+  useEffect(() => { void load(); }, [project.id]);
+  async function save() {
+    const parsed = parseStatsMarkdown(text);
+    if (parsed.errors.length) { setNotice(parsed.errors[0]); return; }
+    const characters = await db.characters.where("projectId").equals(project.id).toArray();
+    const byName = new Map(characters.map((character) => [character.name.trim(), character]));
+    const libraryOverBudget = parsed.rows.find((row) => byName.has(row.name) && (Object.values(row.scores).some((score) => score > 15) || totalPointCost({ str: row.scores.STR, dex: row.scores.DEX, con: row.scores.CON, int: row.scores.INT, wis: row.scores.WIS, cha: row.scores.CHA }) > 27));
+    if (libraryOverBudget) { setNotice(`"${libraryOverBudget.name}" is a library character: its base scores must use the normal 27-point budget. Add trait bonuses on the profile instead.`); return; }
+    const cache: Record<string, AbilityScores> = {};
+    const timestamp = now();
+    await db.transaction("rw", db.characters, db.projects, async () => {
+      for (const row of parsed.rows) {
+        const character = byName.get(row.name);
+        if (character) await db.characters.update(character.id, { statsEnabled: true, str: row.scores.STR, dex: row.scores.DEX, con: row.scores.CON, int: row.scores.INT, wis: row.scores.WIS, cha: row.scores.CHA, updatedAt: timestamp });
+        else cache[row.name] = row.scores;
+      }
+      await db.projects.update(project.id, { roleplayStatCache: cache, updatedAt: timestamp });
+    });
+    setNotice(`Saved ${parsed.rows.length} character stat line${parsed.rows.length === 1 ? "" : "s"}.`);
+    await load();
+  }
+  return <Page><nav className="character-profile-nav"><button className="character-back-button" onClick={onBack}><ChevronLeft size={18} /> Back to characters</button></nav><section className="stack"><div className="section-title"><h2>character_stats.md</h2></div><p className="notice">One project-only character per line. Names must match a library profile exactly. Saving a matching line enables and updates that profile’s base ability scores; names without a profile remain available to D20 rolls for this project.</p><textarea className="large-entry" value={text} onChange={(event) => { setText(event.target.value); setNotice(""); }} rows={18} spellCheck={false} placeholder={'"Halle" 10 8 14 13 10 10'} /><small>Order: STR DEX CON INT WIS CHA. Library base scores use normal 5e 27-point buy (8–15); their profile traits remain separate bonuses. Generated NPC-only lines may use the 31-point equivalent to stand in for up to +4 of undeclared traits.</small>{notice && <p className={notice.startsWith("Line") || notice.includes("must use") ? "error" : "save-status"}>{notice}</p>}<div className="split-actions"><button onClick={() => void save()}><Save size={18} /> Save stats</button><button onClick={() => void load()}>Reset</button></div></section></Page>;
 }
 
 function CharacterTile({ character, dragging, managing, selected, disabled, onHold, onToggle, onDragStart, onDrop, onOpen }: { character: Character; dragging: boolean; managing: boolean; selected: boolean; disabled: boolean; onHold: () => void; onToggle: () => void; onDragStart: () => void; onDrop: () => void; onOpen: () => void }) {
@@ -2721,7 +3016,8 @@ function CharacterEditor({ project, character, chatId, onSaved, onRefresh, onOpe
       jobCategory: mode === "template" ? draft.jobCategory : undefined,
       job: mode === "template" ? draft.job : undefined,
       customJobName: mode === "custom" ? draft.customJobName?.trim() : undefined,
-      normalisedName: normaliseTag(draft.name),
+      name: draft.name.trim(),
+      normalisedName: normaliseTag(draft.name.trim()),
       updatedAt: now()
     };
     const timestamp = now();
@@ -3430,9 +3726,9 @@ function ArchiveEntryForm({ entry, onSave }: { entry: { id: string; header: stri
   );
 }
 
-function StarsPage({ project }: { project?: Project }) {
-  const [stars, setStars] = useState<{ id: string; role: string; bodyCopy: string; updatedAt: number }[]>([]);
-  const [openStar, setOpenStar] = useState<{ id: string; role: string; bodyCopy: string; updatedAt: number }>();
+function StarsPage({ project, ratingFilter }: { project?: Project; ratingFilter: 0 | 1 | 2 | 3 | 4 | 5 }) {
+  const [stars, setStars] = useState<{ id: string; role: string; bodyCopy: string; updatedAt: number; rating?: number }[]>([]);
+  const [openStar, setOpenStar] = useState<{ id: string; role: string; bodyCopy: string; updatedAt: number; rating?: number }>();
   async function load() {
     if (project) setStars(await db.stars.where("projectId").equals(project.id).reverse().sortBy("updatedAt"));
   }
@@ -3448,10 +3744,18 @@ function StarsPage({ project }: { project?: Project }) {
     setOpenStar(undefined);
     await load();
   }
+  async function setRating(starId: string, rating: number) {
+    const updatedAt = now();
+    await db.stars.update(starId, { rating, updatedAt });
+    setStars((current) => current.map((star) => star.id === starId ? { ...star, rating, updatedAt } : star));
+    setOpenStar((current) => current?.id === starId ? { ...current, rating, updatedAt } : current);
+  }
+  const visibleStars = ratingFilter ? stars.filter((star) => star.rating === ratingFilter) : stars;
   return (
     <Page>
       {stars.length === 0 && <EmptyState title="No stars yet" body="Star chat messages to collect them here." />}
-      {stars.map((star) => (
+      {stars.length > 0 && visibleStars.length === 0 && <EmptyState title="No matching ratings" body={`No starred messages are rated ${ratingFilter} ${ratingFilter === 1 ? "star" : "stars"}.`} />}
+      {visibleStars.map((star) => (
         <article
           className="star-card"
           key={star.id}
@@ -3465,13 +3769,19 @@ function StarsPage({ project }: { project?: Project }) {
             }
           }}
         >
-          <small>{star.role} - {formatDate(star.updatedAt)}</small>
-          <div className="star-card-preview"><MarkdownText text={star.bodyCopy} /></div>
+          <div className="star-card-header"><small>{star.role} - {formatDate(star.updatedAt)}</small><StarRating rating={star.rating ?? 0} onChange={(rating) => void setRating(star.id, rating)} /></div>
+          <div className="star-card-preview">{star.bodyCopy.replace(/\s+/g, " ").trim()}</div>
         </article>
       ))}
       {openStar && <div className="modal-backdrop" onClick={() => setOpenStar(undefined)}><section className="star-modal" onClick={(event) => event.stopPropagation()}><small>{openStar.role} - {formatDate(openStar.updatedAt)}</small><div className="star-modal-body"><MarkdownText text={openStar.bodyCopy} /></div><div className="split-actions"><button onClick={() => setOpenStar(undefined)}>Close</button><button className="danger" onClick={() => removeStar(openStar.id)}><Trash2 size={18} /> Delete star</button></div></section></div>}
     </Page>
   );
+}
+
+function StarRating({ rating, onChange }: { rating: number; onChange: (rating: number) => void }) {
+  return <div className="star-rating" role="group" aria-label={`Message rating: ${rating || "unrated"}`}>
+    {[1, 2, 3, 4, 5].map((value) => <button key={value} type="button" className={value <= rating ? "rated" : ""} aria-label={`Rate ${value} out of 5`} aria-pressed={value <= rating} onClick={(event) => { event.stopPropagation(); onChange(value); }}><Star size={14} fill={value <= rating ? "currentColor" : "none"} /></button>)}
+  </div>;
 }
 
 const RECOVERY_REMINDER_DELAY = 48 * 60 * 60 * 1000;
