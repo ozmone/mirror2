@@ -37,7 +37,7 @@ import {
 import Dexie from "dexie";
 import type React from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { createFullBackup, createRecoverySnapshot, listRecoverySnapshots, mergeFullBackup, parseAndValidateBackup, replaceWithFullBackup, restoreRecoverySnapshot, type RecoverySlot, type RecoverySnapshot } from "../data/backup";
+import { createFullBackup, createProjectBackup, createRecoverySnapshot, listRecoverySnapshots, mergeFullBackup, parseAndValidateBackup, parseAndValidateProjectBackup, replaceWithFullBackup, restoreProjectBackup, restoreRecoverySnapshot, type ProjectBackup, type RecoverySlot, type RecoverySnapshot } from "../data/backup";
 import { importCastSources, isCastSource } from "../data/castImport";
 import { db, ensureSeedData } from "../data/db";
 import { defaultDeltaJobs, defaultDeltaNpcStats, defaultDeltaSystemPrompt, defaultSettings, effectiveDeltaSystemPrompt } from "../data/defaults";
@@ -3540,6 +3540,9 @@ function RecoveryBackupReminder({ active }: { active: boolean }) {
 
 function DataSettingsContent() {
   const [importStatus, setImportStatus] = useState("");
+  const [projectBackupStatus, setProjectBackupStatus] = useState("");
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [projectBackupId, setProjectBackupId] = useState("");
   const [auditStorage, setAuditStorage] = useState({ bytes: 0, messages: 0 });
   const [auditClearStep, setAuditClearStep] = useState<1 | 2>();
   const [auditStatus, setAuditStatus] = useState("");
@@ -3553,9 +3556,15 @@ function DataSettingsContent() {
   async function loadRecoverySnapshots() {
     setRecoverySnapshots(await listRecoverySnapshots());
   }
+  async function loadProjects() {
+    const rows = await db.projects.orderBy("orderIndex").toArray();
+    setProjects(rows);
+    setProjectBackupId((current) => rows.some((project) => project.id === current) ? current : rows[0]?.id ?? "");
+  }
   useEffect(() => {
     void loadAuditStorage();
     void loadRecoverySnapshots();
+    void loadProjects();
     window.addEventListener("mirror:recovery-snapshot", loadRecoverySnapshots);
     return () => window.removeEventListener("mirror:recovery-snapshot", loadRecoverySnapshots);
   }, []);
@@ -3575,6 +3584,36 @@ function DataSettingsContent() {
     } catch (error) {
       setImportStatus(error instanceof Error ? error.message : "Import failed.");
       return undefined;
+    }
+  }
+  async function downloadProjectBackup() {
+    const project = projects.find((item) => item.id === projectBackupId);
+    if (!project) return;
+    if (!confirm(`Create a portable backup of “${project.name}”, including its chats, context, media, and the app settings needed to continue it? The API key is never included.`)) return;
+    try {
+      const safeName = project.name.trim().replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "") || "project";
+      downloadJson(`mirror-project-${safeName}-backup.json`, await createProjectBackup(project.id));
+      setProjectBackupStatus(`Project backup for “${project.name}” downloaded.`);
+    } catch (error) {
+      setProjectBackupStatus(error instanceof Error ? error.message : "Project backup failed.");
+    }
+  }
+  async function restoreProject(file: File | undefined) {
+    if (!file) return;
+    let backup: ProjectBackup;
+    try {
+      backup = await parseAndValidateProjectBackup(await file.text());
+    } catch (error) {
+      setProjectBackupStatus(error instanceof Error ? error.message : "Project import failed.");
+      return;
+    }
+    if (!confirm(`Restore “${backup.projectName}” from this project backup? It restores every saved project record, chats, context, media, and app settings. Any current project with the same ID will be replaced. Other projects stay intact. Your API key is not included.`)) return;
+    try {
+      await restoreProjectBackup(backup);
+      setProjectBackupStatus("Project restored and verified. Reloading…");
+      location.reload();
+    } catch (error) {
+      setProjectBackupStatus(error instanceof Error ? error.message : "Project restore failed; current data was left unchanged.");
     }
   }
   function backupSummary(backup: { createdAt: string; tableCounts: Record<string, number> }) {
@@ -3650,6 +3689,13 @@ function DataSettingsContent() {
       <p className="notice">Exports every current Mirror table, including attachments, but excludes the API key. Keep the downloaded file outside Chrome for protection against browser storage loss.</p>
       <div className="split-actions"><button onClick={downloadFullBackup}><Download size={18} /> Download Full Backup</button><label className="file-pick"><Upload size={18} /> Merge Import<input type="file" accept="application/json" onChange={(event) => void mergeImport(event.target.files?.[0])} /></label><label className="file-pick danger"><Upload size={18} /> Full Restore<input type="file" accept="application/json" onChange={(event) => void fullRestore(event.target.files?.[0])} /></label></div>
       {importStatus && <p className="save-status">{importStatus}</p>}
+    </section>
+    <section className="panel stack">
+      <div className="section-title"><h2>Portable Project Backup</h2></div>
+      <p className="notice">Exports one project exactly as it is: chats and branches, messages and context, memories, instructions, characters, source files and images, inventory, timeline, Delta data, plus app settings and the model library. API keys are never included.</p>
+      <div className="split-actions"><select aria-label="Project to back up" value={projectBackupId} onChange={(event) => setProjectBackupId(event.target.value)}>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select><button disabled={!projectBackupId} onClick={() => void downloadProjectBackup()}><Download size={18} /> Download Project Backup</button><label className="file-pick"><Upload size={18} /> Restore Project Backup<input type="file" accept="application/json" onChange={(event) => void restoreProject(event.target.files?.[0])} /></label></div>
+      <p className="notice">On another PC, restore the file to continue the project. If it already exists there, this replaces that project; other projects remain untouched.</p>
+      {projectBackupStatus && <p className="save-status">{projectBackupStatus}</p>}
     </section>
     <section className="panel stack">
       <div className="section-title"><h2>Local Recovery Backups</h2><button onClick={() => void createRecovery()}><Save size={18} /> Create snapshot</button></div>
