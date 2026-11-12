@@ -1,6 +1,7 @@
 import {
   Clipboard,
   Edit3,
+  GitFork,
   Image as ImageIcon,
   Info,
   Paperclip,
@@ -9,6 +10,7 @@ import {
   Save,
   Settings,
   Star,
+  VenetianMask,
   X
 } from "lucide-react";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -51,7 +53,9 @@ function MessageRow({
   onAvoidDeltaBrief,
   deltaLocked,
   onOpenChatSettings,
-  onRefresh
+  onRefresh,
+  onForkChat,
+  forkDisabled
 }: {
   projectId: string;
   message: Message;
@@ -66,6 +70,8 @@ function MessageRow({
   deltaLocked: boolean;
   onOpenChatSettings: () => void;
   onRefresh: () => Promise<void>;
+  onForkChat: (masked: boolean) => Promise<void>;
+  forkDisabled: boolean;
 }) {
   const [infoOpen, setInfoOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
@@ -84,22 +90,6 @@ function MessageRow({
   const editImagePickerRef = useRef<HTMLInputElement>(null);
   const editFilePickerRef = useRef<HTMLInputElement>(null);
   const attachmentPressTimer = useRef<number>();
-  const messagePressTimer = useRef<number>();
-  const messagePressStart = useRef<{ x: number; y: number }>();
-  function cancelMessagePress() {
-    window.clearTimeout(messagePressTimer.current);
-    messagePressTimer.current = undefined;
-    messagePressStart.current = undefined;
-  }
-  useEffect(() => {
-    window.addEventListener("scroll", cancelMessagePress, true);
-    window.addEventListener("blur", cancelMessagePress);
-    return () => {
-      cancelMessagePress();
-      window.removeEventListener("scroll", cancelMessagePress, true);
-      window.removeEventListener("blur", cancelMessagePress);
-    };
-  }, [message.id]);
   useEffect(() => setDraftBody(message.body), [message.id, message.body]);
   async function loadDeltaCharacters() {
     const rows = await db.characters.where("projectId").equals(projectId).toArray();
@@ -132,6 +122,10 @@ function MessageRow({
   }
   async function copyMessage() {
     await navigator.clipboard.writeText(message.body);
+  }
+  async function fork(masked: boolean) {
+    if (forkDisabled) return;
+    await onForkChat(masked);
   }
   async function resend() {
     if (deltaLocked) return;
@@ -226,22 +220,10 @@ function MessageRow({
         tabIndex={0}
         aria-label={`${message.role === "user" ? "Your" : "Assistant"} message`}
         aria-expanded={expanded}
-        onPointerDown={(event) => {
-          cancelMessagePress();
-          if (!event.isPrimary || event.button !== 0 || (event.target as Element).closest("button, a, input, textarea, select, [role='button'], [contenteditable='true']")) return;
-          messagePressStart.current = { x: event.clientX, y: event.clientY };
-          messagePressTimer.current = window.setTimeout(() => {
-            cancelMessagePress();
-            onExpand(message.id);
-          }, 520);
+        onClick={(event) => {
+          if ((event.target as Element).closest("button, a, input, textarea, select, [role='button'], [contenteditable='true']")) return;
+          onExpand(message.id);
         }}
-        onPointerMove={(event) => {
-          const start = messagePressStart.current;
-          if (start && Math.hypot(event.clientX - start.x, event.clientY - start.y) > 10) cancelMessagePress();
-        }}
-        onPointerUp={cancelMessagePress}
-        onPointerCancel={cancelMessagePress}
-        onPointerLeave={cancelMessagePress}
         onKeyDown={(event) => {
           if (event.target === event.currentTarget && !event.repeat && (event.key === "Enter" || event.key === " ")) {
             event.preventDefault();
@@ -304,6 +286,8 @@ function MessageRow({
           <button aria-label="Edit message" title={deltaLocked ? "Resolve engagement to unlock editing" : "Edit"} disabled={deltaLocked} onClick={(event) => { event.stopPropagation(); if (!deltaLocked) setEditOpen(true); }}><Edit3 size={16} /></button>
           <button aria-label={message.starred ? "Unstar message" : "Star message"} title={message.starred ? "Unstar" : "Star"} onClick={(event) => { event.stopPropagation(); star(); }}><Star size={16} fill={message.starred ? "currentColor" : "none"} /></button>
           <button aria-label="Copy message" title="Copy" onClick={(event) => { event.stopPropagation(); copyMessage(); }}><Clipboard size={16} /></button>
+          <button aria-label="Fork chat" title={forkDisabled ? "Wait for the current reply to finish before forking" : "Fork chat"} disabled={forkDisabled} onClick={(event) => { event.stopPropagation(); void fork(false); }}><GitFork size={16} /></button>
+          <button aria-label="Masked fork chat" title={forkDisabled ? "Wait for the current reply to finish before forking" : "Create masked fork"} disabled={forkDisabled} onClick={(event) => { event.stopPropagation(); void fork(true); }}><VenetianMask size={16} /></button>
           <button aria-label="Response audit" title="Response audit" onClick={(event) => { event.stopPropagation(); setInfoOpen(true); }}><Info size={16} /></button>
           <span>{formatMessageDate(message.createdAt)}</span>
           <span>{message.inputTokens ?? message.outputTokens ?? estimateTokens(message.body)}t</span>
@@ -416,6 +400,8 @@ type VirtualMessageListData = {
   deltaLocked: boolean;
   onOpenChatSettings: () => void;
   onRefresh: () => Promise<void>;
+  onForkChat: (masked: boolean) => Promise<void>;
+  forkDisabled: boolean;
   onSize: (index: number, messageId: string, height: number) => void;
 };
 
@@ -448,6 +434,8 @@ function VirtualMessageListRow({ index, style, data }: ListChildComponentProps<V
           deltaLocked={data.deltaLocked}
           onOpenChatSettings={data.onOpenChatSettings}
           onRefresh={data.onRefresh}
+          onForkChat={data.onForkChat}
+          forkDisabled={data.forkDisabled}
         />
       </div>
     </div>
@@ -475,6 +463,8 @@ function MeasuredMessageList({
   deltaLocked,
   onOpenChatSettings,
   onRefresh,
+  onForkChat,
+  forkDisabled,
 }: VirtualMessageListProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const listRef = useRef<VariableSizeList<VirtualMessageListData>>(null);
@@ -530,8 +520,8 @@ function MeasuredMessageList({
   }, [messages.length]);
   const itemData = useMemo<VirtualMessageListData>(() => ({
     projectId, messages, expandedMessageId, onExpand, onEdit, onResend, onInventoryUpdateAction, onRoleplayRollAction,
-    onBeginDeltaBrief, onAvoidDeltaBrief, deltaLocked, onOpenChatSettings, onRefresh, onSize
-  }), [projectId, messages, expandedMessageId, onExpand, onEdit, onResend, onInventoryUpdateAction, onRoleplayRollAction, onBeginDeltaBrief, onAvoidDeltaBrief, deltaLocked, onOpenChatSettings, onRefresh, onSize]);
+    onBeginDeltaBrief, onAvoidDeltaBrief, deltaLocked, onOpenChatSettings, onRefresh, onForkChat, forkDisabled, onSize
+  }), [projectId, messages, expandedMessageId, onExpand, onEdit, onResend, onInventoryUpdateAction, onRoleplayRollAction, onBeginDeltaBrief, onAvoidDeltaBrief, deltaLocked, onOpenChatSettings, onRefresh, onForkChat, forkDisabled, onSize]);
 
   return (
     <div ref={hostRef} className="virtual-message-list-host">

@@ -1372,10 +1372,20 @@ button:has(.lucide-save):hover:not(:disabled),
   flex: 1 1 auto;
   min-height: 0;
   display: grid;
-  grid-template-rows: 1fr auto;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+.chat-screen > .empty,
+.chat-screen > .masked-session-banner {
+  grid-row: 1;
+}
+
+.chat-screen > .composer {
+  grid-row: 3;
 }
 
 .virtual-message-list-host {
+  grid-row: 2;
   min-height: 0;
 }
 
@@ -5027,6 +5037,7 @@ button:has(.lucide-save):hover:not(:disabled),
   background: color-mix(in srgb, var(--accent) 10%, var(--surface));
   color: var(--text-2);
   font-size: .86rem;
+  flex-wrap: wrap;
 }
 
 .masked-session-banner strong { color: var(--text); white-space: nowrap; }

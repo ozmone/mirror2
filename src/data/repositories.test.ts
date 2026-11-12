@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { db } from "./db";
 import { defaultDeltaBases, defaultSettings, sampleProject } from "./defaults";
-import { addDeltaMessage, applyDeltaDamage, applyInventoryChange, createChat, createMemory, deltaCarryProfile, formatDeltaTemplateTag, generatedDeltaStats, findCharacters, getCharacterBio, getCharacterIdentity, getCharacterStats, messagesForIncrementalCompaction, normaliseInventoryName, searchCharacterBackgroundDetails, searchMemories, validatePointBuy } from "./repositories";
+import { addDeltaMessage, applyDeltaDamage, applyInventoryChange, createChat, createMemory, deltaCarryProfile, forkChat, formatDeltaTemplateTag, generatedDeltaStats, findCharacters, getCharacterBio, getCharacterIdentity, getCharacterStats, messagesForIncrementalCompaction, normaliseInventoryName, searchCharacterBackgroundDetails, searchMemories, validatePointBuy } from "./repositories";
 import { Character, DeltaRollReceipt, Message } from "../types";
 
 describe("local data rules", () => {
@@ -462,6 +462,43 @@ describe("local data rules", () => {
 
     expect(await testDb.deltaEffects.where("projectId").equals("project-1").first()).toMatchObject({ name: "Bleeding", iconId: "icon-1", savingThrowTiming: "every-turn" });
     expect(await testDb.deltaIcons.where("projectId").equals("project-1").first()).toMatchObject({ name: "Bandaged", dataUrl: "data:image/png;base64,AA==" });
+  });
+
+  it("forks chat-owned history, attachments, and Delta archives into independent records", async () => {
+    const project = sampleProject();
+    await testDb.projects.add(project);
+    const sourceId = await createChat(project.id, "Open the gate.");
+    const source = (await testDb.chats.get(sourceId))!;
+    await testDb.chats.update(sourceId, { title: "Gate plan", titleState: "manual" });
+    const prompt = (await testDb.messages.where("chatId").equals(sourceId).first())!;
+    await testDb.messages.add({ id: "reply", chatId: sourceId, branchId: source.activeBranchId, parentMessageId: prompt.id, sequence: 1, role: "assistant", body: "The gate opens.", estimatedTokens: true, starred: true, status: "complete", createdAt: 1, updatedAt: 1 });
+    await testDb.attachments.add({ id: "image", ownerType: "message", ownerId: prompt.id, name: "map.png", mimeType: "image/png", size: 3, blob: new Blob(["map"]), createdAt: 1, updatedAt: 1 });
+    await testDb.chatSources.add({ id: "state", projectId: project.id, chatId: sourceId, branchId: source.activeBranchId, name: "State", textContent: "The gate is open.", internal: true, kind: "last-confirmed-story-state", createdAt: 1, updatedAt: 1 });
+    await testDb.inventoryItems.add({ id: "torch", projectId: project.id, chatId: sourceId, kind: "inventory", name: "Torch", normalisedName: "torch", quantity: 2, createdAt: 1, updatedAt: 1 });
+    await testDb.deltaSessions.add({ id: "engagement", projectId: project.id, chatId: sourceId, title: "Gate fight", active: false, archivedAt: 1, settings: {}, createdAt: 1, updatedAt: 1 });
+    await testDb.deltaMessages.add({ id: "engagement-message", sessionId: "engagement", sequence: 0, role: "assistant", body: "Victory.", status: "complete", createdAt: 1, updatedAt: 1 });
+    await testDb.deltaEntities.add({ id: "engagement-entity", sessionId: "engagement", name: "Guard", side: "hostile", orderIndex: 0, createdAt: 1, updatedAt: 1 });
+    await createChat(project.id, "Other");
+    await testDb.chats.update((await testDb.chats.where("projectId").equals(project.id).and((chat) => chat.id !== sourceId).first())!.id, { title: "Gate plan fork 1" });
+
+    const forkId = await forkChat(sourceId);
+    const fork = (await testDb.chats.get(forkId))!;
+    const forkMessages = await testDb.messages.where("chatId").equals(forkId).sortBy("sequence");
+    const forkSession = (await testDb.deltaSessions.where("chatId").equals(forkId).first())!;
+
+    expect(fork).toMatchObject({ title: "Gate plan fork 2", maskedSession: undefined, activeBranchId: expect.any(String) });
+    expect(fork.activeBranchId).not.toBe(source.activeBranchId);
+    expect(forkMessages.map((message) => message.body)).toEqual(["Open the gate.", "The gate opens."]);
+    expect(forkMessages.map((message) => message.id)).not.toContain(prompt.id);
+    expect(await testDb.attachments.where("[ownerType+ownerId]").equals(["message", forkMessages[0].id]).count()).toBe(1);
+    expect(await testDb.chatSources.where("chatId").equals(forkId).count()).toBe(1);
+    expect(await testDb.inventoryItems.where("chatId").equals(forkId).count()).toBe(1);
+    expect(forkSession).toMatchObject({ title: "Gate fight", active: false, archivedAt: 1 });
+    expect(await testDb.deltaMessages.where("sessionId").equals(forkSession.id).count()).toBe(1);
+    expect(await testDb.deltaEntities.where("sessionId").equals(forkSession.id).count()).toBe(1);
+
+    const maskedForkId = await forkChat(sourceId, { masked: true });
+    expect((await testDb.chats.get(maskedForkId))?.maskedSession).toBe(true);
   });
 });
 

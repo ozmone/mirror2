@@ -2,7 +2,7 @@ import Dexie from "dexie";
 import { db } from "./db";
 import { defaultWorldState } from "./world";
 import { defaultDeltaBases, defaultDeltaJobs, defaultDeltaNpcStats, defaultDeltaPrefixes, defaultDeltaSystemPrompt, defaultMemoryInstruction } from "./defaults";
-import { Ability, AbilityModifiers, AbilityScores, Character, Chat, DeltaAllyCacheEntry, DeltaBaseTemplate, DeltaEntity, DeltaMessage, DeltaPrefixTemplate, DeltaSession, InventoryKind, Memory, Message, Project } from "../types";
+import { Ability, AbilityModifiers, AbilityScores, Attachment, Branch, Character, Chat, ChatSource, DeltaActionMacro, DeltaAllyCacheEntry, DeltaBaseTemplate, DeltaEntity, DeltaMessage, DeltaPrefixTemplate, DeltaSession, InventoryItem, InventoryKind, InventoryLog, Memory, Message, Project, Star } from "../types";
 import { estimateTokens, fallbackChatTitle, normaliseTag, now, uid } from "../utils";
 
 export const abilities: Ability[] = ["STR", "DEX", "CON", "INT", "WIS", "CHA"];
@@ -327,6 +327,94 @@ export async function createChat(projectId: string, firstMessage = "", continuit
       world: defaultWorldState()
     });
     if (firstMessage.trim()) await addMessage(chatId, branchId, "user", firstMessage, undefined, 0);
+  });
+  return chatId;
+}
+
+function nextForkTitle(title: string, chats: Chat[]) {
+  const escapedTitle = title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const forkNumbers = chats.flatMap((chat) => {
+    const match = new RegExp(`^${escapedTitle} fork (\\d+)$`).exec(chat.title);
+    return match ? [Number(match[1])] : [];
+  });
+  return `${title} fork ${Math.max(0, ...forkNumbers) + 1}`;
+}
+
+/**
+ * Create an independent local copy of every record owned by a chat. Project-wide
+ * memories, timeline entries, and source-library files deliberately stay shared:
+ * they are not chat-owned state, and a masked fork must not mutate them.
+ */
+export async function forkChat(sourceChatId: string, options: { masked?: boolean } = {}) {
+  const source = await db.chats.get(sourceChatId);
+  if (!source) throw new Error("Chat not found.");
+
+  const sourceMessages = await db.messages.where("chatId").equals(source.id).toArray();
+  if (sourceMessages.some((message) => message.status === "pending" || message.status === "streaming")) {
+    throw new Error("Wait for the current reply to finish before forking this chat.");
+  }
+
+  const [sourceBranches, sourceStars, sourceSources, sourceInventoryItems, sourceInventoryLogs, sourceSessions, sourceAllyCache, sourceMacros] = await Promise.all([
+    db.branches.where("chatId").equals(source.id).toArray(),
+    db.stars.where("chatId").equals(source.id).toArray(),
+    db.chatSources.where("chatId").equals(source.id).toArray(),
+    db.inventoryItems.where("chatId").equals(source.id).toArray(),
+    db.inventoryLogs.where("chatId").equals(source.id).toArray(),
+    db.deltaSessions.where("chatId").equals(source.id).toArray(),
+    db.deltaAllyCache.where("chatId").equals(source.id).toArray(),
+    db.deltaActionMacros.where("chatId").equals(source.id).toArray()
+  ]);
+  const sourceMessageAttachments = sourceMessages.length
+    ? await db.attachments.where("[ownerType+ownerId]").anyOf(sourceMessages.map((message) => ["message", message.id] as [Attachment["ownerType"], string])).toArray()
+    : [];
+  const sourceSessionIds = sourceSessions.map((session) => session.id);
+  const [sourceDeltaMessages, sourceDeltaEntities] = await Promise.all([
+    sourceSessionIds.length ? db.deltaMessages.where("sessionId").anyOf(sourceSessionIds).toArray() : [],
+    sourceSessionIds.length ? db.deltaEntities.where("sessionId").anyOf(sourceSessionIds).toArray() : []
+  ]);
+  const deltaAttachmentIds = [...new Set(sourceDeltaEntities.map((entity) => entity.imageAttachmentId).filter((id): id is string => Boolean(id)))];
+  const extraDeltaAttachments = deltaAttachmentIds.length ? (await db.attachments.bulkGet(deltaAttachmentIds)).filter((row): row is Attachment => Boolean(row)) : [];
+
+  const timestamp = now();
+  const chatId = uid();
+  const branchIds = new Map(sourceBranches.map((branch) => [branch.id, uid()]));
+  const messageIds = new Map(sourceMessages.map((message) => [message.id, uid()]));
+  const sessionIds = new Map(sourceSessions.map((session) => [session.id, uid()]));
+  const macroIds = new Map(sourceMacros.map((macro) => [macro.id, uid()]));
+  const attachmentIds = new Map<string, string>();
+  [...sourceMessageAttachments, ...extraDeltaAttachments].forEach((attachment) => {
+    if (!attachmentIds.has(attachment.id)) attachmentIds.set(attachment.id, uid());
+  });
+
+  await db.transaction("rw", [db.chats, db.branches, db.messages, db.stars, db.attachments, db.chatSources, db.inventoryItems, db.inventoryLogs, db.deltaSessions, db.deltaMessages, db.deltaEntities, db.deltaAllyCache, db.deltaActionMacros], async () => {
+    const activeBranchId = branchIds.get(source.activeBranchId);
+    if (!activeBranchId) throw new Error("Chat has no active branch.");
+    const projectChats = await db.chats.where("projectId").equals(source.projectId).toArray();
+    await db.chats.add({
+      ...source,
+      id: chatId,
+      title: nextForkTitle(source.title, projectChats),
+      activeBranchId,
+      maskedSession: options.masked ?? source.maskedSession,
+      pinned: false,
+      archived: false,
+      titleState: "manual",
+      createdAt: timestamp,
+      updatedAt: timestamp
+    });
+    await db.branches.bulkAdd(sourceBranches.map((branch): Branch => ({ ...branch, id: branchIds.get(branch.id)!, chatId, rootMessageId: branch.rootMessageId ? messageIds.get(branch.rootMessageId) : undefined, createdAt: timestamp, updatedAt: timestamp })));
+    await db.messages.bulkAdd(sourceMessages.map((message): Message => ({ ...message, id: messageIds.get(message.id)!, chatId, branchId: branchIds.get(message.branchId)!, parentMessageId: message.parentMessageId ? messageIds.get(message.parentMessageId) : undefined, createdAt: timestamp, updatedAt: timestamp })));
+    await db.stars.bulkAdd(sourceStars.map((star): Star => ({ ...star, id: uid(), chatId, branchId: branchIds.get(star.branchId)!, messageId: messageIds.get(star.messageId)!, createdAt: timestamp, updatedAt: timestamp })));
+    await db.chatSources.bulkAdd(sourceSources.map((item): ChatSource => ({ ...item, id: uid(), chatId, branchId: item.branchId ? branchIds.get(item.branchId) : undefined, createdAt: timestamp, updatedAt: timestamp })));
+    await db.inventoryItems.bulkAdd(sourceInventoryItems.map((item): InventoryItem => ({ ...item, id: uid(), chatId, createdAt: timestamp, updatedAt: timestamp })));
+    await db.inventoryLogs.bulkAdd(sourceInventoryLogs.map((item): InventoryLog => ({ ...item, id: uid(), chatId, createdAt: timestamp, updatedAt: timestamp })));
+    await db.deltaSessions.bulkAdd(sourceSessions.map((session): DeltaSession => ({ ...session, id: sessionIds.get(session.id)!, chatId, createdAt: timestamp, updatedAt: timestamp })));
+    await db.deltaMessages.bulkAdd(sourceDeltaMessages.map((message): DeltaMessage => ({ ...message, id: uid(), sessionId: sessionIds.get(message.sessionId)!, createdAt: timestamp, updatedAt: timestamp })));
+    await db.deltaEntities.bulkAdd(sourceDeltaEntities.map((entity): DeltaEntity => ({ ...entity, id: uid(), sessionId: sessionIds.get(entity.sessionId)!, imageAttachmentId: entity.imageAttachmentId ? attachmentIds.get(entity.imageAttachmentId) : undefined, createdAt: timestamp, updatedAt: timestamp })));
+    await db.deltaAllyCache.bulkAdd(sourceAllyCache.map((item): DeltaAllyCacheEntry => ({ ...item, id: uid(), chatId, createdAt: timestamp, updatedAt: timestamp })));
+    await db.deltaActionMacros.bulkAdd(sourceMacros.map((item): DeltaActionMacro => ({ ...item, id: macroIds.get(item.id)!, chatId, parentId: item.parentId ? macroIds.get(item.parentId) : undefined, createdAt: timestamp, updatedAt: timestamp })));
+    const attachments = [...new Map([...sourceMessageAttachments, ...extraDeltaAttachments].map((item) => [item.id, item])).values()];
+    await db.attachments.bulkAdd(attachments.map((attachment): Attachment => ({ ...attachment, id: attachmentIds.get(attachment.id)!, ownerId: attachment.ownerType === "message" ? messageIds.get(attachment.ownerId) ?? attachment.ownerId : attachment.ownerId, createdAt: timestamp, updatedAt: timestamp })));
   });
   return chatId;
 }

@@ -25,7 +25,7 @@ it("follows estimated-height corrections, respects scrolling up, and resets on c
   const props = { projectId: "project", chatId: "one", messages: [message], bubbleMode: "bubbles" as const,
     onExpand: vi.fn(), onEdit: vi.fn(), onResend: vi.fn(), onInventoryUpdateAction: vi.fn(),
     onBeginDeltaBrief: vi.fn(), onAvoidDeltaBrief: vi.fn(), deltaLocked: false,
-    onOpenChatSettings: vi.fn(), onRefresh: vi.fn() };
+    onOpenChatSettings: vi.fn(), onRefresh: vi.fn(), onForkChat: vi.fn(), forkDisabled: false };
   const view = render(<VirtualMessageList {...props} />);
   act(() => vi.runOnlyPendingTimers());
   list.scrollToItem.mockClear();

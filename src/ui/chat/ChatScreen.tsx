@@ -22,6 +22,7 @@ import {
   applyInventoryChange,
   characterTemplateStats,
   createChat,
+  forkChat,
   createMemory,
   findCharacters,
   getCharacterStats,
@@ -1929,6 +1930,11 @@ export function ChatScreen({
   const openChatSettingsStable = useCallback(() => {
     openChatSettings();
   }, []);
+  const forkChatStable = useCallback(async (masked: boolean) => {
+    if (!chat) return;
+    const chatId = await forkChat(chat.id, { masked });
+    await onChatCreated(chatId);
+  }, [chat, onChatCreated]);
 
   if (!project) {
     return <EmptyState title="Choose a project" body="Open the sidebar and select a project before starting a chat." />;
@@ -2004,6 +2010,8 @@ export function ChatScreen({
         deltaLocked={deltaLocked}
         onOpenChatSettings={openChatSettingsStable}
         onRefresh={onRefreshStable}
+        onForkChat={forkChatStable}
+        forkDisabled={messages.some((message) => message.status === "pending" || message.status === "streaming")}
         chatId={chat?.id}
       />
       <section className={`composer ${deltaLocked ? "locked" : ""}`}>
